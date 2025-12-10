@@ -41,17 +41,26 @@ export default function Home() {
 
   const pendingConsent = sessionState.pending_consent ?? null;
 
-  async function callChat(userText: string, nextMessages: Msg[], nextState?: SessionState) {
-    const stateToSend = nextState ?? sessionState;
+  const API_BASE =
+  process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
 
-    const res = await fetch("http://localhost:8000/chat", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        text: userText,
-        session_state: stateToSend,
-        history: nextMessages,
-      }),
+  async function callChat(userText: string, nextMessages: Msg[], nextState?: SessionState) {
+  const stateToSend = nextState ?? sessionState;
+
+  const res = await fetch(`${API_BASE}/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      text: userText,
+      session_state: stateToSend,
+      history: nextMessages,
+    }),
+  });
+
+  const data = await res.json();
+  return data;
+}
+
     });
 
     const data = await res.json();
