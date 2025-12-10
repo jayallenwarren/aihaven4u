@@ -29,7 +29,9 @@ jobs:
           action: "upload"
           app_location: "frontend"
           api_location: ""
-          output_location: "out"
+          output_location: "out"   # or ".next" depending on your config
+      env:
+        NEXT_PUBLIC_API_BASE_URL: ${{ secrets.NEXT_PUBLIC_API_BASE_URL }}
 
   close_pull_request_job:
     if: github.event_name == 'pull_request' && github.event.action == 'closed'
