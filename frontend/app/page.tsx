@@ -41,10 +41,16 @@ export default function Home() {
 
   const pendingConsent = sessionState.pending_consent ?? null;
 
-  const API_BASE =
-  process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
+  const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
+if (!API_BASE) {
+  throw new Error("Missing NEXT_PUBLIC_API_BASE_URL");
+}
 
-  async function callChat(userText: string, nextMessages: Msg[], nextState?: SessionState) {
+async function callChat(
+  userText: string,
+  nextMessages: Msg[],
+  nextState?: SessionState
+) {
   const stateToSend = nextState ?? sessionState;
 
   const res = await fetch(`${API_BASE}/chat`, {
@@ -57,15 +63,13 @@ export default function Home() {
     }),
   });
 
-  const data = await res.json();
-  return data;
-}
-
-    });
-
-    const data = await res.json();
-    return data;
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    throw new Error(`Backend error ${res.status}: ${errText}`);
   }
+
+  return res.json();
+}
 
   async function send(userTextOverride?: string) {
     if (loading) return;

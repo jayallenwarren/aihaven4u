@@ -26,8 +26,8 @@ def update_consent_from_user(user_text: str, session_state: Dict[str, Any]):
 
         # If we were asking adult verification
         if session_state.get("pending_consent") == "adult":
-            session_state["adult_verified"] = True
-            #session_state["pending_consent"] = "explicit"  # next checkpoint
+    	    session_state["adult_verified"] = True
+    	    session_state["pending_consent"] = None
 
 
 def format_history(history):
