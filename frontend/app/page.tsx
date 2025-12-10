@@ -41,16 +41,17 @@ export default function Home() {
 
   const pendingConsent = sessionState.pending_consent ?? null;
 
-  const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
-if (!API_BASE) {
-  throw new Error("Missing NEXT_PUBLIC_API_BASE_URL");
-}
+  const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "";
 
 async function callChat(
   userText: string,
   nextMessages: Msg[],
   nextState?: SessionState
 ) {
+  if (!API_BASE) {
+    throw new Error("API base URL not configured");
+  }
+
   const stateToSend = nextState ?? sessionState;
 
   const res = await fetch(`${API_BASE}/chat`, {
@@ -70,6 +71,7 @@ async function callChat(
 
   return res.json();
 }
+
 
   async function send(userTextOverride?: string) {
     if (loading) return;
