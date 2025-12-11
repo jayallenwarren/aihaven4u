@@ -30,6 +30,7 @@ jobs:
           app_location: "frontend"
           api_location: ""
           output_location: "out"   # or ".next" depending on your config
+          app_build_command: "npm run build:static"
         env:
           NEXT_PUBLIC_API_BASE_URL: ${{ secrets.NEXT_PUBLIC_API_BASE_URL }}
 
