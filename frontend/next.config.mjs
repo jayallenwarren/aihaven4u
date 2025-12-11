@@ -1,6 +1,7 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  output: "export",           // ✅ makes Next generate frontend/out
+  output: "export",
+  trailingSlash: true,
   images: { unoptimized: true },
 };
 
