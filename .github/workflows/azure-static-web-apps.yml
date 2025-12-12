@@ -1,45 +1,58 @@
-name: Azure Static Web Apps CI/CD
+name: Build and deploy Python app to Azure Web App - aihaven4u-api-03
 
 on:
   push:
     branches:
       - main
-  pull_request:
-    types: [opened, synchronize, reopened, closed]
-    branches:
-      - main
 
 jobs:
-  build_and_deploy_job:
-    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.action != 'closed')
+  build:
     runs-on: ubuntu-latest
-    name: Build and Deploy Job
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          submodules: true
-          lfs: false
+          python-version: "3.11"
 
-      - name: Build And Deploy
-        uses: Azure/static-web-apps-deploy@v1
+      - name: Install dependencies
+        run: |
+          cd backend
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Create deployment package
+        run: |
+          cd backend
+          zip -r ../python-app.zip .
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
         with:
-          azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN }}
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
-          action: upload
-          app_location: frontend
-          output_location: out
-        env:
-          NEXT_PUBLIC_API_BASE_URL: "https://aihaven4u-api-03.azurewebsites.net"
+          name: python-app
+          path: python-app.zip
 
-
-  close_pull_request_job:
-    if: github.event_name == 'pull_request' && github.event.action == 'closed'
+  deploy:
     runs-on: ubuntu-latest
-    name: Close Pull Request Job
+    needs: build     # wait for build job
+    permissions:
+      id-token: write
+      contents: read
     steps:
-      - name: Close Pull Request
-        id: closepullrequest
-        uses: Azure/static-web-apps-deploy@v1
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
         with:
-          azure_static_web_apps_api_token: ${{ secrets.AZURE_STATIC_WEB_APPS_API_TOKEN_YELLOW_HILL_0A40AE30F }}
-          action: "close"
+          name: python-app
+
+      - name: Unzip artifact
+        run: unzip python-app.zip -d .
+
+      - name: Deploy to Azure Web App
+        id: deploy-to-webapp
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: aihaven4u-api-03       # your app name
+          slot-name: production
+          package: .
