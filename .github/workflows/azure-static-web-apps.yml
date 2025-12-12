@@ -28,6 +28,9 @@ jobs:
           action: upload
           app_location: frontend
           output_location: out
+  env:
+    NEXT_PUBLIC_API_BASE_URL: https://aihaven4u-api-03.azurewebsites.net
+
         env:
           NEXT_PUBLIC_API_BASE_URL: "https://aihaven4u-api-03.azurewebsites.net"
 
