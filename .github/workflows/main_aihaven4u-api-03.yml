@@ -58,9 +58,8 @@ jobs:
       - name: Login to Azure
         uses: azure/login@v2
         with:
-          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_6F3EB622A6EF45D39C379248C0FE3D96 }}
-          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_3BB30A1D8D1D4F6CBC8137673C212A95 }}
-          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_5884EA402A1E429DB894999903C67D3D }}
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
 
       - name: Deploy to Azure Web App
         uses: azure/webapps-deploy@v3
@@ -70,3 +69,4 @@ jobs:
           slot-name: "Production"
           # Deploy the backend folder
           package: "backend"
+
