@@ -2,11 +2,10 @@ import json
 from app.chat.router import route_turn
 from typing import List, Dict, Any
 from openai import OpenAI
-
 from app.rag.retriever import get_retriever
 from app.chat.prompting import build_runtime_system
 
-client = OpenAI()
+# client = OpenAI()
 
 def update_consent_from_user(user_text: str, session_state: Dict[str, Any]):
     t = user_text.lower().strip()
@@ -19,15 +18,22 @@ def update_consent_from_user(user_text: str, session_state: Dict[str, Any]):
             session_state["pending_consent"] = None
 
         # If we were asking explicit consent
-        if session_state.get("pending_consent") == "explicit":
+        elif session_state.get("pending_consent") == "explicit":
             session_state["explicit_consented"] = True
             session_state["mode"] = "explicit"
             session_state["pending_consent"] = None
 
         # If we were asking adult verification
-        if session_state.get("pending_consent") == "adult":
-    	    session_state["adult_verified"] = True
-    	    session_state["pending_consent"] = None
+        elif session_state.get("pending_consent") == "adult":
+            session_state["adult_verified"] = True
+            session_state["pending_consent"] = None
+
+    if t in ["no", "nope", "nah", "i don't", "do not"]:
+        session_state["pending_consent"] = None
+        # optionally revert mode
+        session_state["mode"] = "friend"
+        return
+
 
 
 def format_history(history):
@@ -41,13 +47,14 @@ def format_history(history):
     return cleaned[-6:]  # last 6 messages max
 
 def retrieve_context(user_text: str, mode: str, k: int = 3) -> str:
-    """
-    Retrieve small, bounded RAG context.
-    Bias toward AI Haven 4U + correct mode.
-    """
-    retriever = get_retriever(k=k)
+    try:
+        retriever = get_retriever(k=k)
+    except FileNotFoundError:
+        # No vector DB deployed yet -> run without RAG instead of 500
+        return ""
+    except Exception:
+        return ""
 
-    # Query boost to prefer correct brand + mode docs
     boosted_query = f"[brand: AI Haven 4U] [mode: {mode}] {user_text}"
     docs = retriever.invoke(boosted_query)
 
@@ -77,32 +84,28 @@ def retrieve_context(user_text: str, mode: str, k: int = 3) -> str:
 
 
 def chat_turn(user_text: str, session_state: Dict[str, Any], history: List[Dict[str, str]]):
-    mode = session_state.get("mode", "friend")
+    # lazy init so missing env doesn't crash worker boot
+    client = OpenAI()
 
-    # 0) Update consent from user replies first
     update_consent_from_user(user_text, session_state)
 
-    # 1) Route for safety/consent
     action, short_msg = route_turn(user_text, session_state)
-
     if action == "need_romance_consent":
         session_state["pending_consent"] = "romance"
         return short_msg, session_state
 
     if action == "need_explicit_consent":
-        # decide which consent we're asking for
-        if not session_state.get("adult_verified", False):
-            session_state["pending_consent"] = "adult"
-        else:
-            session_state["pending_consent"] = "explicit"
+        session_state["pending_consent"] = "adult" if not session_state.get("adult_verified", False) else "explicit"
         return short_msg, session_state
 
-    if action == "crisis" or action == "block_taboo":
-        # short-circuit hard safety cases
+    if action in ("crisis", "block_taboo"):
         session_state["pending_consent"] = None
         return short_msg, session_state
 
-    # 2) Normal RAG + LLM path
+    # compute mode only after session_state may have changed
+    mode = session_state.get("mode", "friend")
+
+    # RAG (safe-fail to empty string if DB missing)
     rag_context = retrieve_context(user_text, mode, k=2)
 
     system_msg = build_runtime_system(
@@ -116,19 +119,19 @@ def chat_turn(user_text: str, session_state: Dict[str, Any], history: List[Dict[
     messages.extend(format_history(history))
     messages.append({"role": "user", "content": user_text})
 
-    # FINAL safety cap on total prompt size
-    total_chars = sum(len(m["content"]) for m in messages)
+    # safety cap
+    total_chars = sum(len(m.get("content", "")) for m in messages)
     if total_chars > 20000:
         messages = messages[:1] + messages[-3:]
-        total_chars = sum(len(m["content"]) for m in messages)
 
     resp = client.chat.completions.create(
         model=session_state.get("model", "gpt-4o"),
         messages=messages,
         temperature=0.8,
-        max_tokens=400,  # correct param
+        max_tokens=400,
     )
 
     assistant_text = resp.choices[0].message.content
     return assistant_text, session_state
+
 
