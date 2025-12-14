@@ -29,6 +29,8 @@ type PlanName =
   | "Weekly - Intimate (18+)"
   | null;
 
+const UPGRADE_URL = "https://www.aihaven4u.com/pricing-plans/list";
+
 const ROMANTIC_ALLOWED_PLANS: PlanName[] = [
   "Week - Trial",
   "Weekly - Romantic",
@@ -50,10 +52,8 @@ function allowedModesForPlan(planName: PlanName): Mode[] {
 }
 
 /**
- * Editor Preview support:
- * - In production, parent origin is your domain
- * - In Editor Preview, parent origin may be editor.wix.com / manage.wix.com
- * - Preview/published subdomains often appear as https://<sub>.wixsite.com
+ * event.origin is the Wix parent origin (NOT Azure).
+ * Allow production + Wix Editor Preview.
  */
 function isAllowedOrigin(origin: string) {
   // Production
@@ -68,6 +68,28 @@ function isAllowedOrigin(origin: string) {
   if (/^https:\/\/[a-z0-9-]+\.wixsite\.com$/i.test(origin)) return true;
 
   return false;
+}
+
+/** Lightweight intent detection to prevent prompt-based bypass. */
+function isRomanticRequest(text: string) {
+  const t = (text || "").toLowerCase();
+  return /\bromance\b|\bromantic\b|\bflirt\b|\bflirty\b|\bdate\b|\bgirlfriend\b|\bboyfriend\b|\bkiss\b|\bmake out\b|\blove you\b/.test(
+    t
+  );
+}
+
+function isExplicitRequest(text: string) {
+  const t = (text || "").toLowerCase();
+  return /\bexplicit\b|\bintimate\b|\b18\+\b|\bnsfw\b|\bsex\b|\bfuck\b|\bnude\b|\bnaked\b|\borgasm\b|\bblowjob\b|\bbj\b|\bdeep throat\b|\bsquirt\b|\bpee\b|\bfart\b|\bpussy\b|\banal\b/.test(
+    t
+  );
+}
+
+/** Explicit outranks Romantic if both match. */
+function requestedModeFromText(text: string): Mode | null {
+  if (isExplicitRequest(text)) return "explicit";
+  if (isRomanticRequest(text)) return "romantic";
+  return null;
 }
 
 export default function Page() {
@@ -97,13 +119,14 @@ export default function Page() {
     scrollRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, loading]);
 
-  // Show upgrade message in chat (no backend call)
+  // ✅ Markdown upgrade link
   function showUpgradeMessage(requestedMode: Mode) {
     const modeLabel = MODE_LABELS[requestedMode];
+
     const msg =
       `The requested ${modeLabel} mode is not available for your current plan. ` +
       `Your plan will need to be upgraded to complete your request.\n\n` +
-      `Upgrade here: https://www.aihaven4u.com/pricing-plans/list`;
+      `[Upgrade Plan](${UPGRADE_URL})`;
 
     setMessages((prev) => [...prev, { role: "assistant", content: msg }]);
   }
@@ -133,7 +156,7 @@ export default function Page() {
     return () => window.removeEventListener("message", onMessage);
   }, []);
 
-  async function callChat(userText: string, nextMessages: Msg[], stateToSend: SessionState) {
+  async function callChat(userText: string, nextMessages: Msg[], stateToSend: any) {
     if (!API_BASE) throw new Error("NEXT_PUBLIC_API_BASE_URL is not set");
 
     const res = await fetch(`${API_BASE}/chat`, {
@@ -160,15 +183,38 @@ export default function Page() {
     const userText = (textOverride ?? input).trim();
     if (!userText) return;
 
+    // ✅ Prevent prompt-based bypass (block BEFORE calling FastAPI)
+    const requested = requestedModeFromText(userText);
+    if (requested && !allowedModes.includes(requested)) {
+      showUpgradeMessage(requested);
+      setInput("");
+      return;
+    }
+
     const nextMessages: Msg[] = [...messages, { role: "user", content: userText }];
     setMessages(nextMessages);
     setInput("");
     setLoading(true);
 
     try {
-      const data = await callChat(userText, nextMessages, sessionState);
+      // ✅ Send plan_name to backend (FastAPI) so server can enforce too
+      // ✅ Pin mode to valid value if client ever gets out of sync
+      const safeMode: Mode = allowedModes.includes(sessionState.mode) ? sessionState.mode : "friend";
+
+      const stateToSend = {
+        ...sessionState,
+        mode: safeMode,
+        plan_name: planName,
+      };
+
+      const data = await callChat(userText, nextMessages, stateToSend);
+
       setMessages([...nextMessages, { role: "assistant", content: data.reply }]);
-      setSessionState(data.session_state);
+
+      // Prefer backend’s returned session state, but never let it set an invalid mode client-side
+      const nextState: SessionState = data.session_state ?? sessionState;
+      const coercedMode: Mode = allowedModes.includes(nextState.mode) ? nextState.mode : "friend";
+      setSessionState({ ...nextState, mode: coercedMode });
     } catch {
       setMessages([...nextMessages, { role: "assistant", content: "⚠️ Error talking to backend." }]);
     } finally {
@@ -177,7 +223,6 @@ export default function Page() {
   }
 
   function requestMode(mode: Mode) {
-    // If not allowed, show upgrade message
     if (!allowedModes.includes(mode)) {
       showUpgradeMessage(mode);
       return;
@@ -405,7 +450,7 @@ export default function Page() {
               {pendingConsent === "explicit" && <>Explicit Mode is optional and consent-first.</>}
             </p>
 
-            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" as any }}>
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
               <button
                 onClick={() => handleConsent("no")}
                 style={{
