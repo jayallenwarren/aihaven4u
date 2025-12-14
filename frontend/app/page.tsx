@@ -32,7 +32,6 @@ export default function Home() {
     pending_consent: null,
   });
   const [loading, setLoading] = useState(false);
-  const [showDebug, setShowDebug] = useState(true);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -43,35 +42,34 @@ export default function Home() {
 
   const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "";
 
-async function callChat(
-  userText: string,
-  nextMessages: Msg[],
-  nextState?: SessionState
-) {
-  if (!API_BASE) {
-    throw new Error("API base URL not configured");
+  async function callChat(
+    userText: string,
+    nextMessages: Msg[],
+    nextState?: SessionState
+  ) {
+    if (!API_BASE) {
+      throw new Error("API base URL not configured");
+    }
+
+    const stateToSend = nextState ?? sessionState;
+
+    const res = await fetch(`${API_BASE}/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text: userText,
+        session_state: stateToSend,
+        history: nextMessages,
+      }),
+    });
+
+    if (!res.ok) {
+      const errText = await res.text().catch(() => "");
+      throw new Error(`Backend error ${res.status}: ${errText}`);
+    }
+
+    return res.json();
   }
-
-  const stateToSend = nextState ?? sessionState;
-
-  const res = await fetch(`${API_BASE}/chat`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      text: userText,
-      session_state: stateToSend,
-      history: nextMessages,
-    }),
-  });
-
-  if (!res.ok) {
-    const errText = await res.text().catch(() => "");
-    throw new Error(`Backend error ${res.status}: ${errText}`);
-  }
-
-  return res.json();
-}
-
 
   async function send(userTextOverride?: string) {
     if (loading) return;
@@ -122,7 +120,10 @@ async function callChat(
     send(hint);
   }
 
-  const modePills = useMemo(() => (["friend", "romantic", "explicit"] as const), []);
+  const modePills = useMemo(
+    () => (["friend", "romantic", "explicit"] as const),
+    []
+  );
 
   return (
     <main
@@ -140,7 +141,7 @@ async function callChat(
           style={{
             width: 56,
             height: 56,
-            borderRadius: "50%",      // ✅ circular frame
+            borderRadius: "50%", // ✅ circular frame
             overflow: "hidden",
             boxShadow: "0 2px 8px rgba(0,0,0,0.12)",
             background: "white",
@@ -149,17 +150,16 @@ async function callChat(
           }}
         >
           <img
-            src="/ai-haven-heart.png"   // or your generated PNG filename
+            src="/ai-haven-heart.png" // or your generated PNG filename
             alt="AI Haven 4U Heart"
             style={{
               width: "100%",
               height: "100%",
-              objectFit: "cover",       // ✅ fills circle without distortion
+              objectFit: "cover", // ✅ fills circle without distortion
               objectPosition: "center",
             }}
           />
         </div>
-
 
         <div>
           <h1 style={{ margin: 0, fontSize: 22 }}>AI Haven 4U</h1>
@@ -298,39 +298,6 @@ async function callChat(
         AI Haven 4U is a supportive companion, not a replacement for professional help.
         If you’re in danger, contact local emergency services.
       </footer>
-
-      {/* Debug drawer */}
-      <section style={{ marginTop: 12 }}>
-        <button
-          onClick={() => setShowDebug((v) => !v)}
-          style={{
-            fontSize: 12,
-            padding: "6px 10px",
-            borderRadius: 8,
-            border: "1px solid #ddd",
-            background: "white",
-            cursor: "pointer",
-          }}
-        >
-          {showDebug ? "Hide" : "Show"} session debug
-        </button>
-
-        {showDebug && (
-          <pre
-            style={{
-              marginTop: 8,
-              fontSize: 12,
-              background: "#0b0b0b",
-              color: "#d7d7d7",
-              padding: 10,
-              borderRadius: 10,
-              overflowX: "auto",
-            }}
-          >
-{JSON.stringify(sessionState, null, 2)}
-          </pre>
-        )}
-      </section>
 
       {/* Consent modal */}
       {pendingConsent && (
