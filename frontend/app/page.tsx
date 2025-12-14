@@ -405,7 +405,7 @@ export default function Page() {
               {pendingConsent === "explicit" && <>Explicit Mode is optional and consent-first.</>}
             </p>
 
-            <div style={{ display: "flex", gap: 8, justifyContent:: "flex-end" as any }}>
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" as any }}>
               <button
                 onClick={() => handleConsent("no")}
                 style={{
