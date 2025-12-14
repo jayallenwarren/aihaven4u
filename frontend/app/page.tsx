@@ -26,26 +26,27 @@ type PlanName =
   | "Week - Trial"
   | "Weekly - Friend"
   | "Weekly - Romantic"
-  | "Weekly - Unlimited"
+  | "Weekly - Intimate (18+)"
   | null;
 
+const ROMANTIC_ALLOWED_PLANS: PlanName[] = [
+  "Week - Trial",
+  "Weekly - Romantic",
+  "Weekly - Intimate (18+)",
+];
+
 function allowedModesForPlan(planName: PlanName): Mode[] {
-  // Rules:
-  // Week - Trial        → Friend + Romantic
-  // Weekly - Friend     → Friend only
-  // Weekly - Romantic   → Friend + Romantic
-  // Weekly - Unlimited  → Friend + Romantic + Intimate (18+)
-  switch (planName) {
-    case "Weekly - Friend":
-      return ["friend"];
-    case "Week - Trial":
-    case "Weekly - Romantic":
-      return ["friend", "romantic"];
-    case "Weekly - Unlimited":
-      return ["friend", "romantic", "explicit"];
-    default:
-      return ["friend"];
+  const modes: Mode[] = ["friend"];
+
+  if (ROMANTIC_ALLOWED_PLANS.includes(planName)) {
+    modes.push("romantic");
   }
+
+  if (planName === "Weekly - Intimate (18+)") {
+    modes.push("explicit");
+  }
+
+  return modes;
 }
 
 /**
@@ -89,6 +90,24 @@ export default function Page() {
   const [planName, setPlanName] = useState<PlanName>(null);
   const [allowedModes, setAllowedModes] = useState<Mode[]>(["friend"]);
 
+  const modePills = useMemo(() => ["friend", "romantic", "explicit"] as const, []);
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    scrollRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, loading]);
+
+  // Show upgrade message in chat (no backend call)
+  function showUpgradeMessage(requestedMode: Mode) {
+    const modeLabel = MODE_LABELS[requestedMode];
+    const msg =
+      `The requested ${modeLabel} mode is not available for your current plan. ` +
+      `Your plan will need to be upgraded to complete your request.\n\n` +
+      `Upgrade here: https://www.aihaven4u.com/pricing-plans/list`;
+
+    setMessages((prev) => [...prev, { role: "assistant", content: msg }]);
+  }
+
   // Receive Wix -> iframe messages
   useEffect(() => {
     function onMessage(event: MessageEvent) {
@@ -98,7 +117,6 @@ export default function Page() {
       if (!data || data.type !== "WEEKLY_PLAN") return;
 
       const incomingPlan = (data.planName ?? null) as PlanName;
-
       setPlanName(incomingPlan);
 
       const nextAllowed = allowedModesForPlan(incomingPlan);
@@ -114,13 +132,6 @@ export default function Page() {
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
   }, []);
-
-  const modePills = useMemo(() => ["friend", "romantic", "explicit"] as const, []);
-  const scrollRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    scrollRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, loading]);
 
   async function callChat(userText: string, nextMessages: Msg[], stateToSend: SessionState) {
     if (!API_BASE) throw new Error("NEXT_PUBLIC_API_BASE_URL is not set");
@@ -166,7 +177,11 @@ export default function Page() {
   }
 
   function requestMode(mode: Mode) {
-    if (!allowedModes.includes(mode)) return;
+    // If not allowed, show upgrade message
+    if (!allowedModes.includes(mode)) {
+      showUpgradeMessage(mode);
+      return;
+    }
 
     const hint =
       mode === "friend"
@@ -232,14 +247,10 @@ export default function Page() {
           const active = sessionState.mode === m;
           const enabled = allowedModes.includes(m);
 
-          // If you'd rather HIDE unavailable buttons:
-          // if (!enabled) return null;
-
           return (
             <button
               key={m}
-              onClick={() => enabled && requestMode(m)}
-              disabled={!enabled}
+              onClick={() => requestMode(m)}
               style={{
                 padding: "6px 12px",
                 borderRadius: 999,
@@ -247,8 +258,8 @@ export default function Page() {
                 background: active ? "#111" : "white",
                 color: active ? "white" : "#111",
                 fontSize: 13,
-                cursor: enabled ? "pointer" : "not-allowed",
-                opacity: enabled ? 1 : 0.35,
+                cursor: "pointer",
+                opacity: enabled ? 1 : 0.5,
               }}
               title={enabled ? `Request ${MODE_LABELS[m]} Mode` : "Upgrade required"}
             >
@@ -394,7 +405,7 @@ export default function Page() {
               {pendingConsent === "explicit" && <>Explicit Mode is optional and consent-first.</>}
             </p>
 
-            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+            <div style={{ display: "flex", gap: 8, justifyContent:: "flex-end" as any }}>
               <button
                 onClick={() => handleConsent("no")}
                 style={{
