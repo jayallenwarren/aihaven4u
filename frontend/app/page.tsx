@@ -1,28 +1,81 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 
 type Role = "user" | "assistant";
 type Msg = { role: Role; content: string };
 
+type Mode = "friend" | "romantic" | "explicit";
+
 type SessionState = {
-  mode: "friend" | "romantic" | "explicit";
-  adult_verified?: boolean;
-  romance_consented?: boolean;
-  explicit_consented?: boolean;
-  pending_consent?: "romance" | "adult" | "explicit" | null;
-  model?: string;
+  mode: Mode;
+  adult_verified: boolean;
+  romance_consented: boolean;
+  explicit_consented: boolean;
+  pending_consent: "romance" | "adult" | "explicit" | null;
+  model: string;
 };
 
-const MODE_LABELS: Record<SessionState["mode"], string> = {
+const MODE_LABELS: Record<Mode, string> = {
   friend: "Friend",
   romantic: "Romantic",
   explicit: "Intimate (18+)",
 };
 
-export default function Home() {
+type PlanName =
+  | "Week - Trial"
+  | "Weekly - Friend"
+  | "Weekly - Romantic"
+  | "Weekly - Unlimited"
+  | null;
+
+function allowedModesForPlan(planName: PlanName): Mode[] {
+  // Rules:
+  // Week - Trial        → Friend + Romantic
+  // Weekly - Friend     → Friend only
+  // Weekly - Romantic   → Friend + Romantic
+  // Weekly - Unlimited  → Friend + Romantic + Intimate (18+)
+  switch (planName) {
+    case "Weekly - Friend":
+      return ["friend"];
+    case "Week - Trial":
+    case "Weekly - Romantic":
+      return ["friend", "romantic"];
+    case "Weekly - Unlimited":
+      return ["friend", "romantic", "explicit"];
+    default:
+      return ["friend"];
+  }
+}
+
+/**
+ * Editor Preview support:
+ * - In production, parent origin is your domain
+ * - In Editor Preview, parent origin may be editor.wix.com / manage.wix.com
+ * - Preview/published subdomains often appear as https://<sub>.wixsite.com
+ */
+function isAllowedOrigin(origin: string) {
+  // Production
+  if (origin === "https://aihaven4u.com") return true;
+  if (origin === "https://www.aihaven4u.com") return true;
+
+  // Wix Editor Preview
+  if (origin === "https://editor.wix.com") return true;
+  if (origin === "https://manage.wix.com") return true;
+
+  // Preview/published site subdomains
+  if (/^https:\/\/[a-z0-9-]+\.wixsite\.com$/i.test(origin)) return true;
+
+  return false;
+}
+
+export default function Page() {
+  const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "";
+
   const [input, setInput] = useState("");
   const [messages, setMessages] = useState<Msg[]>([]);
+  const [loading, setLoading] = useState(false);
+
   const [sessionState, setSessionState] = useState<SessionState>({
     mode: "friend",
     model: "gpt-4o",
@@ -31,27 +84,46 @@ export default function Home() {
     explicit_consented: false,
     pending_consent: null,
   });
-  const [loading, setLoading] = useState(false);
 
+  // From Wix
+  const [planName, setPlanName] = useState<PlanName>(null);
+  const [allowedModes, setAllowedModes] = useState<Mode[]>(["friend"]);
+
+  // Receive Wix -> iframe messages
+  useEffect(() => {
+    function onMessage(event: MessageEvent) {
+      if (!isAllowedOrigin(event.origin)) return;
+
+      const data = event.data;
+      if (!data || data.type !== "WEEKLY_PLAN") return;
+
+      const incomingPlan = (data.planName ?? null) as PlanName;
+
+      setPlanName(incomingPlan);
+
+      const nextAllowed = allowedModesForPlan(incomingPlan);
+      setAllowedModes(nextAllowed);
+
+      // If current mode becomes invalid, force fallback
+      setSessionState((prev) => {
+        if (nextAllowed.includes(prev.mode)) return prev;
+        return { ...prev, mode: "friend" };
+      });
+    }
+
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, []);
+
+  const modePills = useMemo(() => ["friend", "romantic", "explicit"] as const, []);
   const scrollRef = useRef<HTMLDivElement>(null);
+
   useEffect(() => {
     scrollRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, loading]);
 
-  const pendingConsent = sessionState.pending_consent ?? null;
-
-  const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "";
-
-  async function callChat(
-    userText: string,
-    nextMessages: Msg[],
-    nextState?: SessionState
-  ) {
-    if (!API_BASE) {
-      throw new Error("API base URL not configured");
-    }
-
-    const stateToSend = nextState ?? sessionState;
+  async function callChat(userText: string, nextMessages: Msg[], stateToSend: SessionState) {
+    if (!API_BASE) throw new Error("NEXT_PUBLIC_API_BASE_URL is not set");
 
     const res = await fetch(`${API_BASE}/chat`, {
       method: "POST",
@@ -71,41 +143,31 @@ export default function Home() {
     return res.json();
   }
 
-  async function send(userTextOverride?: string) {
+  async function send(textOverride?: string) {
     if (loading) return;
 
-    const userText = (userTextOverride ?? input).trim();
+    const userText = (textOverride ?? input).trim();
     if (!userText) return;
 
-    const nextMessages: Msg[] = [
-      ...messages,
-      { role: "user", content: userText },
-    ];
+    const nextMessages: Msg[] = [...messages, { role: "user", content: userText }];
     setMessages(nextMessages);
     setInput("");
     setLoading(true);
 
     try {
-      const data = await callChat(userText, nextMessages);
+      const data = await callChat(userText, nextMessages, sessionState);
       setMessages([...nextMessages, { role: "assistant", content: data.reply }]);
       setSessionState(data.session_state);
     } catch {
-      setMessages([
-        ...nextMessages,
-        { role: "assistant", content: "⚠️ Error talking to backend." },
-      ]);
+      setMessages([...nextMessages, { role: "assistant", content: "⚠️ Error talking to backend." }]);
     } finally {
       setLoading(false);
     }
   }
 
-  async function handleConsent(choice: "yes" | "no") {
-    // send a short consent reply into the same conversation
-    await send(choice);
-  }
+  function requestMode(mode: Mode) {
+    if (!allowedModes.includes(mode)) return;
 
-  function requestMode(mode: SessionState["mode"]) {
-    // UI request only. Backend gates still apply.
     const hint =
       mode === "friend"
         ? "Let’s stay in Friend Mode."
@@ -113,17 +175,15 @@ export default function Home() {
         ? "Can we switch to Romantic Mode?"
         : "Can we switch to Explicit Mode?";
 
-    // Optimistically set mode so UI pill highlights,
-    // but backend may revert if consent isn't granted.
-    const optimisticState = { ...sessionState, mode };
-    setSessionState(optimisticState);
+    setSessionState((prev) => ({ ...prev, mode }));
     send(hint);
   }
 
-  const modePills = useMemo(
-    () => (["friend", "romantic", "explicit"] as const),
-    []
-  );
+  async function handleConsent(choice: "yes" | "no") {
+    await send(choice);
+  }
+
+  const pendingConsent = sessionState.pending_consent;
 
   return (
     <main
@@ -134,14 +194,13 @@ export default function Home() {
         fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif",
       }}
     >
-      {/* Header */}
       <header style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 10 }}>
         <div
           aria-hidden
           style={{
             width: 56,
             height: 56,
-            borderRadius: "50%", // ✅ circular frame
+            borderRadius: "50%",
             overflow: "hidden",
             boxShadow: "0 2px 8px rgba(0,0,0,0.12)",
             background: "white",
@@ -150,14 +209,9 @@ export default function Home() {
           }}
         >
           <img
-            src="/ai-haven-heart.png" // or your generated PNG filename
+            src="/ai-haven-heart.png"
             alt="AI Haven 4U Heart"
-            style={{
-              width: "100%",
-              height: "100%",
-              objectFit: "cover", // ✅ fills circle without distortion
-              objectPosition: "center",
-            }}
+            style={{ width: "100%", height: "100%", objectFit: "cover" }}
           />
         </div>
 
@@ -166,17 +220,26 @@ export default function Home() {
           <div style={{ fontSize: 13, color: "#555" }}>
             Companion MVP · reducing loneliness with consent-first intimacy
           </div>
+          <div style={{ fontSize: 12, color: "#666", marginTop: 2 }}>
+            Plan: <b>{planName ?? "Unknown / Not provided"}</b>
+          </div>
         </div>
       </header>
 
-      {/* Mode pills */}
+      {/* Mode buttons */}
       <section style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
         {modePills.map((m) => {
           const active = sessionState.mode === m;
+          const enabled = allowedModes.includes(m);
+
+          // If you'd rather HIDE unavailable buttons:
+          // if (!enabled) return null;
+
           return (
             <button
               key={m}
-              onClick={() => requestMode(m)}
+              onClick={() => enabled && requestMode(m)}
+              disabled={!enabled}
               style={{
                 padding: "6px 12px",
                 borderRadius: 999,
@@ -184,20 +247,22 @@ export default function Home() {
                 background: active ? "#111" : "white",
                 color: active ? "white" : "#111",
                 fontSize: 13,
-                cursor: "pointer",
+                cursor: enabled ? "pointer" : "not-allowed",
+                opacity: enabled ? 1 : 0.35,
               }}
-              title={`Request ${MODE_LABELS[m]} Mode`}
+              title={enabled ? `Request ${MODE_LABELS[m]} Mode` : "Upgrade required"}
             >
               {MODE_LABELS[m]}
             </button>
           );
         })}
+
         <div style={{ marginLeft: "auto", fontSize: 12, color: "#666", alignSelf: "center" }}>
           Current: <b>{MODE_LABELS[sessionState.mode]}</b>
         </div>
       </section>
 
-      {/* Chat window */}
+      {/* Chat */}
       <section
         style={{
           border: "1px solid #e5e5e5",
@@ -260,7 +325,7 @@ export default function Home() {
         <div ref={scrollRef} />
       </section>
 
-      {/* Input row */}
+      {/* Input */}
       <section style={{ display: "flex", gap: 8, marginTop: 12 }}>
         <input
           value={input}
@@ -293,12 +358,6 @@ export default function Home() {
         </button>
       </section>
 
-      {/* Safety footer */}
-      <footer style={{ marginTop: 10, fontSize: 12, color: "#666" }}>
-        AI Haven 4U is a supportive companion, not a replacement for professional help.
-        If you’re in danger, contact local emergency services.
-      </footer>
-
       {/* Consent modal */}
       {pendingConsent && (
         <div
@@ -330,15 +389,9 @@ export default function Home() {
             </h3>
 
             <p style={{ fontSize: 14, color: "#333" }}>
-              {pendingConsent === "romance" && (
-                <>We can be romantic only if you want that. You can say yes or no.</>
-              )}
-              {pendingConsent === "adult" && (
-                <>I need to confirm you’re 18+ before any explicit adult conversation.</>
-              )}
-              {pendingConsent === "explicit" && (
-                <>Explicit Mode is optional and consent-first. You can say yes or no.</>
-              )}
+              {pendingConsent === "romance" && <>We can be romantic only if you want that.</>}
+              {pendingConsent === "adult" && <>I need to confirm you’re 18+ first.</>}
+              {pendingConsent === "explicit" && <>Explicit Mode is optional and consent-first.</>}
             </p>
 
             <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
