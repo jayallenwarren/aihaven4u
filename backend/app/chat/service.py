@@ -5,8 +5,18 @@ from app.chat.router import route_turn
 from app.rag.retriever import get_retriever
 from app.chat.prompting import build_runtime_system
 
-ROMANTIC_ALLOWED_PLANS = {"Week - Trial", "Weekly - Romantic", "Weekly - Intimate (18+)"}
-EXPLICIT_ALLOWED_PLANS = {"Weekly - Intimate (18+)"}
+ROMANTIC_ALLOWED_PLANS = {
+    "Week - Trial",
+    "Weekly - Romantic",
+    "Weekly - Intimate (18+)",
+    "Test - Romantic",
+    "Test - Intimate (18+)",
+}
+
+EXPLICIT_ALLOWED_PLANS = {
+    "Weekly - Intimate (18+)",
+    "Test - Intimate (18+)",
+}
 
 def update_consent_from_user(user_text: str, session_state: Dict[str, Any]):
     t = (user_text or "").lower().strip()
@@ -14,7 +24,6 @@ def update_consent_from_user(user_text: str, session_state: Dict[str, Any]):
 
     if t in ["yes", "yeah", "yep", "i do", "sure"]:
         if session_state.get("pending_consent") == "romance":
-            # ✅ enforce plan even if user says "yes"
             if plan_name in ROMANTIC_ALLOWED_PLANS:
                 session_state["romance_consented"] = True
                 session_state["mode"] = "romantic"
@@ -24,7 +33,6 @@ def update_consent_from_user(user_text: str, session_state: Dict[str, Any]):
             session_state["pending_consent"] = None
 
         elif session_state.get("pending_consent") == "explicit":
-            # ✅ enforce plan even if user says "yes"
             if plan_name in EXPLICIT_ALLOWED_PLANS:
                 session_state["explicit_consented"] = True
                 session_state["mode"] = "explicit"
@@ -40,7 +48,6 @@ def update_consent_from_user(user_text: str, session_state: Dict[str, Any]):
     if t in ["no", "nope", "nah", "i don't", "do not"]:
         session_state["pending_consent"] = None
         session_state["mode"] = "friend"
-        return
 
 def format_history(history):
     if not isinstance(history, list):
@@ -54,27 +61,11 @@ def format_history(history):
 def retrieve_context(user_text: str, mode: str, k: int = 3) -> str:
     try:
         retriever = get_retriever(k=k)
-    except FileNotFoundError:
-        return ""
     except Exception:
         return ""
 
     boosted_query = f"[brand: AI Haven 4U] [mode: {mode}] {user_text}"
     docs = retriever.invoke(boosted_query)
-
-    def score_doc(d):
-        src = (d.metadata.get("source") or "").lower()
-        text = (d.page_content or "").lower()
-        score = 0
-        if "ai_haven_4u" in src or "ai haven 4u" in text:
-            score += 3
-        if "haven" in src and "ai_haven_4u" not in src:
-            score -= 1
-        if f"mode: {mode}" in text:
-            score += 1
-        return score
-
-    docs = sorted(docs, key=score_doc, reverse=True)
 
     blocks = []
     for d in docs[:k]:
@@ -88,12 +79,10 @@ def retrieve_context(user_text: str, mode: str, k: int = 3) -> str:
 def chat_turn(user_text: str, session_state: Dict[str, Any], history: List[Dict[str, str]]):
     client = OpenAI()
 
-    # Apply consent updates (plan-gated)
     update_consent_from_user(user_text, session_state)
 
     action, short_msg = route_turn(user_text, session_state)
 
-    # ✅ PLAN ENFORCEMENT SHORT-CIRCUIT (prevents LLM calls)
     if action == "upgrade_required":
         session_state["pending_consent"] = None
         session_state["mode"] = "friend"
@@ -126,10 +115,6 @@ def chat_turn(user_text: str, session_state: Dict[str, Any], history: List[Dict[
     messages = [{"role": "system", "content": system_msg}]
     messages.extend(format_history(history))
     messages.append({"role": "user", "content": user_text})
-
-    total_chars = sum(len(m.get("content", "")) for m in messages)
-    if total_chars > 20000:
-        messages = messages[:1] + messages[-3:]
 
     resp = client.chat.completions.create(
         model=session_state.get("model", "gpt-4o"),
