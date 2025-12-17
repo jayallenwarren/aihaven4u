@@ -103,3 +103,12 @@ async def chat(payload: ChatRequest, request: Request):
         mode="safe",
         reply=f"You said: {user_text}",
     )
+
+@app.get("/debug/cors")
+def debug_cors():
+    cors_value = (settings.CORS_ALLOW_ORIGINS or "").strip()
+    raw_origins = [o.strip() for o in cors_value.split(",") if o.strip()]
+    return {
+        "CORS_ALLOW_ORIGINS_raw": cors_value,
+        "parsed_origins": raw_origins,
+    }
