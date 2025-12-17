@@ -137,6 +137,23 @@ function requestedModeFromHint(text: string): Mode | null {
 export default function Page() {
   const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "";
 
+  const sessionIdRef = useRef<string>("");
+
+  useEffect(() => {
+    const key = "aihaven4u_session_id";
+    const existing = window.sessionStorage.getItem(key);
+
+    if (existing) {
+      sessionIdRef.current = existing;
+    } else {
+      const id =
+        (crypto as any).randomUUID?.() ??
+        `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      sessionIdRef.current = id;
+      window.sessionStorage.setItem(key, id);
+    }
+  }, []);
+
   const [input, setInput] = useState("");
   const [messages, setMessages] = useState<Msg[]>([]);
   const [loading, setLoading] = useState(false);
@@ -193,25 +210,32 @@ export default function Page() {
   }, []);
 
   async function callChat(userText: string, nextMessages: Msg[], stateToSend: any) {
-    if (!API_BASE) throw new Error("NEXT_PUBLIC_API_BASE_URL is not set");
+  if (!API_BASE) throw new Error("NEXT_PUBLIC_API_BASE_URL is not set");
 
-    const res = await fetch(`${API_BASE}/chat`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        text: userText,
-        session_state: stateToSend,
-        history: nextMessages,
-      }),
-    });
+  const session_id =
+    sessionIdRef.current ||
+    (crypto as any).randomUUID?.() ||
+    `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
-    if (!res.ok) {
-      const errText = await res.text().catch(() => "");
-      throw new Error(`Backend error ${res.status}: ${errText}`);
-    }
+  const res = await fetch(`${API_BASE}/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      session_id,
+      wants_explicit: stateToSend?.explicit_consented === true,
+      messages: nextMessages.map((m) => ({ role: m.role, content: m.content })),
+    }),
+  });
 
-    return res.json();
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    throw new Error(`Backend error ${res.status}: ${errText}`);
   }
+
+  return res.json();
+}
+
+
 
   async function send(textOverride?: string) {
     if (loading) return;
