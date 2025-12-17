@@ -11,20 +11,21 @@ app = FastAPI(title="AIHaven4U API")
 # -----------------------------
 # CORS
 # -----------------------------
+# CORS_ALLOW_ORIGINS should be a comma-separated list of exact origins, e.g.:
+# https://aihaven4u.com,https://www.aihaven4u.com,https://yellow-hill-0a40ae30f.3.azurestaticapps.net,http://localhost:3000
+#
 # IMPORTANT:
-# - Do NOT use allow_origins=["*"] together with allow_credentials=True.
-# - Instead, explicitly allow the origins you trust via CORS_ALLOW_ORIGINS
-#   e.g.:
-#   CORS_ALLOW_ORIGINS=https://aihaven4u.com,https://www.aihaven4u.com,https://yellow-hill-0a40ae30f.3.azurestaticapps.net,http://localhost:3000
+# - Browsers reject allow_origins=["*"] when allow_credentials=True.
+# - So we only allow "*" when allow_credentials is False.
+
+cors_value = (settings.CORS_ALLOW_ORIGINS or "").strip()
+allow_all = (cors_value == "*")
+
 raw_origins = [
     o.strip()
-    for o in (settings.CORS_ALLOW_ORIGINS or "").split(",")
+    for o in cors_value.split(",")
     if o.strip()
 ]
-
-# If you truly want "allow all", set allow_credentials to False.
-# (Browsers will reject "*" with credentials.)
-allow_all = (settings.CORS_ALLOW_ORIGINS or "").strip() == "*"
 
 if allow_all:
     allow_origins = ["*"]
@@ -33,10 +34,8 @@ else:
     allow_origins = raw_origins
     allow_credentials = True
 
-# (Optional) Defensive: if env var is empty, your frontend will fail CORS.
-# Keep app running, but make it obvious in logs.
 if not allow_all and not allow_origins:
-    # This prints once on startup in most App Service setups.
+    # Keep app running but make misconfig obvious in logs
     print(
         "WARNING: CORS_ALLOW_ORIGINS is empty. "
         "Set it to a comma-separated list of allowed origins."
@@ -72,4 +71,6 @@ def _looks_explicit(text: str) -> bool:
 
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(payload: ChatReque
+async def chat(payload: ChatRequest, request: Request):
+    if not payload.messages:
+        raise HTTPException(status_code=400, detail="messages_
