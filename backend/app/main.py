@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from .settings import settings
@@ -6,7 +6,8 @@ from .models import ChatRequest, ChatResponse
 from .consent_store import consent_store
 from .consent_routes import router as consent_router
 
-app = FastAPI(title="AIHaven4U API")
+# Disable automatic trailing-slash redirects to avoid preflight redirect issues.
+app = FastAPI(title="AIHaven4U API", redirect_slashes=False)
 
 # -----------------------------
 # CORS
@@ -17,7 +18,6 @@ app = FastAPI(title="AIHaven4U API")
 # IMPORTANT:
 # - Browsers reject allow_origins=["*"] when allow_credentials=True.
 # - So we only allow "*" when allow_credentials is False.
-
 cors_value = (settings.CORS_ALLOW_ORIGINS or "").strip()
 allow_all = cors_value == "*"
 
@@ -53,6 +53,13 @@ app.include_router(consent_router)
 @app.get("/health")
 def health():
     return {"ok": True}
+
+
+# Explicit preflight handler (helps if anything upstream misroutes OPTIONS).
+# CORSMiddleware will still attach the proper Access-Control-* headers.
+@app.options("/chat")
+async def chat_preflight() -> Response:
+    return Response(status_code=204)
 
 
 def _looks_explicit(text: str) -> bool:
@@ -103,6 +110,7 @@ async def chat(payload: ChatRequest, request: Request):
         mode="safe",
         reply=f"You said: {user_text}",
     )
+
 
 @app.get("/debug/cors")
 def debug_cors():
