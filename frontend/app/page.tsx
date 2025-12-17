@@ -89,6 +89,51 @@ function requestedModeFromText(text: string): Mode | null {
   return null;
 }
 
+/**
+ * NEW: Detect explicit UI mode-switch phrases from either the user or your own buttons.
+ * Covers:
+ * - Friend <-> Romantic
+ * - Friend <-> Intimate (18+)
+ * - Romantic <-> Intimate (18+)
+ */
+function requestedModeFromHint(text: string): Mode | null {
+  const t = (text || "").toLowerCase().trim();
+
+  // Helper: common "switch" verbs
+  const wantsSwitch =
+    /\b(switch|change|go|return|get|set|move|put|back)\b/.test(t) ||
+    /\b(back to|go back to|switch back to|return to)\b/.test(t);
+
+  // Friend / friendly
+  if (
+    /\bfriend\b/.test(t) ||
+    /\bfriendly\b/.test(t) ||
+    /\bkeep it friendly\b/.test(t)
+  ) {
+    // If they’re clearly requesting a mode change (or explicitly mention mode),
+    // treat it as a friend-mode request.
+    if (wantsSwitch || /\bmode\b/.test(t)) return "friend";
+  }
+
+  // Romantic / romance
+  if (/\bromantic\b/.test(t) || /\bromance\b/.test(t)) {
+    if (wantsSwitch || /\bmode\b/.test(t)) return "romantic";
+  }
+
+  // Explicit / intimate (18+)
+  if (
+    /\bexplicit\b/.test(t) ||
+    /\bintimate\b/.test(t) ||
+    /\b18\+\b/.test(t) ||
+    /\bnsfw\b/.test(t)
+  ) {
+    if (wantsSwitch || /\bmode\b/.test(t) || /\bplease\b/.test(t)) return "explicit";
+  }
+
+  return null;
+}
+
+
 export default function Page() {
   const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "";
 
@@ -174,6 +219,20 @@ export default function Page() {
     const userText = (textOverride ?? input).trim();
     if (!userText) return;
 
+    // ✅ NEW: if this text is a mode-switch hint, treat it as an actual requested mode
+    const hintedMode = requestedModeFromHint(userText);
+    if (hintedMode) {
+      // Gate hinted switches too
+      if (!allowedModes.includes(hintedMode)) {
+        showUpgradeMessage(hintedMode);
+        setInput("");
+        return;
+      }
+      // Update UI immediately (fixes pill selection for all switch directions)
+      setSessionState((prev) => ({ ...prev, mode: hintedMode }));
+    }
+
+    // Existing: block prompt-based bypass for romance/explicit intent
     const requested = requestedModeFromText(userText);
     if (requested && !allowedModes.includes(requested)) {
       showUpgradeMessage(requested);
@@ -187,7 +246,9 @@ export default function Page() {
     setLoading(true);
 
     try {
-      const safeMode: Mode = allowedModes.includes(sessionState.mode) ? sessionState.mode : "friend";
+      // Prefer hinted mode for this turn, otherwise current session mode
+      const desiredMode = hintedMode ?? sessionState.mode;
+      const safeMode: Mode = allowedModes.includes(desiredMode) ? desiredMode : "friend";
 
       const stateToSend = {
         ...sessionState,
@@ -236,7 +297,11 @@ export default function Page() {
     <main style={{ maxWidth: 880, margin: "24px auto", padding: "0 16px", fontFamily: "system-ui" }}>
       <header style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 10 }}>
         <div aria-hidden style={{ width: 56, height: 56, borderRadius: "50%", overflow: "hidden" }}>
-          <img src="/ai-haven-heart.png" alt="AI Haven 4U Heart" style={{ width: "100%", height: "100%" }} />
+          <img
+            src="/ai-haven-heart.png"
+            alt="AI Haven 4U Heart"
+            style={{ width: "100%", height: "100%" }}
+          />
         </div>
         <div>
           <h1 style={{ margin: 0, fontSize: 22 }}>AI Haven 4U</h1>
@@ -274,8 +339,24 @@ export default function Page() {
 
       <section style={{ border: "1px solid #e5e5e5", borderRadius: 14, padding: 12, minHeight: 420 }}>
         {messages.map((m, i) => (
-          <div key={i} style={{ display: "flex", justifyContent: m.role === "user" ? "flex-end" : "flex-start", margin: "8px 0" }}>
-            <div style={{ maxWidth: "75%", padding: "10px 12px", borderRadius: 12, background: m.role === "user" ? "#111" : "white", color: m.role === "user" ? "white" : "#111", whiteSpace: "pre-wrap" }}>
+          <div
+            key={i}
+            style={{
+              display: "flex",
+              justifyContent: m.role === "user" ? "flex-end" : "flex-start",
+              margin: "8px 0",
+            }}
+          >
+            <div
+              style={{
+                maxWidth: "75%",
+                padding: "10px 12px",
+                borderRadius: 12,
+                background: m.role === "user" ? "#111" : "white",
+                color: m.role === "user" ? "white" : "#111",
+                whiteSpace: "pre-wrap",
+              }}
+            >
               {m.content}
             </div>
           </div>
@@ -292,13 +373,33 @@ export default function Page() {
           placeholder="Type here…"
           style={{ flex: 1, padding: 12, borderRadius: 10, border: "1px solid #ccc", fontSize: 15 }}
         />
-        <button onClick={() => send()} disabled={loading} style={{ padding: "12px 16px", borderRadius: 10, border: "none", background: "#111", color: "white", fontWeight: 600 }}>
+        <button
+          onClick={() => send()}
+          disabled={loading}
+          style={{
+            padding: "12px 16px",
+            borderRadius: 10,
+            border: "none",
+            background: "#111",
+            color: "white",
+            fontWeight: 600,
+          }}
+        >
           Send
         </button>
       </section>
 
       {pendingConsent && (
-        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.45)", display: "grid", placeItems: "center", padding: 16 }}>
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.45)",
+            display: "grid",
+            placeItems: "center",
+            padding: 16,
+          }}
+        >
           <div style={{ width: "100%", maxWidth: 440, background: "white", borderRadius: 14, padding: 16 }}>
             <h3 style={{ marginTop: 0 }}>
               {pendingConsent === "romance" && "Opt into Romantic Mode?"}
@@ -307,10 +408,16 @@ export default function Page() {
             </h3>
 
             <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
-              <button onClick={() => handleConsent("no")} style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #ccc", background: "white" }}>
+              <button
+                onClick={() => handleConsent("no")}
+                style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #ccc", background: "white" }}
+              >
                 No
               </button>
-              <button onClick={() => handleConsent("yes")} style={{ padding: "8px 12px", borderRadius: 8, border: "none", background: "#111", color: "white", fontWeight: 600 }}>
+              <button
+                onClick={() => handleConsent("yes")}
+                style={{ padding: "8px 12px", borderRadius: 8, border: "none", background: "#111", color: "white", fontWeight: 600 }}
+              >
                 Yes
               </button>
             </div>
