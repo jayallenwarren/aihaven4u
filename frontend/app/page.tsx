@@ -44,43 +44,28 @@ const ROMANTIC_ALLOWED_PLANS: PlanName[] = [
 
 function allowedModesForPlan(planName: PlanName): Mode[] {
   const modes: Mode[] = ["friend"];
-
-  if (ROMANTIC_ALLOWED_PLANS.includes(planName)) {
-    modes.push("romantic");
-  }
-
-  // Explicit only for Intimate (18+) tiers
-  if (planName === "Weekly - Intimate (18+)" || planName === "Test - Intimate (18+)") {
-    modes.push("explicit");
-  }
-
+  if (ROMANTIC_ALLOWED_PLANS.includes(planName)) modes.push("romantic");
+  if (planName === "Weekly - Intimate (18+)" || planName === "Test - Intimate (18+)") modes.push("explicit");
   return modes;
 }
 
 function isAllowedOrigin(origin: string) {
   if (origin === "https://aihaven4u.com") return true;
   if (origin === "https://www.aihaven4u.com") return true;
-
   if (origin === "https://editor.wix.com") return true;
   if (origin === "https://manage.wix.com") return true;
-
   if (/^https:\/\/[a-z0-9-]+\.wixsite\.com$/i.test(origin)) return true;
-
   return false;
 }
 
 function isRomanticRequest(text: string) {
   const t = (text || "").toLowerCase();
-  return /\bromance\b|\bromantic\b|\bflirt\b|\bflirty\b|\bdate\b|\bgirlfriend\b|\bboyfriend\b|\bkiss\b|\bmake out\b|\blove you\b/.test(
-    t
-  );
+  return /\bromance\b|\bromantic\b|\bflirt\b|\bflirty\b|\bdate\b|\bgirlfriend\b|\bboyfriend\b|\bkiss\b|\bmake out\b|\blove you\b/.test(t);
 }
 
 function isExplicitRequest(text: string) {
   const t = (text || "").toLowerCase();
-  return /\bexplicit\b|\bintimate\b|\b18\+\b|\bnsfw\b|\bsex\b|\bfuck\b|\bnude\b|\bnaked\b|\borgasm\b|\bblowjob\b|\bbj\b|\bdeep throat\b|\bsquirt\b|\bpee\b|\bfart\b|\bpussy\b|\banal\b/.test(
-    t
-  );
+  return /\bexplicit\b|\bintimate\b|\b18\+\b|\bnsfw\b|\bsex\b|\bfuck\b|\bnude\b|\bnaked\b|\borgasm\b|\bblowjob\b|\bbj\b|\bdeep throat\b|\bsquirt\b|\bpee\b|\bfart\b|\bpussy\b|\banal\b/.test(t);
 }
 
 function requestedModeFromText(text: string): Mode | null {
@@ -89,69 +74,42 @@ function requestedModeFromText(text: string): Mode | null {
   return null;
 }
 
-/**
- * NEW: Detect explicit UI mode-switch phrases from either the user or your own buttons.
- * Covers:
- * - Friend <-> Romantic
- * - Friend <-> Intimate (18+)
- * - Romantic <-> Intimate (18+)
- */
 function requestedModeFromHint(text: string): Mode | null {
   const t = (text || "").toLowerCase().trim();
-
-  // Helper: common "switch" verbs
   const wantsSwitch =
     /\b(switch|change|go|return|get|set|move|put|back)\b/.test(t) ||
     /\b(back to|go back to|switch back to|return to)\b/.test(t);
 
-  // Friend / friendly
-  if (
-    /\bfriend\b/.test(t) ||
-    /\bfriendly\b/.test(t) ||
-    /\bkeep it friendly\b/.test(t)
-  ) {
-    // If they’re clearly requesting a mode change (or explicitly mention mode),
-    // treat it as a friend-mode request.
-    if (wantsSwitch || /\bmode\b/.test(t)) return "friend";
+  if ((/\bfriend\b/.test(t) || /\bfriendly\b/.test(t) || /\bkeep it friendly\b/.test(t)) && (wantsSwitch || /\bmode\b/.test(t))) {
+    return "friend";
   }
-
-  // Romantic / romance
-  if (/\bromantic\b/.test(t) || /\bromance\b/.test(t)) {
-    if (wantsSwitch || /\bmode\b/.test(t)) return "romantic";
+  if ((/\bromantic\b/.test(t) || /\bromance\b/.test(t)) && (wantsSwitch || /\bmode\b/.test(t))) {
+    return "romantic";
   }
-
-  // Explicit / intimate (18+)
-  if (
-    /\bexplicit\b/.test(t) ||
-    /\bintimate\b/.test(t) ||
-    /\b18\+\b/.test(t) ||
-    /\bnsfw\b/.test(t)
-  ) {
-    if (wantsSwitch || /\bmode\b/.test(t) || /\bplease\b/.test(t)) return "explicit";
+  if ((/\bexplicit\b/.test(t) || /\bintimate\b/.test(t) || /\b18\+\b/.test(t) || /\bnsfw\b/.test(t)) && (wantsSwitch || /\bmode\b/.test(t) || /\bplease\b/.test(t))) {
+    return "explicit";
   }
-
   return null;
 }
-
 
 export default function Page() {
   const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "";
 
+  // ✅ persistent per-tab session_id (fixes 422)
   const sessionIdRef = useRef<string>("");
 
   useEffect(() => {
     const key = "aihaven4u_session_id";
     const existing = window.sessionStorage.getItem(key);
-
     if (existing) {
       sessionIdRef.current = existing;
-    } else {
-      const id =
-        (crypto as any).randomUUID?.() ??
-        `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-      sessionIdRef.current = id;
-      window.sessionStorage.setItem(key, id);
+      return;
     }
+    const id =
+      (crypto as any).randomUUID?.() ??
+      `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    sessionIdRef.current = id;
+    window.sessionStorage.setItem(key, id);
   }, []);
 
   const [input, setInput] = useState("");
@@ -209,33 +167,33 @@ export default function Page() {
     return () => window.removeEventListener("message", onMessage);
   }, []);
 
-  async function callChat(userText: string, nextMessages: Msg[], stateToSend: any) {
-  if (!API_BASE) throw new Error("NEXT_PUBLIC_API_BASE_URL is not set");
+  async function callChat(nextMessages: Msg[], stateToSend: any) {
+    if (!API_BASE) throw new Error("NEXT_PUBLIC_API_BASE_URL is not set");
 
-  const session_id =
-    sessionIdRef.current ||
-    (crypto as any).randomUUID?.() ||
-    `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const session_id =
+      sessionIdRef.current ||
+      (crypto as any).randomUUID?.() ||
+      `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
-  const res = await fetch(`${API_BASE}/chat`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      session_id,
-      wants_explicit: stateToSend?.explicit_consented === true,
-      messages: nextMessages.map((m) => ({ role: m.role, content: m.content })),
-    }),
-  });
+    // ✅ Send what backend expects: session_id + messages (+ wants_explicit)
+    const res = await fetch(`${API_BASE}/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id,
+        wants_explicit: stateToSend?.explicit_consented === true,
+        session_state: stateToSend, // optional; backend accepts it
+        messages: nextMessages.map((m) => ({ role: m.role, content: m.content })),
+      }),
+    });
 
-  if (!res.ok) {
-    const errText = await res.text().catch(() => "");
-    throw new Error(`Backend error ${res.status}: ${errText}`);
+    if (!res.ok) {
+      const errText = await res.text().catch(() => "");
+      throw new Error(`Backend error ${res.status}: ${errText}`);
+    }
+
+    return res.json() as Promise<{ reply: string; session_state?: SessionState }>;
   }
-
-  return res.json();
-}
-
-
 
   async function send(textOverride?: string) {
     if (loading) return;
@@ -243,20 +201,16 @@ export default function Page() {
     const userText = (textOverride ?? input).trim();
     if (!userText) return;
 
-    // ✅ NEW: if this text is a mode-switch hint, treat it as an actual requested mode
     const hintedMode = requestedModeFromHint(userText);
     if (hintedMode) {
-      // Gate hinted switches too
       if (!allowedModes.includes(hintedMode)) {
         showUpgradeMessage(hintedMode);
         setInput("");
         return;
       }
-      // Update UI immediately (fixes pill selection for all switch directions)
       setSessionState((prev) => ({ ...prev, mode: hintedMode }));
     }
 
-    // Existing: block prompt-based bypass for romance/explicit intent
     const requested = requestedModeFromText(userText);
     if (requested && !allowedModes.includes(requested)) {
       showUpgradeMessage(requested);
@@ -270,23 +224,20 @@ export default function Page() {
     setLoading(true);
 
     try {
-      // Prefer hinted mode for this turn, otherwise current session mode
       const desiredMode = hintedMode ?? sessionState.mode;
       const safeMode: Mode = allowedModes.includes(desiredMode) ? desiredMode : "friend";
 
-      const stateToSend = {
-        ...sessionState,
-        mode: safeMode,
-        plan_name: planName,
-      };
+      const stateToSend = { ...sessionState, mode: safeMode, plan_name: planName };
 
-      const data = await callChat(userText, nextMessages, stateToSend);
+      const data = await callChat(nextMessages, stateToSend);
 
       setMessages([...nextMessages, { role: "assistant", content: data.reply }]);
 
-      const nextState: SessionState = data.session_state ?? sessionState;
-      const coercedMode: Mode = allowedModes.includes(nextState.mode) ? nextState.mode : "friend";
-      setSessionState({ ...nextState, mode: coercedMode });
+      // backend may or may not send session_state; don’t require it
+      if (data.session_state) {
+        const coercedMode: Mode = allowedModes.includes(data.session_state.mode) ? data.session_state.mode : "friend";
+        setSessionState({ ...data.session_state, mode: coercedMode });
+      }
     } catch {
       setMessages([...nextMessages, { role: "assistant", content: "⚠️ Error talking to backend." }]);
     } finally {
@@ -321,11 +272,7 @@ export default function Page() {
     <main style={{ maxWidth: 880, margin: "24px auto", padding: "0 16px", fontFamily: "system-ui" }}>
       <header style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 10 }}>
         <div aria-hidden style={{ width: 56, height: 56, borderRadius: "50%", overflow: "hidden" }}>
-          <img
-            src="/ai-haven-heart.png"
-            alt="AI Haven 4U Heart"
-            style={{ width: "100%", height: "100%" }}
-          />
+          <img src="/ai-haven-heart.png" alt="AI Haven 4U Heart" style={{ width: "100%", height: "100%" }} />
         </div>
         <div>
           <h1 style={{ margin: 0, fontSize: 22 }}>AI Haven 4U</h1>
