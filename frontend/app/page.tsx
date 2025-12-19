@@ -1,9 +1,105 @@
 "use client";
 
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import havenHeart from "../public/ai-haven-heart.png";
 
 type Role = "user" | "assistant";
 type Msg = { role: Role; content: string };
+
+type CompanionMeta = {
+  first: string;
+  gender: string;
+  ethnicity: string;
+  generation: string;
+  key: string;
+};
+
+const DEFAULT_COMPANION_NAME = "Haven";
+const HEADSHOT_DIR = "/companion/headshot";
+const GREET_ONCE_KEY = "AIHAVEN_GREETED";
+
+// Bundled default avatar (avoids public-path issues when embedded in Wix iframe)
+const DEFAULT_AVATAR = havenHeart.src;
+
+function stripExt(s: string) {
+  return (s || "").replace(/\.(png|jpg|jpeg|webp)$/i, "");
+}
+
+function normalizeKeyForFile(raw: string) {
+  return (raw || "").trim().replace(/\s+/g, "-");
+}
+
+function parseCompanionMeta(raw: string): CompanionMeta {
+  const cleaned = stripExt(raw || "");
+  const parts = cleaned
+    .split("-")
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  // If the string isn't 4 parts, treat as Haven-ish fallback
+  if (parts.length < 4) {
+    return {
+      first: cleaned || DEFAULT_COMPANION_NAME,
+      gender: "",
+      ethnicity: "",
+      generation: "",
+      key: cleaned || DEFAULT_COMPANION_NAME,
+    };
+  }
+
+  const [first, gender, ethnicity, ...rest] = parts;
+  const generation = rest.join("-");
+
+  return {
+    first: first || DEFAULT_COMPANION_NAME,
+    gender: gender || "",
+    ethnicity: ethnicity || "",
+    generation: generation || "",
+    key: cleaned,
+  };
+}
+
+/**
+ * Generates candidate headshot URLs:
+ * - We try .jpeg, .jpg, then .png
+ * - We normalize spaces to hyphens ONLY for filenames
+ */
+function buildAvatarCandidates(companionKeyOrName: string) {
+  const raw = (companionKeyOrName || "").trim();
+  const normalized = normalizeKeyForFile(stripExt(raw));
+  const base = normalized ? `${HEADSHOT_DIR}/${encodeURIComponent(normalized)}` : "";
+
+  const candidates: string[] = [];
+  if (base) {
+    candidates.push(`${base}.jpeg`);
+    candidates.push(`${base}.jpg`);
+    candidates.push(`${base}.png`);
+  }
+
+  // Always end with bundled default avatar
+  candidates.push(DEFAULT_AVATAR);
+  return candidates;
+}
+
+async function pickFirstExisting(urls: string[]) {
+  for (const url of urls) {
+    // If this is the bundled default, just take it (no need to probe)
+    if (url === DEFAULT_AVATAR) return url;
+
+    try {
+      const res = await fetch(url, { method: "HEAD", cache: "no-store" });
+      if (res.ok) return url;
+    } catch {
+      // ignore and continue
+    }
+  }
+  return DEFAULT_AVATAR;
+}
+
+function greetingFor(name: string) {
+  const n = (name || DEFAULT_COMPANION_NAME).trim() || DEFAULT_COMPANION_NAME;
+  return `Hi, ${n} here. 😊 What's on your mind?`;
+}
 
 type Mode = "friend" | "romantic" | "explicit";
 
@@ -32,6 +128,8 @@ type PlanName =
   | "Test - Intimate (18+)"
   | null;
 
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
+
 const UPGRADE_URL = "https://www.aihaven4u.com/pricing-plans/list";
 
 const ROMANTIC_ALLOWED_PLANS: PlanName[] = [
@@ -50,66 +148,48 @@ function allowedModesForPlan(planName: PlanName): Mode[] {
 }
 
 function isAllowedOrigin(origin: string) {
-  if (origin === "https://aihaven4u.com") return true;
-  if (origin === "https://www.aihaven4u.com") return true;
-  if (origin === "https://editor.wix.com") return true;
-  if (origin === "https://manage.wix.com") return true;
-  if (/^https:\/\/[a-z0-9-]+\.wixsite\.com$/i.test(origin)) return true;
-  return false;
+  try {
+    const u = new URL(origin);
+    const host = u.hostname.toLowerCase();
+    if (host.endsWith("aihaven4u.com")) return true;
+    if (host.endsWith("wix.com")) return true;
+    if (host.endsWith("wixsite.com")) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+function requestedModeFromHint(text: string): Mode | null {
+  const t = (text || "").toLowerCase();
+  if (t.includes("mode:friend") || t.includes("[mode:friend]")) return "friend";
+  if (t.includes("mode:romantic") || t.includes("[mode:romantic]")) return "romantic";
+  if (t.includes("mode:explicit") || t.includes("[mode:explicit]")) return "explicit";
+  return null;
 }
 
 function isRomanticRequest(text: string) {
   const t = (text || "").toLowerCase();
-  return /\bromance\b|\bromantic\b|\bflirt\b|\bflirty\b|\bdate\b|\bgirlfriend\b|\bboyfriend\b|\bkiss\b|\bmake out\b|\blove you\b/.test(t);
+  return /\b(flirt|romance|romantic|date|kiss|love|boyfriend|girlfriend)\b/.test(t);
 }
 
 function isExplicitRequest(text: string) {
   const t = (text || "").toLowerCase();
-  return /\bexplicit\b|\bintimate\b|\b18\+\b|\bnsfw\b|\bsex\b|\bfuck\b|\bnude\b|\bnaked\b|\borgasm\b|\bblowjob\b|\bbj\b|\bdeep throat\b|\bsquirt\b|\bpee\b|\bfart\b|\bpussy\b|\banal\b/.test(t);
-}
-
-function requestedModeFromText(text: string): Mode | null {
-  if (isExplicitRequest(text)) return "explicit";
-  if (isRomanticRequest(text)) return "romantic";
-  return null;
-}
-
-function requestedModeFromHint(text: string): Mode | null {
-  const t = (text || "").toLowerCase().trim();
-  const wantsSwitch =
-    /\b(switch|change|go|return|get|set|move|put|back)\b/.test(t) ||
-    /\b(back to|go back to|switch back to|return to)\b/.test(t);
-
-  if ((/\bfriend\b/.test(t) || /\bfriendly\b/.test(t) || /\bkeep it friendly\b/.test(t)) && (wantsSwitch || /\bmode\b/.test(t))) {
-    return "friend";
-  }
-  if ((/\bromantic\b/.test(t) || /\bromance\b/.test(t)) && (wantsSwitch || /\bmode\b/.test(t))) {
-    return "romantic";
-  }
-  if ((/\bexplicit\b/.test(t) || /\bintimate\b/.test(t) || /\b18\+\b/.test(t) || /\bnsfw\b/.test(t)) && (wantsSwitch || /\bmode\b/.test(t) || /\bplease\b/.test(t))) {
-    return "explicit";
-  }
-  return null;
+  return /\b(sex|nude|explicit|intimate|nsfw|oral|penetration|hardcore)\b/.test(t);
 }
 
 export default function Page() {
-  const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "";
-
-  // ✅ persistent per-tab session_id (fixes 422)
-  const sessionIdRef = useRef<string>("");
+  const sessionIdRef = useRef<string | null>(null);
 
   useEffect(() => {
-    const key = "aihaven4u_session_id";
-    const existing = window.sessionStorage.getItem(key);
-    if (existing) {
-      sessionIdRef.current = existing;
-      return;
+    if (typeof window === "undefined") return;
+    const key = "AIHAVEN_SESSION_ID";
+    let id = window.sessionStorage.getItem(key);
+    if (!id) {
+      id = (crypto as any).randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      window.sessionStorage.setItem(key, id);
     }
-    const id =
-      (crypto as any).randomUUID?.() ??
-      `${Date.now()}-${Math.random().toString(16).slice(2)}`;
     sessionIdRef.current = id;
-    window.sessionStorage.setItem(key, id);
   }, []);
 
   const [input, setInput] = useState("");
@@ -126,21 +206,56 @@ export default function Page() {
   });
 
   const [planName, setPlanName] = useState<PlanName>(null);
+  const [companionName, setCompanionName] = useState<string>(DEFAULT_COMPANION_NAME);
+  const [avatarSrc, setAvatarSrc] = useState<string>(DEFAULT_AVATAR);
+  // full companion key string (e.g. "Aaliyah-Female-Black-Generation Z") used for avatar matching
+  const [companionKey, setCompanionKey] = useState<string>("");
+
   const [allowedModes, setAllowedModes] = useState<Mode[]>(["friend"]);
 
   const modePills = useMemo(() => ["friend", "romantic", "explicit"] as const, []);
   const scrollRef = useRef<HTMLDivElement>(null);
 
+  const scrollToBottom = useCallback(() => {
+    requestAnimationFrame(() => {
+      scrollRef.current?.scrollIntoView({ behavior: "smooth" });
+    });
+  }, []);
+
   useEffect(() => {
-    scrollRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, loading]);
+    scrollToBottom();
+  }, [messages, loading, scrollToBottom]);
+
+  // Greeting: once per *browser session* per companion
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const keyName = normalizeKeyForFile(companionName || DEFAULT_COMPANION_NAME);
+    const greetKey = `${GREET_ONCE_KEY}:${keyName}`;
+
+    // short delay so UI mounts + companionName can arrive from Wix postMessage
+    const tmr = window.setTimeout(() => {
+      const already = sessionStorage.getItem(greetKey) === "1";
+      if (already) return;
+
+      setMessages((prev) => {
+        // Don't duplicate if something already populated messages (safety)
+        if (prev && prev.length > 0) return prev;
+        return [{ role: "assistant", content: greetingFor(companionName || DEFAULT_COMPANION_NAME) }];
+      });
+
+      sessionStorage.setItem(greetKey, "1");
+    }, 150);
+
+    return () => window.clearTimeout(tmr);
+  }, [companionName]);
 
   function showUpgradeMessage(requestedMode: Mode) {
     const modeLabel = MODE_LABELS[requestedMode];
     const msg =
-      `The requested ${modeLabel} mode is not available for your current plan. ` +
-      `Your plan will need to be upgraded to complete your request.\n\n` +
-      `[Upgrade Plan](${UPGRADE_URL})`;
+      `The requested mode (${modeLabel}) isn't available on your current plan. ` +
+      `Please upgrade here: ${UPGRADE_URL}`;
+
     setMessages((prev) => [...prev, { role: "assistant", content: msg }]);
   }
 
@@ -153,6 +268,25 @@ export default function Page() {
 
       const incomingPlan = (data.planName ?? null) as PlanName;
       setPlanName(incomingPlan);
+
+      // Companion key/meta used for avatar matching (e.g. "Aaliyah-Female-Black-Generation Z")
+      const incomingCompanion =
+        typeof (data as any).companion === "string" ? (data as any).companion.trim() : "";
+      const resolvedCompanionKey = incomingCompanion || "";
+
+      if (resolvedCompanionKey) {
+        const parsed = parseCompanionMeta(resolvedCompanionKey);
+        setCompanionKey(parsed.key);
+        setCompanionName(parsed.first || DEFAULT_COMPANION_NAME);
+      } else {
+        setCompanionKey("");
+        setCompanionName(DEFAULT_COMPANION_NAME);
+      }
+
+      const avatarCandidates = buildAvatarCandidates(resolvedCompanionKey || DEFAULT_COMPANION_NAME);
+      pickFirstExisting(avatarCandidates).then((picked) => {
+        setAvatarSrc(picked);
+      });
 
       const nextAllowed = allowedModesForPlan(incomingPlan);
       setAllowedModes(nextAllowed);
@@ -209,75 +343,61 @@ export default function Page() {
         return;
       }
       setSessionState((prev) => ({ ...prev, mode: hintedMode }));
-    }
-
-    const requested = requestedModeFromText(userText);
-    if (requested && !allowedModes.includes(requested)) {
-      showUpgradeMessage(requested);
       setInput("");
       return;
     }
 
-    const nextMessages: Msg[] = [...messages, { role: "user", content: userText }];
+    // Gate based on plan for inferred intent
+    if (isExplicitRequest(userText) && !allowedModes.includes("explicit")) {
+      showUpgradeMessage("explicit");
+      setInput("");
+      return;
+    }
+    if (isRomanticRequest(userText) && !allowedModes.includes("romantic")) {
+      showUpgradeMessage("romantic");
+      setInput("");
+      return;
+    }
+
+    const nextMessages = [...messages, { role: "user", content: userText }];
     setMessages(nextMessages);
     setInput("");
     setLoading(true);
 
     try {
-      const desiredMode = hintedMode ?? sessionState.mode;
-      const safeMode: Mode = allowedModes.includes(desiredMode) ? desiredMode : "friend";
+      const data = await callChat(nextMessages, sessionState);
 
-      const stateToSend = { ...sessionState, mode: safeMode, plan_name: planName };
+      if (data.session_state) setSessionState(data.session_state);
 
-      const data = await callChat(nextMessages, stateToSend);
-
-      setMessages([...nextMessages, { role: "assistant", content: data.reply }]);
-
-      // backend may or may not send session_state; don’t require it
-      if (data.session_state) {
-        const coercedMode: Mode = allowedModes.includes(data.session_state.mode) ? data.session_state.mode : "friend";
-        setSessionState({ ...data.session_state, mode: coercedMode });
-      }
-    } catch {
-      setMessages([...nextMessages, { role: "assistant", content: "⚠️ Error talking to backend." }]);
+      setMessages((prev) => [...prev, { role: "assistant", content: data.reply }]);
+    } catch (err: any) {
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: `Error: ${err?.message ?? "Unknown error"}` },
+      ]);
     } finally {
       setLoading(false);
     }
   }
 
-  function requestMode(mode: Mode) {
-    if (!allowedModes.includes(mode)) {
-      showUpgradeMessage(mode);
-      return;
-    }
-
-    const hint =
-      mode === "friend"
-        ? "Let’s stay in Friend Mode."
-        : mode === "romantic"
-        ? "Can we switch to Romantic Mode?"
-        : "Can we switch to Explicit Mode?";
-
-    setSessionState((prev) => ({ ...prev, mode }));
-    send(hint);
-  }
-
-  async function handleConsent(choice: "yes" | "no") {
-    await send(choice);
-  }
-
-  const pendingConsent = sessionState.pending_consent;
-
   return (
     <main style={{ maxWidth: 880, margin: "24px auto", padding: "0 16px", fontFamily: "system-ui" }}>
       <header style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 10 }}>
         <div aria-hidden style={{ width: 56, height: 56, borderRadius: "50%", overflow: "hidden" }}>
-          <img src="/ai-haven-heart.png" alt="AI Haven 4U Heart" style={{ width: "100%", height: "100%" }} />
+          <img
+            src={avatarSrc}
+            alt="AI Haven 4U"
+            style={{ width: "100%", height: "100%" }}
+            onError={(e) => {
+              (e.currentTarget as HTMLImageElement).src = DEFAULT_AVATAR;
+            }}
+          />
         </div>
         <div>
           <h1 style={{ margin: 0, fontSize: 22 }}>AI Haven 4U</h1>
           <div style={{ fontSize: 12, color: "#666" }}>
-            Plan: <b>{planName ?? "Unknown / Not provided"}</b>
+            Companion: <b>{companionName || DEFAULT_COMPANION_NAME}</b> • Plan:{" "}
+            <b>{planName ?? "Unknown / Not provided"}</b>
           </div>
         </div>
       </header>
@@ -285,22 +405,28 @@ export default function Page() {
       <section style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
         {modePills.map((m) => {
           const active = sessionState.mode === m;
-          const enabled = allowedModes.includes(m);
+          const disabled = !allowedModes.includes(m);
           return (
             <button
               key={m}
-              onClick={() => requestMode(m)}
-              style={{
-                padding: "6px 12px",
-                borderRadius: 999,
-                border: active ? "1px solid #222" : "1px solid #ccc",
-                background: active ? "#111" : "white",
-                color: active ? "white" : "#111",
-                fontSize: 13,
-                cursor: "pointer",
-                opacity: enabled ? 1 : 0.5,
+              disabled={disabled}
+              onClick={() => {
+                if (disabled) return showUpgradeMessage(m);
+                setSessionState((prev) => ({ ...prev, mode: m }));
+                setMessages((prev) => [
+                  ...prev,
+                  { role: "assistant", content: `Mode set to: ${MODE_LABELS[m]}` },
+                ]);
               }}
-              title={enabled ? `Request ${MODE_LABELS[m]} Mode` : "Upgrade required"}
+              style={{
+                padding: "8px 12px",
+                borderRadius: 999,
+                border: "1px solid #ddd",
+                background: active ? "#111" : "#fff",
+                color: active ? "#fff" : "#111",
+                opacity: disabled ? 0.45 : 1,
+                cursor: disabled ? "not-allowed" : "pointer",
+              }}
             >
               {MODE_LABELS[m]}
             </button>
@@ -308,31 +434,21 @@ export default function Page() {
         })}
       </section>
 
-      <section style={{ border: "1px solid #e5e5e5", borderRadius: 14, padding: 12, minHeight: 420 }}>
+      <section
+        style={{
+          border: "1px solid #e5e5e5",
+          borderRadius: 12,
+          padding: 12,
+          minHeight: 360,
+        }}
+      >
         {messages.map((m, i) => (
-          <div
-            key={i}
-            style={{
-              display: "flex",
-              justifyContent: m.role === "user" ? "flex-end" : "flex-start",
-              margin: "8px 0",
-            }}
-          >
-            <div
-              style={{
-                maxWidth: "75%",
-                padding: "10px 12px",
-                borderRadius: 12,
-                background: m.role === "user" ? "#111" : "white",
-                color: m.role === "user" ? "white" : "#111",
-                whiteSpace: "pre-wrap",
-              }}
-            >
-              {m.content}
-            </div>
+          <div key={i} style={{ marginBottom: 10 }}>
+            <div style={{ fontSize: 12, color: "#666" }}>{m.role === "user" ? "You" : "AI"}</div>
+            <div style={{ whiteSpace: "pre-wrap" }}>{m.content}</div>
           </div>
         ))}
-        {loading && <div style={{ color: "#444" }}>Thinking…</div>}
+        {loading && <div style={{ color: "#666" }}>Thinking…</div>}
         <div ref={scrollRef} />
       </section>
 
@@ -340,56 +456,62 @@ export default function Page() {
         <input
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && send()}
-          placeholder="Type here…"
-          style={{ flex: 1, padding: 12, borderRadius: 10, border: "1px solid #ccc", fontSize: 15 }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") send();
+          }}
+          placeholder="Type a message…"
+          style={{
+            flex: 1,
+            padding: "10px 12px",
+            borderRadius: 10,
+            border: "1px solid #ddd",
+          }}
         />
         <button
           onClick={() => send()}
-          disabled={loading}
           style={{
-            padding: "12px 16px",
+            padding: "10px 14px",
             borderRadius: 10,
-            border: "none",
+            border: "1px solid #111",
             background: "#111",
-            color: "white",
-            fontWeight: 600,
+            color: "#fff",
+            cursor: "pointer",
           }}
         >
           Send
         </button>
       </section>
 
-      {pendingConsent && (
+      {/* Consent overlay (existing behavior in page_w.tsx) */}
+      {sessionState.pending_consent && (
         <div
           style={{
             position: "fixed",
             inset: 0,
-            background: "rgba(0,0,0,0.45)",
-            display: "grid",
-            placeItems: "center",
+            background: "rgba(0,0,0,0.4)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
             padding: 16,
           }}
         >
-          <div style={{ width: "100%", maxWidth: 440, background: "white", borderRadius: 14, padding: 16 }}>
-            <h3 style={{ marginTop: 0 }}>
-              {pendingConsent === "romance" && "Opt into Romantic Mode?"}
-              {pendingConsent === "adult" && "Confirm you’re 18+?"}
-              {pendingConsent === "explicit" && "Opt into Explicit Mode?"}
-            </h3>
-
-            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+          <div style={{ background: "#fff", borderRadius: 12, padding: 16, maxWidth: 520, width: "100%" }}>
+            <h3 style={{ marginTop: 0 }}>Consent Required</h3>
+            <p style={{ marginTop: 0 }}>
+              Please confirm to proceed. (Pending: <b>{sessionState.pending_consent}</b>)
+            </p>
+            <div style={{ display: "flex", gap: 8 }}>
               <button
-                onClick={() => handleConsent("no")}
-                style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #ccc", background: "white" }}
-              >
-                No
-              </button>
-              <button
-                onClick={() => handleConsent("yes")}
-                style={{ padding: "8px 12px", borderRadius: 8, border: "none", background: "#111", color: "white", fontWeight: 600 }}
+                onClick={() => send("Yes")}
+                style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #111", background: "#111", color: "#fff" }}
               >
                 Yes
+              </button>
+              <button
+                onClick={() => send("No")}
+                style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #ddd", background: "#fff" }}
+              >
+                No
               </button>
             </div>
           </div>
