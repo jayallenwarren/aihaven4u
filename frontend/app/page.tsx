@@ -143,7 +143,8 @@ const ROMANTIC_ALLOWED_PLANS: PlanName[] = [
 function allowedModesForPlan(planName: PlanName): Mode[] {
   const modes: Mode[] = ["friend"];
   if (ROMANTIC_ALLOWED_PLANS.includes(planName)) modes.push("romantic");
-  if (planName === "Weekly - Intimate (18+)" || planName === "Test - Intimate (18+)") modes.push("explicit");
+  if (planName === "Weekly - Intimate (18+)" || planName === "Test - Intimate (18+)")
+    modes.push("explicit");
   return modes;
 }
 
@@ -238,10 +239,16 @@ export default function Page() {
       const already = sessionStorage.getItem(greetKey) === "1";
       if (already) return;
 
+      // ✅ ensure Msg typing so Role doesn't widen to string
+      const greetingMsg: Msg = {
+        role: "assistant",
+        content: greetingFor(companionName || DEFAULT_COMPANION_NAME),
+      };
+
       setMessages((prev) => {
         // Don't duplicate if something already populated messages (safety)
         if (prev && prev.length > 0) return prev;
-        return [{ role: "assistant", content: greetingFor(companionName || DEFAULT_COMPANION_NAME) }];
+        return [greetingMsg];
       });
 
       sessionStorage.setItem(greetKey, "1");
@@ -256,7 +263,9 @@ export default function Page() {
       `The requested mode (${modeLabel}) isn't available on your current plan. ` +
       `Please upgrade here: ${UPGRADE_URL}`;
 
-    setMessages((prev) => [...prev, { role: "assistant", content: msg }]);
+    // ✅ ensure Msg typing so Role doesn't widen to string
+    const upgradeMsg: Msg = { role: "assistant", content: msg };
+    setMessages((prev) => [...prev, upgradeMsg]);
   }
 
   useEffect(() => {
@@ -359,7 +368,10 @@ export default function Page() {
       return;
     }
 
-    const nextMessages = [...messages, { role: "user", content: userText }];
+    // ✅ ensure Msg typing so Role doesn't widen to string
+    const userMsg: Msg = { role: "user", content: userText };
+    const nextMessages: Msg[] = [...messages, userMsg];
+
     setMessages(nextMessages);
     setInput("");
     setLoading(true);
@@ -369,12 +381,15 @@ export default function Page() {
 
       if (data.session_state) setSessionState(data.session_state);
 
-      setMessages((prev) => [...prev, { role: "assistant", content: data.reply }]);
+      // ✅ ensure Msg typing so Role doesn't widen to string
+      const assistantMsg: Msg = { role: "assistant", content: data.reply };
+      setMessages((prev) => [...prev, assistantMsg]);
     } catch (err: any) {
-      setMessages((prev) => [
-        ...prev,
-        { role: "assistant", content: `Error: ${err?.message ?? "Unknown error"}` },
-      ]);
+      const errorMsg: Msg = {
+        role: "assistant",
+        content: `Error: ${err?.message ?? "Unknown error"}`,
+      };
+      setMessages((prev) => [...prev, errorMsg]);
     } finally {
       setLoading(false);
     }
@@ -413,10 +428,10 @@ export default function Page() {
               onClick={() => {
                 if (disabled) return showUpgradeMessage(m);
                 setSessionState((prev) => ({ ...prev, mode: m }));
-                setMessages((prev) => [
-                  ...prev,
-                  { role: "assistant", content: `Mode set to: ${MODE_LABELS[m]}` },
-                ]);
+
+                // ✅ ensure Msg typing so Role doesn't widen to string
+                const modeMsg: Msg = { role: "assistant", content: `Mode set to: ${MODE_LABELS[m]}` };
+                setMessages((prev) => [...prev, modeMsg]);
               }}
               style={{
                 padding: "8px 12px",
@@ -495,7 +510,15 @@ export default function Page() {
             padding: 16,
           }}
         >
-          <div style={{ background: "#fff", borderRadius: 12, padding: 16, maxWidth: 520, width: "100%" }}>
+          <div
+            style={{
+              background: "#fff",
+              borderRadius: 12,
+              padding: 16,
+              maxWidth: 520,
+              width: "100%",
+            }}
+          >
             <h3 style={{ marginTop: 0 }}>Consent Required</h3>
             <p style={{ marginTop: 0 }}>
               Please confirm to proceed. (Pending: <b>{sessionState.pending_consent}</b>)
@@ -503,13 +526,24 @@ export default function Page() {
             <div style={{ display: "flex", gap: 8 }}>
               <button
                 onClick={() => send("Yes")}
-                style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #111", background: "#111", color: "#fff" }}
+                style={{
+                  padding: "10px 12px",
+                  borderRadius: 10,
+                  border: "1px solid #111",
+                  background: "#111",
+                  color: "#fff",
+                }}
               >
                 Yes
               </button>
               <button
                 onClick={() => send("No")}
-                style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #ddd", background: "#fff" }}
+                style={{
+                  padding: "10px 12px",
+                  borderRadius: 10,
+                  border: "1px solid #ddd",
+                  background: "#fff",
+                }}
               >
                 No
               </button>
