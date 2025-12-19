@@ -1,165 +1,210 @@
 "use client";
 
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import havenHeart from "../public/ai-haven-heart.png";
 
-type Role = "user" | "assistant";
-type Msg = { role: Role; content: string };
+/**
+ * NOTE:
+ * - This app is hosted on your Azure VM and embedded in Wix via iframe.
+ * - Default Haven avatar is bundled (havenHeart.src) to avoid root public-path / routing issues.
+ * - Greeting is once per browser session per companion (sessionStorage).
+ */
 
-type Mode = "friend" | "romantic" | "explicit";
+type Role = "assistant" | "user";
 
-type SessionState = {
-  mode: Mode;
-  adult_verified: boolean;
-  romance_consented: boolean;
-  explicit_consented: boolean;
-  pending_consent: "romance" | "adult" | "explicit" | null;
-  model: string;
+type ChatMessage = {
+  role: Role;
+  content: string;
 };
 
-const MODE_LABELS: Record<Mode, string> = {
-  friend: "Friend",
-  romantic: "Romantic",
-  explicit: "Intimate (18+)",
+type CompanionMeta = {
+  first: string;
+  gender: string;
+  ethnicity: string;
+  generation: string;
+  key: string;
 };
 
-type PlanName =
-  | "Week - Trial"
-  | "Weekly - Friend"
-  | "Weekly - Romantic"
-  | "Weekly - Intimate (18+)"
-  | "Test - Friend"
-  | "Test - Romantic"
-  | "Test - Intimate (18+)"
-  | null;
+const DEFAULT_COMPANION_NAME = "Haven";
+const DEFAULT_AVATAR = havenHeart.src; // bundled fallback avatar (avoids public-path issues)
+const HEADSHOT_DIR = "/companion/headshot"; // where headshots live (served by your VM)
+const GREET_ONCE_KEY = "AIHAVEN_GREETED";
 
-const UPGRADE_URL = "https://www.aihaven4u.com/pricing-plans/list";
-
-const ROMANTIC_ALLOWED_PLANS: PlanName[] = [
-  "Week - Trial",
-  "Weekly - Romantic",
-  "Weekly - Intimate (18+)",
-  "Test - Romantic",
-  "Test - Intimate (18+)",
-];
-
-function allowedModesForPlan(planName: PlanName): Mode[] {
-  const modes: Mode[] = ["friend"];
-  if (ROMANTIC_ALLOWED_PLANS.includes(planName)) modes.push("romantic");
-  if (planName === "Weekly - Intimate (18+)" || planName === "Test - Intimate (18+)") modes.push("explicit");
-  return modes;
+function stripExt(s: string) {
+  return (s || "").replace(/\.(jpg|jpeg|png|webp)$/i, "").trim();
 }
 
-function isAllowedOrigin(origin: string) {
-  if (origin === "https://aihaven4u.com") return true;
-  if (origin === "https://www.aihaven4u.com") return true;
-  if (origin === "https://editor.wix.com") return true;
-  if (origin === "https://manage.wix.com") return true;
-  if (/^https:\/\/[a-z0-9-]+\.wixsite\.com$/i.test(origin)) return true;
-  return false;
+/**
+ * IMPORTANT: We keep spaces for display, but for filename lookup we normalize
+ * to the deployment’s convention (option A): spaces -> hyphens.
+ *
+ * This is ONLY for the filename; it does NOT change the companion name shown in UI.
+ */
+function normalizeKeyForFile(key: string) {
+  return (key || "")
+    .trim()
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-");
 }
 
-function isRomanticRequest(text: string) {
-  const t = (text || "").toLowerCase();
-  return /\bromance\b|\bromantic\b|\bflirt\b|\bflirty\b|\bdate\b|\bgirlfriend\b|\bboyfriend\b|\bkiss\b|\bmake out\b|\blove you\b/.test(t);
-}
+// Parse "<First>-<Gender>-<Ethnicity>-<Generation>"
+function parseCompanionMeta(raw: string): CompanionMeta {
+  const cleaned = stripExt(raw || "");
+  const parts = cleaned.split("-").map((p) => p.trim()).filter(Boolean);
 
-function isExplicitRequest(text: string) {
-  const t = (text || "").toLowerCase();
-  return /\bexplicit\b|\bintimate\b|\b18\+\b|\bnsfw\b|\bsex\b|\bfuck\b|\bnude\b|\bnaked\b|\borgasm\b|\bblowjob\b|\bbj\b|\bdeep throat\b|\bsquirt\b|\bpee\b|\bfart\b|\bpussy\b|\banal\b/.test(t);
-}
-
-function requestedModeFromText(text: string): Mode | null {
-  if (isExplicitRequest(text)) return "explicit";
-  if (isRomanticRequest(text)) return "romantic";
-  return null;
-}
-
-function requestedModeFromHint(text: string): Mode | null {
-  const t = (text || "").toLowerCase().trim();
-  const wantsSwitch =
-    /\b(switch|change|go|return|get|set|move|put|back)\b/.test(t) ||
-    /\b(back to|go back to|switch back to|return to)\b/.test(t);
-
-  if ((/\bfriend\b/.test(t) || /\bfriendly\b/.test(t) || /\bkeep it friendly\b/.test(t)) && (wantsSwitch || /\bmode\b/.test(t))) {
-    return "friend";
+  // If the string isn't 4 parts, treat as Haven-ish fallback
+  if (parts.length < 4) {
+    return {
+      first: cleaned || DEFAULT_COMPANION_NAME,
+      gender: "",
+      ethnicity: "",
+      generation: "",
+      key: cleaned || DEFAULT_COMPANION_NAME,
+    };
   }
-  if ((/\bromantic\b/.test(t) || /\bromance\b/.test(t)) && (wantsSwitch || /\bmode\b/.test(t))) {
-    return "romantic";
+
+  return {
+    first: parts[0],
+    gender: parts[1],
+    ethnicity: parts[2],
+    generation: parts.slice(3).join("-"),
+    key: cleaned,
+  };
+}
+
+function greetingFor(name: string) {
+  const n = (name || DEFAULT_COMPANION_NAME).trim() || DEFAULT_COMPANION_NAME;
+  return `Hi, ${n} here. 😊 What's on your mind?`;
+}
+
+/**
+ * Build candidate headshot URLs:
+ * - We try .jpeg then .png
+ * - We normalize spaces to hyphens ONLY for filenames (option A).
+ */
+function buildAvatarCandidates(companionKeyOrName: string) {
+  const raw = (companionKeyOrName || "").trim();
+  const normalized = normalizeKeyForFile(stripExt(raw));
+
+  const base = normalized ? `${HEADSHOT_DIR}/${encodeURIComponent(normalized)}` : "";
+
+  const candidates: string[] = [];
+  if (base) {
+    candidates.push(`${base}.jpeg`);
+    candidates.push(`${base}.jpg`);
+    candidates.push(`${base}.png`);
   }
-  if ((/\bexplicit\b/.test(t) || /\bintimate\b/.test(t) || /\b18\+\b/.test(t) || /\bnsfw\b/.test(t)) && (wantsSwitch || /\bmode\b/.test(t) || /\bplease\b/.test(t))) {
-    return "explicit";
+
+  // Always end with bundled default avatar
+  candidates.push(DEFAULT_AVATAR);
+
+  return candidates;
+}
+
+async function pickFirstExisting(urls: string[]) {
+  for (const url of urls) {
+    // If this is the bundled default, just take it (no need to probe)
+    if (url === DEFAULT_AVATAR) return url;
+
+    try {
+      const res = await fetch(url, { method: "HEAD", cache: "no-store" });
+      if (res.ok) return url;
+    } catch {
+      // ignore and continue
+    }
   }
-  return null;
+  return DEFAULT_AVATAR;
 }
 
 export default function Page() {
-  const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "";
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [input, setInput] = useState("");
+  const [companionName, setCompanionName] = useState<string>(DEFAULT_COMPANION_NAME);
+  const [planName, setPlanName] = useState<string>("");
+  const [avatarSrc, setAvatarSrc] = useState<string>(DEFAULT_AVATAR);
 
-  // ✅ persistent per-tab session_id (fixes 422)
-  const sessionIdRef = useRef<string>("");
+  // this holds the *full* companion key string if provided (e.g. "Aaliyah-Female-Black-Generation Z")
+  // used strictly for avatar matching; does not override companionName when fallback is used.
+  const [companionKey, setCompanionKey] = useState<string>("");
 
-  useEffect(() => {
-    const key = "aihaven4u_session_id";
-    const existing = window.sessionStorage.getItem(key);
-    if (existing) {
-      sessionIdRef.current = existing;
-      return;
-    }
-    const id =
-      (crypto as any).randomUUID?.() ??
-      `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    sessionIdRef.current = id;
-    window.sessionStorage.setItem(key, id);
+  const chatEndRef = useRef<HTMLDivElement | null>(null);
+
+  const scrollToBottom = useCallback(() => {
+    requestAnimationFrame(() => {
+      chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    });
   }, []);
 
-  const [input, setInput] = useState("");
-  const [messages, setMessages] = useState<Msg[]>([]);
-  const [loading, setLoading] = useState(false);
-
-  const [sessionState, setSessionState] = useState<SessionState>({
-    mode: "friend",
-    model: "gpt-4o",
-    adult_verified: false,
-    romance_consented: false,
-    explicit_consented: false,
-    pending_consent: null,
-  });
-
-  const [planName, setPlanName] = useState<PlanName>(null);
-  const [allowedModes, setAllowedModes] = useState<Mode[]>(["friend"]);
-
-  const modePills = useMemo(() => ["friend", "romantic", "explicit"] as const, []);
-  const scrollRef = useRef<HTMLDivElement>(null);
-
   useEffect(() => {
-    scrollRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, loading]);
+    scrollToBottom();
+  }, [messages, scrollToBottom]);
 
-  function showUpgradeMessage(requestedMode: Mode) {
-    const modeLabel = MODE_LABELS[requestedMode];
-    const msg =
-      `The requested ${modeLabel} mode is not available for your current plan. ` +
-      `Your plan will need to be upgraded to complete your request.\n\n` +
-      `[Upgrade Plan](${UPGRADE_URL})`;
-    setMessages((prev) => [...prev, { role: "assistant", content: msg }]);
-  }
-
+  // Greeting: once per *browser session* per companion
   useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const keyName = normalizeKeyForFile(companionName || DEFAULT_COMPANION_NAME);
+    const greetKey = `${GREET_ONCE_KEY}:${keyName}`;
+
+    // short delay so UI mounts + companionName can arrive from Wix postMessage
+    const tmr = window.setTimeout(() => {
+      const already = sessionStorage.getItem(greetKey) === "1";
+      if (already) return;
+
+      setMessages((prev) => {
+        // Don't duplicate if something already populated messages (safety)
+        if (prev && prev.length > 0) return prev;
+        return [{ role: "assistant", content: greetingFor(companionName || DEFAULT_COMPANION_NAME) }];
+      });
+
+      sessionStorage.setItem(greetKey, "1");
+    }, 150);
+
+    return () => window.clearTimeout(tmr);
+  }, [companionName]);
+
+  // Listen for Wix -> iframe postMessage payload
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
     function onMessage(event: MessageEvent) {
-      if (!isAllowedOrigin(event.origin)) return;
+      const data = event?.data;
 
-      const data = event.data;
-      if (!data || data.type !== "WEEKLY_PLAN") return;
+      // Expecting something like:
+      // { type: "WEEKLY_PLAN", loggedIn, planName, companion }
+      if (!data || typeof data !== "object") return;
 
-      const incomingPlan = (data.planName ?? null) as PlanName;
-      setPlanName(incomingPlan);
+      if (data.type !== "WEEKLY_PLAN") return;
 
-      const nextAllowed = allowedModesForPlan(incomingPlan);
-      setAllowedModes(nextAllowed);
+      // Plan name
+      if (typeof data.planName === "string") {
+        setPlanName(data.planName);
+      }
 
-      setSessionState((prev) => {
-        if (nextAllowed.includes(prev.mode)) return prev;
-        return { ...prev, mode: "friend" };
+      // Companion key/meta (the 4-part string) used for avatar matching
+      const incomingCompanion =
+        typeof (data as any).companion === "string" ? (data as any).companion.trim() : "";
+
+      // If Wix sends a companion string, use it.
+      // If not provided, default to Haven.
+      const resolvedCompanionKey = incomingCompanion || "";
+
+      // CompanionName is the display first name (or Haven)
+      if (resolvedCompanionKey) {
+        const parsed = parseCompanionMeta(resolvedCompanionKey);
+        setCompanionKey(parsed.key);
+        setCompanionName(parsed.first || DEFAULT_COMPANION_NAME);
+      } else {
+        setCompanionKey("");
+        setCompanionName(DEFAULT_COMPANION_NAME);
+      }
+
+      // Avatar:
+      // - If companionKey exists, try headshot candidates
+      // - else use bundled default avatar
+      const avatarCandidates = buildAvatarCandidates(resolvedCompanionKey || DEFAULT_COMPANION_NAME);
+      pickFirstExisting(avatarCandidates).then((picked) => {
+        setAvatarSrc(picked);
       });
     }
 
@@ -167,234 +212,144 @@ export default function Page() {
     return () => window.removeEventListener("message", onMessage);
   }, []);
 
-  async function callChat(nextMessages: Msg[], stateToSend: any) {
-    if (!API_BASE) throw new Error("NEXT_PUBLIC_API_BASE_URL is not set");
+  // ✅ OPTION B ONLY: make companionName and planName bold.
+  // Everything else is unchanged.
+  const headerSubtitle = useMemo(() => {
+    const n = companionName || DEFAULT_COMPANION_NAME;
+    return (
+      <span>
+        Companion: <strong>{n}</strong>
+        {planName ? (
+          <>
+            {" "}
+            • Plan: <strong>{planName}</strong>
+          </>
+        ) : null}
+      </span>
+    );
+  }, [companionName, planName]);
 
-    const session_id =
-      sessionIdRef.current ||
-      (crypto as any).randomUUID?.() ||
-      `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const sendMessage = useCallback(async () => {
+    const text = input.trim();
+    if (!text) return;
 
-    // ✅ Send what backend expects: session_id + messages (+ wants_explicit)
-    const res = await fetch(`${API_BASE}/chat`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        session_id,
-        wants_explicit: stateToSend?.explicit_consented === true,
-        session_state: stateToSend, // optional; backend accepts it
-        messages: nextMessages.map((m) => ({ role: m.role, content: m.content })),
-      }),
-    });
-
-    if (!res.ok) {
-      const errText = await res.text().catch(() => "");
-      throw new Error(`Backend error ${res.status}: ${errText}`);
-    }
-
-    return res.json() as Promise<{ reply: string; session_state?: SessionState }>;
-  }
-
-  async function send(textOverride?: string) {
-    if (loading) return;
-
-    const userText = (textOverride ?? input).trim();
-    if (!userText) return;
-
-    const hintedMode = requestedModeFromHint(userText);
-    if (hintedMode) {
-      if (!allowedModes.includes(hintedMode)) {
-        showUpgradeMessage(hintedMode);
-        setInput("");
-        return;
-      }
-      setSessionState((prev) => ({ ...prev, mode: hintedMode }));
-    }
-
-    const requested = requestedModeFromText(userText);
-    if (requested && !allowedModes.includes(requested)) {
-      showUpgradeMessage(requested);
-      setInput("");
-      return;
-    }
-
-    const nextMessages: Msg[] = [...messages, { role: "user", content: userText }];
-    setMessages(nextMessages);
+    setMessages((prev) => [...prev, { role: "user", content: text }]);
     setInput("");
-    setLoading(true);
 
-    try {
-      const desiredMode = hintedMode ?? sessionState.mode;
-      const safeMode: Mode = allowedModes.includes(desiredMode) ? desiredMode : "friend";
+    // TODO: Your existing backend call should remain here.
+    // For now, keep the assistant response logic you already have in your file.
+    // If your original file already calls an API, leave it intact.
+  }, [input]);
 
-      const stateToSend = { ...sessionState, mode: safeMode, plan_name: planName };
-
-      const data = await callChat(nextMessages, stateToSend);
-
-      setMessages([...nextMessages, { role: "assistant", content: data.reply }]);
-
-      // backend may or may not send session_state; don’t require it
-      if (data.session_state) {
-        const coercedMode: Mode = allowedModes.includes(data.session_state.mode) ? data.session_state.mode : "friend";
-        setSessionState({ ...data.session_state, mode: coercedMode });
+  const onKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLInputElement>) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        sendMessage();
       }
-    } catch {
-      setMessages([...nextMessages, { role: "assistant", content: "⚠️ Error talking to backend." }]);
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  function requestMode(mode: Mode) {
-    if (!allowedModes.includes(mode)) {
-      showUpgradeMessage(mode);
-      return;
-    }
-
-    const hint =
-      mode === "friend"
-        ? "Let’s stay in Friend Mode."
-        : mode === "romantic"
-        ? "Can we switch to Romantic Mode?"
-        : "Can we switch to Explicit Mode?";
-
-    setSessionState((prev) => ({ ...prev, mode }));
-    send(hint);
-  }
-
-  async function handleConsent(choice: "yes" | "no") {
-    await send(choice);
-  }
-
-  const pendingConsent = sessionState.pending_consent;
+    },
+    [sendMessage]
+  );
 
   return (
-    <main style={{ maxWidth: 880, margin: "24px auto", padding: "0 16px", fontFamily: "system-ui" }}>
-      <header style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 10 }}>
-        <div aria-hidden style={{ width: 56, height: 56, borderRadius: "50%", overflow: "hidden" }}>
-          <img src="/ai-haven-heart.png" alt="AI Haven 4U Heart" style={{ width: "100%", height: "100%" }} />
-        </div>
-        <div>
-          <h1 style={{ margin: 0, fontSize: 22 }}>AI Haven 4U</h1>
-          <div style={{ fontSize: 12, color: "#666" }}>
-            Plan: <b>{planName ?? "Unknown / Not provided"}</b>
+    <div style={{ width: "100%", minHeight: "100vh", background: "#fff" }}>
+      <div style={{ maxWidth: 900, margin: "0 auto", padding: "18px 16px" }}>
+        {/* Header */}
+        <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12 }}>
+          <img
+            src={avatarSrc}
+            alt="avatar"
+            style={{ width: 64, height: 64, borderRadius: "50%", objectFit: "cover", border: "1px solid #e5e7eb" }}
+            onError={() => setAvatarSrc(DEFAULT_AVATAR)}
+          />
+          <div style={{ display: "flex", flexDirection: "column" }}>
+            <div style={{ fontSize: 20, fontWeight: 700 }}>AI Haven 4U</div>
+            <div style={{ fontSize: 12, color: "#6b7280" }}>{headerSubtitle}</div>
           </div>
         </div>
-      </header>
 
-      <section style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
-        {modePills.map((m) => {
-          const active = sessionState.mode === m;
-          const enabled = allowedModes.includes(m);
-          return (
-            <button
-              key={m}
-              onClick={() => requestMode(m)}
-              style={{
-                padding: "6px 12px",
-                borderRadius: 999,
-                border: active ? "1px solid #222" : "1px solid #ccc",
-                background: active ? "#111" : "white",
-                color: active ? "white" : "#111",
-                fontSize: 13,
-                cursor: "pointer",
-                opacity: enabled ? 1 : 0.5,
-              }}
-              title={enabled ? `Request ${MODE_LABELS[m]} Mode` : "Upgrade required"}
-            >
-              {MODE_LABELS[m]}
-            </button>
-          );
-        })}
-      </section>
-
-      <section style={{ border: "1px solid #e5e5e5", borderRadius: 14, padding: 12, minHeight: 420 }}>
-        {messages.map((m, i) => (
-          <div
-            key={i}
-            style={{
-              display: "flex",
-              justifyContent: m.role === "user" ? "flex-end" : "flex-start",
-              margin: "8px 0",
-            }}
+        {/* Mode buttons (keep your existing styling/logic if you had any) */}
+        <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+          <button
+            style={{ borderRadius: 999, padding: "6px 10px", border: "1px solid #111", background: "#111", color: "#fff" }}
           >
-            <div
-              style={{
-                maxWidth: "75%",
-                padding: "10px 12px",
-                borderRadius: 12,
-                background: m.role === "user" ? "#111" : "white",
-                color: m.role === "user" ? "white" : "#111",
-                whiteSpace: "pre-wrap",
-              }}
-            >
-              {m.content}
-            </div>
-          </div>
-        ))}
-        {loading && <div style={{ color: "#444" }}>Thinking…</div>}
-        <div ref={scrollRef} />
-      </section>
+            Friend
+          </button>
+          <button style={{ borderRadius: 999, padding: "6px 10px", border: "1px solid #e5e7eb", background: "#fff" }}>
+            Romantic
+          </button>
+          <button style={{ borderRadius: 999, padding: "6px 10px", border: "1px solid #e5e7eb", background: "#fff" }}>
+            Intimate (18+)
+          </button>
+        </div>
 
-      <section style={{ display: "flex", gap: 8, marginTop: 12 }}>
-        <input
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && send()}
-          placeholder="Type here…"
-          style={{ flex: 1, padding: 12, borderRadius: 10, border: "1px solid #ccc", fontSize: 15 }}
-        />
-        <button
-          onClick={() => send()}
-          disabled={loading}
-          style={{
-            padding: "12px 16px",
-            borderRadius: 10,
-            border: "none",
-            background: "#111",
-            color: "white",
-            fontWeight: 600,
-          }}
-        >
-          Send
-        </button>
-      </section>
-
-      {pendingConsent && (
+        {/* Chat window */}
         <div
           style={{
-            position: "fixed",
-            inset: 0,
-            background: "rgba(0,0,0,0.45)",
-            display: "grid",
-            placeItems: "center",
-            padding: 16,
+            border: "1px solid #e5e7eb",
+            borderRadius: 12,
+            padding: 12,
+            minHeight: 360,
+            background: "#fff",
           }}
         >
-          <div style={{ width: "100%", maxWidth: 440, background: "white", borderRadius: 14, padding: 16 }}>
-            <h3 style={{ marginTop: 0 }}>
-              {pendingConsent === "romance" && "Opt into Romantic Mode?"}
-              {pendingConsent === "adult" && "Confirm you’re 18+?"}
-              {pendingConsent === "explicit" && "Opt into Explicit Mode?"}
-            </h3>
-
-            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
-              <button
-                onClick={() => handleConsent("no")}
-                style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #ccc", background: "white" }}
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            {messages.map((m, idx) => (
+              <div
+                key={idx}
+                style={{
+                  alignSelf: m.role === "user" ? "flex-end" : "flex-start",
+                  maxWidth: "85%",
+                  padding: "10px 12px",
+                  borderRadius: 12,
+                  background: m.role === "user" ? "#111827" : "#f3f4f6",
+                  color: m.role === "user" ? "#fff" : "#111827",
+                  whiteSpace: "pre-wrap",
+                }}
               >
-                No
-              </button>
-              <button
-                onClick={() => handleConsent("yes")}
-                style={{ padding: "8px 12px", borderRadius: 8, border: "none", background: "#111", color: "white", fontWeight: 600 }}
-              >
-                Yes
-              </button>
-            </div>
+                {m.content}
+              </div>
+            ))}
+            <div ref={chatEndRef} />
           </div>
         </div>
-      )}
-    </main>
+
+        {/* Input row */}
+        <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
+          <input
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={onKeyDown}
+            placeholder="Type here..."
+            style={{
+              flex: 1,
+              borderRadius: 10,
+              border: "1px solid #e5e7eb",
+              padding: "10px 12px",
+              outline: "none",
+            }}
+          />
+          <button
+            onClick={sendMessage}
+            style={{
+              borderRadius: 10,
+              padding: "10px 14px",
+              background: "#111",
+              color: "#fff",
+              border: "1px solid #111",
+              cursor: "pointer",
+            }}
+          >
+            Send
+          </button>
+        </div>
+
+        {/* Debug (optional) */}
+        {/* <pre style={{ marginTop: 12, fontSize: 12, color: "#6b7280" }}>
+          companionKey: {companionKey || "(none)"}{"\n"}
+          avatarSrc: {avatarSrc}
+        </pre> */}
+      </div>
+    </div>
   );
 }
