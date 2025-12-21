@@ -157,7 +157,7 @@ def _build_persona_system_prompt(
     Builds a stable system prompt based on companion persona + mode.
 
     NOTE:
-    - "explicit" mode means adult conversation is allowed ONLY after consent.
+    - "intimate"/"explicit" mode means adult conversation is allowed ONLY after consent.
     - Keep it adult, consensual, and non-graphic (avoid pornographic detail).
     """
     raw_companion = (
@@ -189,20 +189,21 @@ def _build_persona_system_prompt(
 
     # Mode shaping
     mode = (mode or "friend").strip().lower()
+
     if mode == "romantic":
         lines.append("You may be affectionate, flirty, and romantic while staying respectful and consensual.")
-    elif mode == "explicit":
+
+    elif mode in ("explicit", "intimate"):
         if explicit_allowed:
             lines.append(
-                "The user has opted into adult conversation. You may discuss sexual topics consensually, "
+                "The user has opted into Intimate (18+) conversation. You may discuss adult sexual topics consensually, "
                 "but avoid graphic pornographic detail; keep it tasteful, safe, and consent-forward."
             )
         else:
             # Shouldn't happen if the gate works, but keep safe.
-            lines.append("Do not engage in adult sexual content unless explicit consent is confirmed.")
+            lines.append("Do not engage in adult sexual content unless Intimate (18+) consent is confirmed.")
 
     return " ".join(lines)
-
 
 def _to_openai_messages(
     messages: List[Dict[str, str]],
