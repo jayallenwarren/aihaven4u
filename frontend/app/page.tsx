@@ -1,593 +1,367 @@
-"use client";
+from __future__ import annotations
 
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import havenHeart from "../public/ai-haven-heart.png";
+import os
+import time
+from typing import Any, Dict, List, Optional
 
-type Role = "user" | "assistant";
-type Msg = { role: Role; content: string };
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 
-type CompanionMeta = {
-  first: string;
-  gender: string;
-  ethnicity: string;
-  generation: string;
-  key: string;
-};
+from .settings import settings
+from .models import ChatResponse
+from .consent_store import consent_store
+from .consent_routes import router as consent_router
 
-const DEFAULT_COMPANION_NAME = "Haven";
-const HEADSHOT_DIR = "/companion/headshot";
-const GREET_ONCE_KEY = "AIHAVEN_GREETED";
+app = FastAPI(title="AIHaven4U API")
 
-// Bundled default avatar (avoids public-path issues when embedded in Wix iframe)
-const DEFAULT_AVATAR = havenHeart.src;
+# ----------------------------
+# CORS
+# ----------------------------
+_raw = (getattr(settings, "CORS_ALLOW_ORIGINS", "") or "").strip()
+raw_origins = [o.strip() for o in _raw.split(",") if o.strip()]
+allow_all = (_raw == "*")
 
-function stripExt(s: string) {
-  return (s || "").replace(/\.(png|jpg|jpeg|webp)$/i, "");
-}
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"] if allow_all else raw_origins,
+    allow_credentials=False if allow_all else True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-function normalizeKeyForFile(raw: string) {
-  return (raw || "").trim().replace(/\s+/g, "-");
-}
+# ----------------------------
+# Routes
+# ----------------------------
+app.include_router(consent_router)
 
-function parseCompanionMeta(raw: string): CompanionMeta {
-  const cleaned = stripExt(raw || "");
-  const parts = cleaned
-    .split("-")
-    .map((p) => p.trim())
-    .filter(Boolean);
 
-  // If the string isn't 4 parts, treat as Haven-ish fallback
-  if (parts.length < 4) {
-    return {
-      first: cleaned || DEFAULT_COMPANION_NAME,
-      gender: "",
-      ethnicity: "",
-      generation: "",
-      key: cleaned || DEFAULT_COMPANION_NAME,
-    };
-  }
+@app.get("/health")
+def health():
+    return {"ok": True}
 
-  const [first, gender, ethnicity, ...rest] = parts;
-  const generation = rest.join("-");
 
-  return {
-    first: first || DEFAULT_COMPANION_NAME,
-    gender: gender || "",
-    ethnicity: ethnicity || "",
-    generation: generation || "",
-    key: cleaned,
-  };
-}
+# ----------------------------
+# Helpers
+# ----------------------------
+def _dbg(enabled: bool, *args: Any) -> None:
+    if enabled:
+        print(*args)
 
-/**
- * Generates candidate headshot URLs:
- * - We try .jpeg, .jpg, then .png
- * - We normalize spaces to hyphens ONLY for filenames
- */
-function buildAvatarCandidates(companionKeyOrName: string) {
-  const raw = (companionKeyOrName || "").trim();
-  const normalized = normalizeKeyForFile(stripExt(raw));
-  const base = normalized ? `${HEADSHOT_DIR}/${encodeURIComponent(normalized)}` : "";
 
-  const candidates: string[] = [];
-  if (base) {
-    candidates.push(`${base}.jpeg`);
-    candidates.push(`${base}.jpg`);
-    candidates.push(`${base}.png`);
-  }
+def _now_ts() -> int:
+    return int(time.time())
 
-  // Always end with bundled default avatar
-  candidates.push(DEFAULT_AVATAR);
-  return candidates;
-}
 
-async function pickFirstExisting(urls: string[]) {
-  for (const url of urls) {
-    // If this is the bundled default, just take it (no need to probe)
-    if (url === DEFAULT_AVATAR) return url;
+def _normalize_mode(raw: Any) -> str:
+    """
+    Frontend historically used "explicit" to mean Intimate (18+).
+    We standardize server-side to: friend | romantic | intimate
+    """
+    m = (str(raw or "").strip().lower())
+    if m in ("explicit", "intimate", "intimate (18+)", "18+", "nsfw"):
+        return "intimate"
+    if m in ("romance", "romantic"):
+        return "romantic"
+    if m in ("friend", "friendly", "safe"):
+        return "friend"
+    return "friend"
 
-    try {
-      const res = await fetch(url, { method: "HEAD", cache: "no-store" });
-      if (res.ok) return url;
-    } catch {
-      // ignore and continue
+
+def _looks_intimate(text: str) -> bool:
+    # IMPORTANT: "Intimate" is treated the same as "Explicit" intent.
+    t = (text or "").lower()
+    return any(
+        k in t
+        for k in [
+            "explicit",
+            "intimate",
+            "18+",
+            "nsfw",
+            "sex",
+            "nude",
+            "porn",
+            "fuck",
+            "cock",
+            "pussy",
+            "blowjob",
+            "anal",
+            "orgasm",
+        ]
+    )
+
+
+def _parse_companion_meta(raw: Any) -> Dict[str, str]:
+    if isinstance(raw, str):
+        parts = [p.strip() for p in raw.split("-") if p.strip()]
+        if len(parts) >= 4:
+            return {
+                "first_name": parts[0],
+                "gender": parts[1],
+                "ethnicity": parts[2],
+                "generation": "-".join(parts[3:]),
+            }
+    return {"first_name": "", "gender": "", "ethnicity": "", "generation": ""}
+
+
+def _build_persona_system_prompt(session_state: dict, *, mode: str, intimate_allowed: bool) -> str:
+    comp = _parse_companion_meta(
+        session_state.get("companion")
+        or session_state.get("companionName")
+        or session_state.get("companion_name")
+    )
+    name = comp.get("first_name") or "Haven"
+
+    # IMPORTANT: We add explicit instructions so the model NEVER claims "I don't have modes"
+    # and can answer "what mode are we in?" reliably.
+    lines = [
+        f"You are {name}, an AI companion who is warm, attentive, and emotionally intelligent.",
+        "You speak naturally and conversationally.",
+        "You prioritize consent, safety, and emotional connection.",
+        "The app has 3 modes: Friend, Romantic, Intimate (18+).",
+        "If the user asks what mode you're in, answer with the current mode plainly (Friend/Romantic/Intimate (18+)).",
+        "Do not claim you 'don't have modes' or that the UI is unrelated—respond consistently with the app's modes.",
+    ]
+
+    if mode == "romantic":
+        lines.append("In Romantic mode, you may be affectionate and flirty while remaining respectful and consensual.")
+
+    if mode == "intimate":
+        if intimate_allowed:
+            lines.append(
+                "In Intimate (18+) mode, the user has consented. You may engage in adult, sensual discussion, "
+                "but avoid graphic or pornographic detail. Focus on intimacy, emotion, and connection."
+            )
+        else:
+            lines.append("Do not engage in intimate/sexual content unless consent is confirmed.")
+
+    return " ".join(lines)
+
+
+def _to_openai_messages(messages: List[Dict[str, str]], session_state: dict, *, mode: str, intimate_allowed: bool, debug: bool):
+    sys = _build_persona_system_prompt(session_state, mode=mode, intimate_allowed=intimate_allowed)
+    _dbg(debug, "SYSTEM PROMPT:", sys)
+
+    out = [{"role": "system", "content": sys}]
+    for m in messages:
+        if m.get("role") in ("user", "assistant") and isinstance(m.get("content"), str):
+            out.append({"role": m["role"], "content": m["content"]})
+    return out
+
+
+def _call_gpt4o(messages: List[Dict[str, str]]) -> str:
+    api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    if not api_key:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set")
+
+    from openai import OpenAI  # type: ignore
+    client = OpenAI(api_key=api_key)
+    resp = client.chat.completions.create(
+        model="gpt-4o",
+        messages=messages,
+        temperature=0.8,
+    )
+    return (resp.choices[0].message.content or "").strip()
+
+
+def _normalize_payload(raw: Dict[str, Any]) -> Dict[str, Any]:
+    sid = raw.get("session_id") or raw.get("sid") or raw.get("sessionId")
+    msgs = raw.get("messages") or []
+    state = raw.get("session_state") or {}
+    wants = bool(raw.get("wants_explicit") or raw.get("wantsExplicit") or False)
+
+    if not sid or not isinstance(msgs, list) or not msgs:
+        raise HTTPException(status_code=422, detail="session_id and messages are required")
+
+    return {"session_id": str(sid), "messages": msgs, "session_state": state, "wants_explicit": wants}
+
+
+def _detect_mode_switch_command(user_text_lower: str) -> Optional[str]:
+    t = (user_text_lower or "").strip()
+
+    # "switch to ___ mode" / "set mode to ___" etc
+    if "switch" in t or "set" in t or "mode" in t:
+        if "friend" in t:
+            return "friend"
+        if "romantic" in t or "romance" in t:
+            return "romantic"
+        if "intimate" in t or "explicit" in t or "18+" in t:
+            return "intimate"
+
+    return None
+
+
+# ----------------------------
+# CHAT
+# ----------------------------
+@app.post("/chat", response_model=ChatResponse)
+async def chat(request: Request):
+    debug = bool(getattr(settings, "DEBUG", False))
+    raw = await request.json()
+    norm = _normalize_payload(raw)
+
+    session_id: str = norm["session_id"]
+    messages: List[Dict[str, str]] = norm["messages"]
+    session_state: Dict[str, Any] = norm["session_state"] or {}
+    wants_explicit: bool = bool(norm["wants_explicit"])
+
+    # Last user message
+    last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
+    user_text = ((last_user.get("content") if last_user else "") or "").strip()
+    user_text_lower = user_text.lower().strip()
+
+    # Normalize requested mode (friend/romantic/intimate)
+    requested_mode = _normalize_mode(session_state.get("mode") or "friend")
+
+    # Consent sources:
+    # - server record (consent_store)
+    # - echoed session_state flag from frontend
+    server_allowed = False
+    try:
+        rec = consent_store.get(session_id)
+        server_allowed = bool(rec and getattr(rec, "explicit_allowed", False))
+    except Exception:
+        server_allowed = False
+
+    session_allowed = (session_state.get("explicit_consented") is True)
+    intimate_allowed = bool(server_allowed or session_allowed)
+
+    # If user typed a mode-switch instruction, honor it by updating session_state.mode
+    cmd_mode = _detect_mode_switch_command(user_text_lower)
+    if cmd_mode:
+        session_state["mode"] = cmd_mode
+        requested_mode = cmd_mode
+
+    # If user is requesting intimate intent via content, treat it as intimate request
+    if _looks_intimate(user_text) or wants_explicit:
+        # only auto-upshift to intimate if they already selected it or gave a mode command
+        # (we do NOT silently flip them; we just use it to trigger consent if they asked)
+        pass
+
+    _dbg(
+        debug,
+        f"/chat sid={session_id} requested_mode={requested_mode} intimate_allowed={intimate_allowed} "
+        f"pending={session_state.get('pending_consent')}",
+    )
+
+    # ----------------------------
+    # CONSENT FLOW (Intimate == Explicit)
+    # ----------------------------
+    CONSENT_YES = {
+        "yes", "y", "yeah", "yep", "sure", "ok", "okay",
+        "i consent", "i agree", "i confirm", "confirm",
+        "i am 18+", "i'm 18+", "i am over 18", "i'm over 18",
+        "i confirm i am 18+", "i confirm that i am 18+",
+        "i confirm and consent",
     }
-  }
-  return DEFAULT_AVATAR;
-}
-
-function greetingFor(name: string) {
-  const n = (name || DEFAULT_COMPANION_NAME).trim() || DEFAULT_COMPANION_NAME;
-  return `Hi, ${n} here. 😊 What's on your mind?`;
-}
-
-type Mode = "friend" | "romantic" | "explicit";
-
-type SessionState = {
-  mode: Mode;
-  adult_verified: boolean;
-  romance_consented: boolean;
-  explicit_consented: boolean;
-  pending_consent: "romance" | "adult" | "explicit" | null;
-  model: string;
-};
-
-const MODE_LABELS: Record<Mode, string> = {
-  friend: "Friend",
-  romantic: "Romantic",
-  explicit: "Intimate (18+)",
-};
-
-type PlanName =
-  | "Week - Trial"
-  | "Weekly - Friend"
-  | "Weekly - Romantic"
-  | "Weekly - Intimate (18+)"
-  | "Test - Friend"
-  | "Test - Romantic"
-  | "Test - Intimate (18+)"
-  | null;
-
-type ChatApiResponse = {
-  reply: string;
-  session_state?: Partial<SessionState>;
-  mode?: string; // optional backend hint (safe/explicit_allowed/intimate/etc.)
-};
-
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
-
-const UPGRADE_URL = "https://www.aihaven4u.com/pricing-plans/list";
-
-const ROMANTIC_ALLOWED_PLANS: PlanName[] = [
-  "Week - Trial",
-  "Weekly - Romantic",
-  "Weekly - Intimate (18+)",
-  "Test - Romantic",
-  "Test - Intimate (18+)",
-];
-
-function allowedModesForPlan(planName: PlanName): Mode[] {
-  const modes: Mode[] = ["friend"];
-  if (ROMANTIC_ALLOWED_PLANS.includes(planName)) modes.push("romantic");
-  if (planName === "Weekly - Intimate (18+)" || planName === "Test - Intimate (18+)")
-    modes.push("explicit");
-  return modes;
-}
-
-function isAllowedOrigin(origin: string) {
-  try {
-    const u = new URL(origin);
-    const host = u.hostname.toLowerCase();
-    if (host.endsWith("aihaven4u.com")) return true;
-    if (host.endsWith("wix.com")) return true;
-    if (host.endsWith("wixsite.com")) return true;
-    return false;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Normalize any backend/UI “mode-ish” string into our 3 Mode values.
- * Treat Intimate as Explicit.
- */
-function normalizeMode(raw: any): Mode | null {
-  const t = String(raw || "").toLowerCase().trim();
-  if (!t) return null;
-
-  if (t === "friend") return "friend";
-  if (t === "romantic") return "romantic";
-
-  // backend variants / synonyms
-  if (t.includes("explicit")) return "explicit";
-  if (t.includes("intimate")) return "explicit";
-  if (t.includes("adult")) return "explicit";
-  if (t.includes("allowed")) return "explicit";
-
-  // ignore "safe" / "blocked" for mode selection
-  if (t.includes("safe")) return null;
-  if (t.includes("blocked")) return null;
-
-  return null;
-}
-
-function requestedModeFromHint(text: string): Mode | null {
-  const t = (text || "").toLowerCase();
-  if (t.includes("mode:friend") || t.includes("[mode:friend]")) return "friend";
-  if (t.includes("mode:romantic") || t.includes("[mode:romantic]")) return "romantic";
-  if (t.includes("mode:explicit") || t.includes("[mode:explicit]")) return "explicit";
-  return null;
-}
-
-function isRomanticRequest(text: string) {
-  const t = (text || "").toLowerCase();
-  return /\b(flirt|romance|romantic|date|kiss|love|boyfriend|girlfriend)\b/.test(t);
-}
-
-function isExplicitRequest(text: string) {
-  const t = (text || "").toLowerCase();
-  return /\b(sex|nude|explicit|intimate|nsfw|oral|penetration|hardcore)\b/.test(t);
-}
-
-export default function Page() {
-  const sessionIdRef = useRef<string | null>(null);
-
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    const key = "AIHAVEN_SESSION_ID";
-    let id = window.sessionStorage.getItem(key);
-    if (!id) {
-      id = (crypto as any).randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-      window.sessionStorage.setItem(key, id);
-    }
-    sessionIdRef.current = id;
-  }, []);
-
-  const [input, setInput] = useState("");
-  const [messages, setMessages] = useState<Msg[]>([]);
-  const [loading, setLoading] = useState(false);
-
-  const [sessionState, setSessionState] = useState<SessionState>({
-    mode: "friend",
-    model: "gpt-4o",
-    adult_verified: false,
-    romance_consented: false,
-    explicit_consented: false,
-    pending_consent: null,
-  });
-
-  const [planName, setPlanName] = useState<PlanName>(null);
-  const [companionName, setCompanionName] = useState<string>(DEFAULT_COMPANION_NAME);
-  const [avatarSrc, setAvatarSrc] = useState<string>(DEFAULT_AVATAR);
-  const [companionKey, setCompanionKey] = useState<string>("");
-
-  const [allowedModes, setAllowedModes] = useState<Mode[]>(["friend"]);
-
-  const modePills = useMemo(() => ["friend", "romantic", "explicit"] as const, []);
-  const scrollRef = useRef<HTMLDivElement>(null);
-
-  const scrollToBottom = useCallback(() => {
-    requestAnimationFrame(() => {
-      scrollRef.current?.scrollIntoView({ behavior: "smooth" });
-    });
-  }, []);
-
-  useEffect(() => {
-    scrollToBottom();
-  }, [messages, loading, scrollToBottom]);
-
-  // Greeting: once per *browser session* per companion
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-
-    const keyName = normalizeKeyForFile(companionName || DEFAULT_COMPANION_NAME);
-    const greetKey = `${GREET_ONCE_KEY}:${keyName}`;
-
-    const tmr = window.setTimeout(() => {
-      const already = sessionStorage.getItem(greetKey) === "1";
-      if (already) return;
-
-      const greetingMsg: Msg = {
-        role: "assistant",
-        content: greetingFor(companionName || DEFAULT_COMPANION_NAME),
-      };
-
-      setMessages((prev) => {
-        if (prev && prev.length > 0) return prev;
-        return [greetingMsg];
-      });
-
-      sessionStorage.setItem(greetKey, "1");
-    }, 150);
-
-    return () => window.clearTimeout(tmr);
-  }, [companionName]);
-
-  function showUpgradeMessage(requestedMode: Mode) {
-    const modeLabel = MODE_LABELS[requestedMode];
-    const msg =
-      `The requested mode (${modeLabel}) isn't available on your current plan. ` +
-      `Please upgrade here: ${UPGRADE_URL}`;
-
-    const upgradeMsg: Msg = { role: "assistant", content: msg };
-    setMessages((prev) => [...prev, upgradeMsg]);
-  }
-
-  useEffect(() => {
-    function onMessage(event: MessageEvent) {
-      if (!isAllowedOrigin(event.origin)) return;
-
-      const data = event.data;
-      if (!data || data.type !== "WEEKLY_PLAN") return;
-
-      const incomingPlan = (data.planName ?? null) as PlanName;
-      setPlanName(incomingPlan);
-
-      const incomingCompanion =
-        typeof (data as any).companion === "string" ? (data as any).companion.trim() : "";
-      const resolvedCompanionKey = incomingCompanion || "";
-
-      if (resolvedCompanionKey) {
-        const parsed = parseCompanionMeta(resolvedCompanionKey);
-        setCompanionKey(parsed.key);
-        setCompanionName(parsed.first || DEFAULT_COMPANION_NAME);
-      } else {
-        setCompanionKey("");
-        setCompanionName(DEFAULT_COMPANION_NAME);
-      }
-
-      const avatarCandidates = buildAvatarCandidates(resolvedCompanionKey || DEFAULT_COMPANION_NAME);
-      pickFirstExisting(avatarCandidates).then((picked) => {
-        setAvatarSrc(picked);
-      });
-
-      const nextAllowed = allowedModesForPlan(incomingPlan);
-      setAllowedModes(nextAllowed);
-
-      setSessionState((prev) => {
-        if (nextAllowed.includes(prev.mode)) return prev;
-        return { ...prev, mode: "friend" };
-      });
-    }
-
-    window.addEventListener("message", onMessage);
-    return () => window.removeEventListener("message", onMessage);
-  }, []);
-
-  async function callChat(nextMessages: Msg[], stateToSend: any) {
-    if (!API_BASE) throw new Error("NEXT_PUBLIC_API_BASE_URL is not set");
-
-    const session_id =
-      sessionIdRef.current ||
-      (crypto as any).randomUUID?.() ||
-      `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-
-    const res = await fetch(`${API_BASE}/chat`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        session_id,
-        wants_explicit: stateToSend?.explicit_consented === true,
-        session_state: stateToSend,
-        messages: nextMessages.map((m) => ({ role: m.role, content: m.content })),
-      }),
-    });
-
-    if (!res.ok) {
-      const errText = await res.text().catch(() => "");
-      throw new Error(`Backend error ${res.status}: ${errText}`);
-    }
-
-    return (await res.json()) as ChatApiResponse;
-  }
-
-  async function send(textOverride?: string) {
-    if (loading) return;
-
-    const userText = (textOverride ?? input).trim();
-    if (!userText) return;
-
-    const hintedMode = requestedModeFromHint(userText);
-    if (hintedMode) {
-      if (!allowedModes.includes(hintedMode)) {
-        showUpgradeMessage(hintedMode);
-        setInput("");
-        return;
-      }
-      setSessionState((prev) => ({ ...prev, mode: hintedMode }));
-      setInput("");
-      return;
-    }
-
-    if (isExplicitRequest(userText) && !allowedModes.includes("explicit")) {
-      showUpgradeMessage("explicit");
-      setInput("");
-      return;
-    }
-    if (isRomanticRequest(userText) && !allowedModes.includes("romantic")) {
-      showUpgradeMessage("romantic");
-      setInput("");
-      return;
-    }
-
-    const userMsg: Msg = { role: "user", content: userText };
-    const nextMessages: Msg[] = [...messages, userMsg];
-
-    setMessages(nextMessages);
-    setInput("");
-    setLoading(true);
-
-    try {
-      const data = await callChat(nextMessages, sessionState);
-
-      // ✅ FIX: merge backend session_state but DO NOT let it clobber the user's chosen mode
-      setSessionState((prev) => {
-        const merged: SessionState = {
-          ...prev,
-          ...(data.session_state || {}),
-        } as SessionState;
-
-        // Determine "authoritative" backend mode only if it is meaningful
-        const modeFromBackend = normalizeMode((data.session_state as any)?.mode) ?? normalizeMode(data.mode);
-
-        // If backend provided a valid mode, apply it; otherwise keep current
-        const nextMode: Mode = modeFromBackend
-          ? (allowedModes.includes(modeFromBackend) ? modeFromBackend : "friend")
-          : prev.mode;
-
-        return { ...merged, mode: nextMode };
-      });
-
-      const assistantMsg: Msg = { role: "assistant", content: data.reply };
-      setMessages((prev) => [...prev, assistantMsg]);
-    } catch (err: any) {
-      const errorMsg: Msg = {
-        role: "assistant",
-        content: `Error: ${err?.message ?? "Unknown error"}`,
-      };
-      setMessages((prev) => [...prev, errorMsg]);
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  return (
-    <main style={{ maxWidth: 880, margin: "24px auto", padding: "0 16px", fontFamily: "system-ui" }}>
-      <header style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 10 }}>
-        <div aria-hidden style={{ width: 56, height: 56, borderRadius: "50%", overflow: "hidden" }}>
-          <img
-            src={avatarSrc}
-            alt="AI Haven 4U"
-            style={{ width: "100%", height: "100%" }}
-            onError={(e) => {
-              (e.currentTarget as HTMLImageElement).src = DEFAULT_AVATAR;
-            }}
-          />
-        </div>
-        <div>
-          <h1 style={{ margin: 0, fontSize: 22 }}>AI Haven 4U</h1>
-          <div style={{ fontSize: 12, color: "#666" }}>
-            Companion: <b>{companionName || DEFAULT_COMPANION_NAME}</b> • Plan:{" "}
-            <b>{planName ?? "Unknown / Not provided"}</b>
-          </div>
-        </div>
-      </header>
-
-      <section style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
-        {modePills.map((m) => {
-          const active = sessionState.mode === m;
-          const disabled = !allowedModes.includes(m);
-          return (
-            <button
-              key={m}
-              disabled={disabled}
-              onClick={() => {
-                if (disabled) return showUpgradeMessage(m);
-
-                // UI selection is immediate and should persist unless backend explicitly changes it
-                setSessionState((prev) => ({ ...prev, mode: m }));
-
-                const modeMsg: Msg = { role: "assistant", content: `Mode set to: ${MODE_LABELS[m]}` };
-                setMessages((prev) => [...prev, modeMsg]);
-              }}
-              style={{
-                padding: "8px 12px",
-                borderRadius: 999,
-                border: "1px solid #ddd",
-                background: active ? "#111" : "#fff",
-                color: active ? "#fff" : "#111",
-                opacity: disabled ? 0.45 : 1,
-                cursor: disabled ? "not-allowed" : "pointer",
-              }}
-            >
-              {MODE_LABELS[m]}
-            </button>
-          );
-        })}
-      </section>
-
-      <section
-        style={{
-          border: "1px solid #e5e5e5",
-          borderRadius: 12,
-          padding: 12,
-          minHeight: 360,
-        }}
-      >
-        {messages.map((m, i) => (
-          <div key={i} style={{ marginBottom: 10 }}>
-            <div style={{ fontSize: 12, color: "#666" }}>{m.role === "user" ? "You" : "AI"}</div>
-            <div style={{ whiteSpace: "pre-wrap" }}>{m.content}</div>
-          </div>
-        ))}
-        {loading && <div style={{ color: "#666" }}>Thinking…</div>}
-        <div ref={scrollRef} />
-      </section>
-
-      <section style={{ display: "flex", gap: 8, marginTop: 12 }}>
-        <input
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") send();
-          }}
-          placeholder="Type a message…"
-          style={{
-            flex: 1,
-            padding: "10px 12px",
-            borderRadius: 10,
-            border: "1px solid #ddd",
-          }}
-        />
-        <button
-          onClick={() => send()}
-          style={{
-            padding: "10px 14px",
-            borderRadius: 10,
-            border: "1px solid #111",
-            background: "#111",
-            color: "#fff",
-            cursor: "pointer",
-          }}
-        >
-          Send
-        </button>
-      </section>
-
-      {/* Consent overlay */}
-      {sessionState.pending_consent && (
-        <div
-          style={{
-            position: "fixed",
-            inset: 0,
-            background: "rgba(0,0,0,0.4)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            padding: 16,
-          }}
-        >
-          <div
-            style={{
-              background: "#fff",
-              borderRadius: 12,
-              padding: 16,
-              maxWidth: 520,
-              width: "100%",
-            }}
-          >
-            <h3 style={{ marginTop: 0 }}>Consent Required</h3>
-            <p style={{ marginTop: 0 }}>
-              Please confirm to proceed. (Pending: <b>{sessionState.pending_consent}</b>)
-            </p>
-            <div style={{ display: "flex", gap: 8 }}>
-              <button
-                onClick={() => send("Yes")}
-                style={{
-                  padding: "10px 12px",
-                  borderRadius: 10,
-                  border: "1px solid #111",
-                  background: "#111",
-                  color: "#fff",
-                }}
-              >
-                Yes
-              </button>
-              <button
-                onClick={() => send("No")}
-                style={{
-                  padding: "10px 12px",
-                  borderRadius: 10,
-                  border: "1px solid #ddd",
-                  background: "#fff",
-                }}
-              >
-                No
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-    </main>
-  );
-}
+    CONSENT_NO = {"no", "n", "nope", "nah", "decline", "cancel"}
+
+    pending = str(session_state.get("pending_consent") or "").strip().lower()
+
+    def _grant_intimate() -> Dict[str, Any]:
+        # Persist server-side
+        try:
+            consent_store.set(
+                session_id=session_id,
+                explicit_allowed=True,
+                reason="user intimate consent",
+            )
+        except Exception:
+            pass
+
+        out = dict(session_state)
+        out["adult_verified"] = True
+        out["explicit_consented"] = True
+        out["pending_consent"] = None
+        out["mode"] = "intimate"
+        out["explicit_granted_at"] = _now_ts()
+        return out
+
+    # If we're waiting for consent
+    if pending == "intimate" and not intimate_allowed:
+        if user_text_lower in CONSENT_YES:
+            session_state_out = _grant_intimate()
+            return ChatResponse(
+                session_id=session_id,
+                mode="intimate",
+                reply="Thank you — Intimate (18+) mode is enabled. What would you like to talk about?",
+                session_state=session_state_out,
+            )
+
+        if user_text_lower in CONSENT_NO:
+            session_state_out = dict(session_state)
+            session_state_out["pending_consent"] = None
+            session_state_out["explicit_consented"] = False
+            session_state_out["mode"] = "friend"
+            return ChatResponse(
+                session_id=session_id,
+                mode="friend",
+                reply="No problem — we’ll keep things non-intimate.",
+                session_state=session_state_out,
+            )
+
+        # Not yes/no: keep asking
+        session_state_out = dict(session_state)
+        session_state_out["pending_consent"] = "intimate"
+        session_state_out["mode"] = "intimate"
+        return ChatResponse(
+            session_id=session_id,
+            mode="intimate",
+            reply="Please reply with 'yes' or 'no' to continue.",
+            session_state=session_state_out,
+        )
+
+    # If Intimate is requested but not allowed, ask for consent
+    intimate_requested = (requested_mode == "intimate") or _looks_intimate(user_text) or wants_explicit
+    if (
+        getattr(settings, "REQUIRE_EXPLICIT_CONSENT_FOR_EXPLICIT_CONTENT", True)
+        and intimate_requested
+        and not intimate_allowed
+    ):
+        session_state_out = dict(session_state)
+        session_state_out["pending_consent"] = "intimate"
+        # Keep the user's selection visible so the pill stays highlighted
+        session_state_out["mode"] = "intimate"
+
+        return ChatResponse(
+            session_id=session_id,
+            mode="intimate",
+            reply=(
+                "Before we go further, I need to confirm you’re 18+ and that you want Intimate (18+) conversation. "
+                "Please reply with 'yes' to confirm."
+            ),
+            session_state=session_state_out,
+        )
+
+    # ----------------------------
+    # MODEL RESPONSE
+    # ----------------------------
+    mode_for_model = requested_mode
+    if mode_for_model == "intimate" and not intimate_allowed:
+        # should be unreachable due to return above, but keep safe
+        mode_for_model = "friend"
+
+    try:
+        reply = _call_gpt4o(
+            _to_openai_messages(
+                messages,
+                session_state,
+                mode=mode_for_model,
+                intimate_allowed=intimate_allowed,
+                debug=debug,
+            )
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"OpenAI call failed: {e}")
+
+    # Echo state back
+    session_state_out = dict(session_state)
+    session_state_out["mode"] = requested_mode
+
+    return ChatResponse(
+        session_id=session_id,
+        mode=requested_mode,
+        reply=reply or "I’m here — what would you like to talk about?",
+        session_state=session_state_out,
+    )
