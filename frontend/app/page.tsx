@@ -97,21 +97,18 @@ function greetingFor(name: string) {
   return `Hi, ${n} here. 😊 What's on your mind?`;
 }
 
-/**
- * Canonical UI modes (match backend):
- * - friend
- * - romantic
- * - intimate
- */
+// Canonical UI modes (matches backend drop-in)
 type Mode = "friend" | "romantic" | "intimate";
 
 type SessionState = {
   mode: Mode;
   adult_verified: boolean;
   romance_consented: boolean;
-  explicit_consented: boolean; // keep key name for backward compatibility
-  pending_consent: "romance" | "adult" | "explicit" | "intimate" | null;
+  explicit_consented: boolean;
+  pending_consent: "romance" | "adult" | "intimate" | null;
   model: string;
+  // allow backend extras without breaking
+  [k: string]: any;
 };
 
 const MODE_LABELS: Record<Mode, string> = {
@@ -129,12 +126,6 @@ type PlanName =
   | "Test - Romantic"
   | "Test - Intimate (18+)"
   | null;
-
-type ChatApiResponse = {
-  reply: string;
-  session_state?: Partial<SessionState>;
-  mode?: string; // backend hint
-};
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
 const UPGRADE_URL = "https://www.aihaven4u.com/pricing-plans/list";
@@ -168,29 +159,14 @@ function isAllowedOrigin(origin: string) {
   }
 }
 
-/**
- * Normalize any backend/UI “mode-ish” string into our 3 Mode values.
- * Treat Explicit as Intimate.
- */
-function normalizeMode(raw: any): Mode | null {
+function normalizeModeFromServer(raw: any, fallback: Mode): Mode {
   const t = String(raw || "").toLowerCase().trim();
-  if (!t) return null;
-
-  if (t === "friend") return "friend";
   if (t === "romantic") return "romantic";
   if (t === "intimate") return "intimate";
-
-  // synonyms
-  if (t.includes("explicit")) return "intimate";
-  if (t.includes("intimate")) return "intimate";
-  if (t.includes("adult")) return "intimate";
-  if (t.includes("allowed")) return "intimate";
-
-  // ignore safe/blocked as "not a mode"
-  if (t.includes("safe")) return null;
-  if (t.includes("blocked")) return null;
-
-  return null;
+  if (t === "explicit") return "intimate"; // legacy
+  if (t === "friend") return "friend";
+  if (t === "safe") return "friend"; // legacy
+  return fallback;
 }
 
 function requestedModeFromHint(text: string): Mode | null {
@@ -198,8 +174,19 @@ function requestedModeFromHint(text: string): Mode | null {
   if (t.includes("mode:friend") || t.includes("[mode:friend]")) return "friend";
   if (t.includes("mode:romantic") || t.includes("[mode:romantic]")) return "romantic";
   if (t.includes("mode:intimate") || t.includes("[mode:intimate]")) return "intimate";
-  // backward compatible
   if (t.includes("mode:explicit") || t.includes("[mode:explicit]")) return "intimate";
+  return null;
+}
+
+// Detect in-chat switching (so pills follow what user typed)
+function requestedModeFromNaturalText(text: string): Mode | null {
+  const t = (text || "").toLowerCase();
+  if ((t.includes("switch") || t.includes("set") || t.includes("change") || t.includes("go to")) && t.includes("romantic"))
+    return "romantic";
+  if ((t.includes("switch") || t.includes("set") || t.includes("change") || t.includes("go to")) && (t.includes("intimate") || t.includes("explicit") || t.includes("18+")))
+    return "intimate";
+  if ((t.includes("switch") || t.includes("set") || t.includes("change") || t.includes("go to")) && t.includes("friend"))
+    return "friend";
   return null;
 }
 
@@ -210,7 +197,7 @@ function isRomanticRequest(text: string) {
 
 function isIntimateRequest(text: string) {
   const t = (text || "").toLowerCase();
-  return /\b(sex|nude|explicit|intimate|nsfw|oral|penetration|hardcore)\b/.test(t);
+  return /\b(sex|nude|explicit|intimate|nsfw|oral|penetration|hardcore|undress|naked)\b/.test(t);
 }
 
 export default function Page() {
@@ -244,7 +231,6 @@ export default function Page() {
   const [companionName, setCompanionName] = useState<string>(DEFAULT_COMPANION_NAME);
   const [avatarSrc, setAvatarSrc] = useState<string>(DEFAULT_AVATAR);
   const [companionKey, setCompanionKey] = useState<string>("");
-
   const [allowedModes, setAllowedModes] = useState<Mode[]>(["friend"]);
 
   const modePills = useMemo(() => ["friend", "romantic", "intimate"] as const, []);
@@ -260,7 +246,7 @@ export default function Page() {
     scrollToBottom();
   }, [messages, loading, scrollToBottom]);
 
-  // Greeting: once per *browser session* per companion
+  // Greeting: once per browser session per companion
   useEffect(() => {
     if (typeof window === "undefined") return;
 
@@ -321,9 +307,7 @@ export default function Page() {
       }
 
       const avatarCandidates = buildAvatarCandidates(resolvedCompanionKey || DEFAULT_COMPANION_NAME);
-      pickFirstExisting(avatarCandidates).then((picked) => {
-        setAvatarSrc(picked);
-      });
+      pickFirstExisting(avatarCandidates).then((picked) => setAvatarSrc(picked));
 
       const nextAllowed = allowedModesForPlan(incomingPlan);
       setAllowedModes(nextAllowed);
@@ -338,6 +322,12 @@ export default function Page() {
     return () => window.removeEventListener("message", onMessage);
   }, []);
 
+  type ChatResponsePayload = {
+    reply: string;
+    mode?: string; // backend may send friend/romantic/intimate (or legacy)
+    session_state?: SessionState;
+  };
+
   async function callChat(nextMessages: Msg[], stateToSend: SessionState) {
     if (!API_BASE) throw new Error("NEXT_PUBLIC_API_BASE_URL is not set");
 
@@ -346,24 +336,41 @@ export default function Page() {
       (crypto as any).randomUUID?.() ||
       `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
-    const res = await fetch(`${API_BASE}/chat`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        session_id,
-        // keep backend compatibility: "wants_explicit" means "wants intimate"
-        wants_explicit: stateToSend.mode === "intimate" || stateToSend.explicit_consented === true,
-        session_state: stateToSend,
-        messages: nextMessages.map((m) => ({ role: m.role, content: m.content })),
-      }),
-    });
+    const url = `${API_BASE}/chat`;
 
-    if (!res.ok) {
-      const errText = await res.text().catch(() => "");
-      throw new Error(`Backend error ${res.status}: ${errText}`);
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id,
+          // tell backend user is trying for Intimate if they selected it
+          wants_explicit: stateToSend?.mode === "intimate" || stateToSend?.explicit_consented === true,
+          session_state: stateToSend,
+          messages: nextMessages.map((m) => ({ role: m.role, content: m.content })),
+        }),
+      });
+
+      const text = await res.text().catch(() => "");
+      if (!res.ok) {
+        throw new Error(`Backend error ${res.status}: ${text || "(no body)"}`);
+      }
+
+      // res.text() consumed; parse JSON from text
+      const data = (text ? JSON.parse(text) : {}) as ChatResponsePayload;
+      return data;
+    } catch (e: any) {
+      // This is the classic browser CORS/network block signature:
+      if (String(e?.message || "").toLowerCase().includes("failed to fetch")) {
+        const origin =
+          typeof window !== "undefined" ? window.location.origin : "(unknown origin)";
+        throw new Error(
+          `Failed to fetch (network/CORS). Origin: ${origin}. ` +
+            `Confirm CORS_ALLOW_ORIGINS includes the iframe origin (often *.azurestaticapps.net) and the top-level domain.`
+        );
+      }
+      throw e;
     }
-
-    return (await res.json()) as ChatApiResponse;
   }
 
   async function send(textOverride?: string) {
@@ -372,6 +379,7 @@ export default function Page() {
     const userText = (textOverride ?? input).trim();
     if (!userText) return;
 
+    // Hint-based mode set
     const hintedMode = requestedModeFromHint(userText);
     if (hintedMode) {
       if (!allowedModes.includes(hintedMode)) {
@@ -381,7 +389,22 @@ export default function Page() {
       }
       setSessionState((prev) => ({ ...prev, mode: hintedMode }));
       setInput("");
+
+      const modeMsg: Msg = { role: "assistant", content: `Mode set to: ${MODE_LABELS[hintedMode]}` };
+      setMessages((prev) => [...prev, modeMsg]);
       return;
+    }
+
+    // Natural-language mode switch
+    const naturalSwitch = requestedModeFromNaturalText(userText);
+    if (naturalSwitch) {
+      if (!allowedModes.includes(naturalSwitch)) {
+        showUpgradeMessage(naturalSwitch);
+        setInput("");
+        return;
+      }
+      setSessionState((prev) => ({ ...prev, mode: naturalSwitch }));
+      // continue sending message to backend so the model follows the new mode
     }
 
     // Gate based on plan for inferred intent
@@ -406,21 +429,13 @@ export default function Page() {
     try {
       const data = await callChat(nextMessages, sessionState);
 
-      // Merge backend session_state safely + accept backend mode hint
+      // Apply backend session_state and mode (authoritative)
       setSessionState((prev) => {
-        const merged: SessionState = {
-          ...prev,
-          ...(data.session_state || {}),
-        } as SessionState;
+        const next = data.session_state ?? prev;
+        const normalized = normalizeModeFromServer(data.mode ?? next.mode, prev.mode);
 
-        const modeFromBackend =
-          normalizeMode((data.session_state as any)?.mode) ?? normalizeMode(data.mode);
-
-        const nextMode: Mode = modeFromBackend
-          ? (allowedModes.includes(modeFromBackend) ? modeFromBackend : "friend")
-          : prev.mode;
-
-        return { ...merged, mode: nextMode };
+        // Ensure mode in state matches normalized backend mode
+        return { ...next, mode: normalized };
       });
 
       const assistantMsg: Msg = { role: "assistant", content: data.reply };
@@ -468,7 +483,6 @@ export default function Page() {
               disabled={disabled}
               onClick={() => {
                 if (disabled) return showUpgradeMessage(m);
-
                 setSessionState((prev) => ({ ...prev, mode: m }));
 
                 const modeMsg: Msg = { role: "assistant", content: `Mode set to: ${MODE_LABELS[m]}` };
