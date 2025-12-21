@@ -74,6 +74,10 @@ def _to_openai_messages(
 
     # 🔹 Persona system prompt FIRST
     system_prompt = _build_persona_system_prompt(session_state)
+
+    # ✅ TEMPORARY debug print
+    print("Persona system prompt:", system_prompt)
+
     out.append({"role": "system", "content": system_prompt})
 
     for m in messages or []:
@@ -227,6 +231,7 @@ async def chat(request: Request):
         )
 
     # ✅ Real OpenAI response (no more echo)
+    
     try:
         assistant_reply = _call_gpt4o(
             _to_openai_messages(messages, norm["session_state"]),
