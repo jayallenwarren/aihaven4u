@@ -128,6 +128,13 @@ type PlanName =
   | "Test - Intimate (18+)"
   | null;
 
+type ChatApiResponse = {
+  reply: string;
+  session_state?: SessionState;
+  // backend may also return "mode", but we DO NOT rely on it to avoid TS mismatch
+  mode?: string;
+};
+
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
 
 const UPGRADE_URL = "https://www.aihaven4u.com/pricing-plans/list";
@@ -159,6 +166,26 @@ function isAllowedOrigin(origin: string) {
   } catch {
     return false;
   }
+}
+
+/**
+ * Normalize any backend/UI “mode-ish” string into our 3 Mode values.
+ * - Treat “intimate” as explicit
+ * - Treat “explicit_allowed” as explicit
+ */
+function normalizeMode(raw: any): Mode {
+  const t = String(raw || "").toLowerCase().trim();
+
+  if (t === "romantic") return "romantic";
+  if (t === "friend") return "friend";
+
+  // backend variants / ui synonyms
+  if (t.includes("explicit")) return "explicit";
+  if (t.includes("intimate")) return "explicit";
+  if (t.includes("adult")) return "explicit";
+  if (t.includes("allowed")) return "explicit";
+
+  return "friend";
 }
 
 function requestedModeFromHint(text: string): Mode | null {
@@ -239,7 +266,6 @@ export default function Page() {
       const already = sessionStorage.getItem(greetKey) === "1";
       if (already) return;
 
-      // ✅ ensure Msg typing so Role doesn't widen to string
       const greetingMsg: Msg = {
         role: "assistant",
         content: greetingFor(companionName || DEFAULT_COMPANION_NAME),
@@ -263,7 +289,6 @@ export default function Page() {
       `The requested mode (${modeLabel}) isn't available on your current plan. ` +
       `Please upgrade here: ${UPGRADE_URL}`;
 
-    // ✅ ensure Msg typing so Role doesn't widen to string
     const upgradeMsg: Msg = { role: "assistant", content: msg };
     setMessages((prev) => [...prev, upgradeMsg]);
   }
@@ -318,14 +343,13 @@ export default function Page() {
       (crypto as any).randomUUID?.() ||
       `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
-    // ✅ Send what backend expects: session_id + messages (+ wants_explicit)
     const res = await fetch(`${API_BASE}/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         session_id,
         wants_explicit: stateToSend?.explicit_consented === true,
-        session_state: stateToSend, // optional; backend accepts it
+        session_state: stateToSend,
         messages: nextMessages.map((m) => ({ role: m.role, content: m.content })),
       }),
     });
@@ -335,7 +359,7 @@ export default function Page() {
       throw new Error(`Backend error ${res.status}: ${errText}`);
     }
 
-    return res.json() as Promise<{ reply: string; session_state?: SessionState }>;
+    return (await res.json()) as ChatApiResponse;
   }
 
   async function send(textOverride?: string) {
@@ -368,7 +392,6 @@ export default function Page() {
       return;
     }
 
-    // ✅ ensure Msg typing so Role doesn't widen to string
     const userMsg: Msg = { role: "user", content: userText };
     const nextMessages: Msg[] = [...messages, userMsg];
 
@@ -379,21 +402,19 @@ export default function Page() {
     try {
       const data = await callChat(nextMessages, sessionState);
 
-    if (data.session_state || data.mode) {
-      setSessionState((prev) => {
-        const next = data.session_state ?? prev;
+      // ✅ FIX: only use session_state (no data.mode) so TS build never breaks
+      if (data.session_state) {
+        setSessionState((prev) => {
+          const next = data.session_state ?? prev;
 
-        // 🔑 IMPORTANT: sync backend mode into session state
-        if (data.mode && next.mode !== data.mode) {
-          return { ...next, mode: data.mode as Mode };
-        }
+          // Normalize backend mode into our 3-mode UI
+          const backendMode = normalizeMode((next as any).mode);
+          const coercedMode: Mode = allowedModes.includes(backendMode) ? backendMode : "friend";
 
-        return next;
-      });
-    }
+          return { ...next, mode: coercedMode };
+        });
+      }
 
-
-      // ✅ ensure Msg typing so Role doesn't widen to string
       const assistantMsg: Msg = { role: "assistant", content: data.reply };
       setMessages((prev) => [...prev, assistantMsg]);
     } catch (err: any) {
@@ -441,7 +462,6 @@ export default function Page() {
                 if (disabled) return showUpgradeMessage(m);
                 setSessionState((prev) => ({ ...prev, mode: m }));
 
-                // ✅ ensure Msg typing so Role doesn't widen to string
                 const modeMsg: Msg = { role: "assistant", content: `Mode set to: ${MODE_LABELS[m]}` };
                 setMessages((prev) => [...prev, modeMsg]);
               }}
@@ -509,7 +529,7 @@ export default function Page() {
         </button>
       </section>
 
-      {/* Consent overlay (existing behavior in page_w.tsx) */}
+      {/* Consent overlay */}
       {sessionState.pending_consent && (
         <div
           style={{
