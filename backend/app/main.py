@@ -245,7 +245,7 @@ async def chat(request: Request):
     # Determine last user text early (Step 5 needs it)
     last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
     user_text = ((last_user.get("content") if last_user else "") or "").strip()
-    normalized_text = user_text.lower()
+    normalized_text = user_text.lower().strip()
 
     # Determine requested mode from session_state (fixes "requested_mode undefined")
     requested_mode = (session_state.get("mode") or "").strip().lower()  # friend/romantic/explicit
@@ -254,41 +254,68 @@ async def chat(request: Request):
     user_requesting_explicit = wants_explicit or _looks_explicit(user_text) or (requested_mode == "explicit")
 
     # =========================
-    # STEP 5 — CONSENT REPLY HANDLER (FIXED)
+    # STEP 5 — CONSENT REPLY HANDLER (DROP-IN)
     # =========================
+
     CONSENT_YES = {
-        "yes",
-        "y",
-        "i consent",
-        "i agree",
-        "i am 18+",
-        "i'm 18+",
-        "i confirm",
-        "i confirm i am 18+",
-        "i confirm that i am 18+",
+        "yes", "y", "yeah", "yep", "sure", "ok", "okay",
+        "i consent", "i agree", "i confirm", "confirm",
+        "i am 18+", "i'm 18+", "i am over 18", "i'm over 18",
+        "i confirm i am 18+", "i confirm that i am 18+",
         "i confirm and consent",
-        "i am over 18",
-        "i'm over 18",
     }
+    CONSENT_NO = {"no", "n", "nope", "nah", "decline", "cancel"}
 
     pending = (session_state.get("pending_consent") or "").strip().lower()
 
-    # If the UI asked for explicit consent (pending_consent == "explicit") and user says yes:
-    if pending == "explicit" and normalized_text in CONSENT_YES:
+    # Helper: set server + session flags consistently
+    def _set_explicit_allowed():
         consent_store.set(
             session_id=session_id,
             explicit_allowed=True,
             reason="user explicit consent",
         )
+        out = dict(session_state)
+        out["adult_verified"] = True
+        out["explicit_consented"] = True
+        out["pending_consent"] = None
+        # Optional: if you want to force mode, uncomment next line
+        # out["mode"] = "explicit"
+        return out
 
+    # If user replies while we are waiting for consent
+    if pending:
+        if normalized_text in CONSENT_YES:
+            # Option A (recommended for your current UX):
+            # Treat "yes" as confirming BOTH 18+ and explicit consent in one step.
+            session_state_out = _set_explicit_allowed()
+            return ChatResponse(
+                session_id=session_id,
+                mode="explicit_allowed",
+                reply="Thank you — explicit mode is enabled. What would you like to do next?",
+                session_state=session_state_out,
+            )
+
+        if normalized_text in CONSENT_NO:
+            session_state_out = dict(session_state)
+            session_state_out["pending_consent"] = None
+            session_state_out["explicit_consented"] = False
+            # Optional: force safe mode
+            session_state_out["mode"] = "friend"
+            return ChatResponse(
+                session_id=session_id,
+                mode="explicit_blocked",
+                reply="No problem — we’ll keep things non-explicit.",
+                session_state=session_state_out,
+            )
+
+        # User said something else; keep asking
         session_state_out = dict(session_state)
-        session_state_out["explicit_consented"] = True
-        session_state_out["pending_consent"] = None
-
+        session_state_out["pending_consent"] = pending or "explicit"
         return ChatResponse(
             session_id=session_id,
-            mode="explicit_allowed",
-            reply="Thank you — explicit mode is enabled. What would you like to do next?",
+            mode="explicit_blocked",
+            reply="Please reply with 'yes' or 'no' to continue.",
             session_state=session_state_out,
         )
 
