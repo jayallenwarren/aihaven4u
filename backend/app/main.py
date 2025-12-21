@@ -75,10 +75,11 @@ def _to_openai_messages(
     # 🔹 Persona system prompt FIRST
     system_prompt = _build_persona_system_prompt(session_state)
 
-    # ✅ TEMPORARY debug print
-    print("Persona system prompt:", system_prompt)
+    if bool(getattr(settings, "DEBUG", False)):
+        print("Persona system prompt:", system_prompt)
 
     out.append({"role": "system", "content": system_prompt})
+
 
     for m in messages or []:
         role = m.get("role")
@@ -88,14 +89,54 @@ def _to_openai_messages(
 
     return out
 
+def _parse_companion_meta(raw: Any) -> Dict[str, str]:
+    """
+    Accepts:
+      - dict: {first_name, gender, ethnicity, generation} (or common variants)
+      - str:  "First-Gender-Ethnicity-Generation X"
+    Returns normalized dict with keys: first_name, gender, ethnicity, generation.
+    """
+    if isinstance(raw, dict):
+        # normalize common key variants
+        first = (raw.get("first_name") or raw.get("firstName") or raw.get("name") or "").strip()
+        gender = (raw.get("gender") or "").strip()
+        ethnicity = (raw.get("ethnicity") or "").strip()
+        generation = (raw.get("generation") or "").strip()
+        return {
+            "first_name": first,
+            "gender": gender,
+            "ethnicity": ethnicity,
+            "generation": generation,
+        }
+
+    if isinstance(raw, str):
+        cleaned = raw.strip()
+        if not cleaned:
+            return {"first_name": "", "gender": "", "ethnicity": "", "generation": ""}
+
+        parts = [p.strip() for p in cleaned.split("-") if p.strip()]
+        if len(parts) >= 4:
+            return {
+                "first_name": parts[0],
+                "gender": parts[1],
+                "ethnicity": parts[2],
+                "generation": "-".join(parts[3:]),  # allow hyphens/spaces in generation
+            }
+
+    return {"first_name": "", "gender": "", "ethnicity": "", "generation": ""}
 
 def _build_persona_system_prompt(session_state: dict) -> str:
     """
     Builds a stable system prompt based on companion persona.
     """
-    companion = session_state.get("companion") or {}
-    
-    name = companion.get("first_name", "Haven")
+    raw_companion = (
+        session_state.get("companion")
+        or session_state.get("companionName")
+        or session_state.get("companion_name")
+    )
+    companion = _parse_companion_meta(raw_companion)
+
+    name = companion.get("first_name") or "Haven"
     gender = companion.get("gender", "")
     ethnicity = companion.get("ethnicity", "")
     generation = companion.get("generation", "")
@@ -231,7 +272,6 @@ async def chat(request: Request):
         )
 
     # ✅ Real OpenAI response (no more echo)
-    
     try:
         assistant_reply = _call_gpt4o(
             _to_openai_messages(messages, norm["session_state"]),
@@ -242,8 +282,24 @@ async def chat(request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"OpenAI call failed: {e}")
 
+    # Echo state back so the frontend can render plan/companion correctly
+    session_state_out = dict(norm.get("session_state") or {})
+
+    # normalize plan key variants (so UI doesn't show Unknown)
+    if "plan_name" not in session_state_out and "planName" in session_state_out:
+        session_state_out["plan_name"] = session_state_out.get("planName")
+
+    # also expose a normalized companion object for convenience (non-breaking)
+    raw_comp = (
+        session_state_out.get("companion")
+        or session_state_out.get("companionName")
+        or session_state_out.get("companion_name")
+    )
+    session_state_out["companion_meta"] = _parse_companion_meta(raw_comp)
+    
     return ChatResponse(
         session_id=session_id,
         mode="explicit_allowed" if (user_requesting_explicit and explicit_allowed) else "safe",
         reply=assistant_reply or "I’m here — what would you like to talk about?",
+        session_state=session_state_out,
     )
