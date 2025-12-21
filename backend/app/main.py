@@ -308,22 +308,35 @@ async def chat(request: Request):
     session_state: Dict[str, Any] = norm["session_state"] or {}
     wants_explicit: bool = bool(norm["wants_explicit"])
 
-    # Determine last user text early (CONSENT HANDLER needs this)
+    # Determine last user text early
     last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
     user_text = ((last_user.get("content") if last_user else "") or "").strip()
     normalized_text = user_text.lower().strip()
 
-    # Requested mode from UI
-    requested_mode = (session_state.get("mode") or "").strip().lower()  # friend/romantic/explicit
+    # UI mode (your UI uses friend / romantic / intimate)
+    requested_mode = (session_state.get("mode") or "").strip().lower()
 
-    # Determine explicit intent
-    user_requesting_explicit = wants_explicit or _looks_explicit(user_text) or (requested_mode == "explicit")
+    # Treat Intimate as Explicit (your request)
+    # If your frontend sends "explicit" sometimes, this supports it too.
+    requested_is_intimate = requested_mode in ("intimate", "explicit")
 
-    # Pull server consent state FIRST
+    # Explicit intent detection (Intimate implies explicit requested)
+    user_requesting_explicit = (
+        wants_explicit
+        or _looks_explicit(user_text)
+        or requested_is_intimate
+    )
+
+    # Pull server consent record (may be non-persistent if in-memory)
     rec = consent_store.get(session_id)
-    explicit_allowed = bool(rec and getattr(rec, "explicit_allowed", False))
+    server_explicit_allowed = bool(rec and getattr(rec, "explicit_allowed", False))
 
-    # TTL (timeout) support (stored in session_state; frontend echoes session_state back)
+    # ALSO trust the echoed session_state (prevents looping if consent_store resets)
+    session_explicit_allowed = bool(session_state.get("explicit_consented") is True)
+
+    explicit_allowed = server_explicit_allowed or session_explicit_allowed
+
+    # TTL (optional — respects your existing ttl behavior)
     ttl = _get_explicit_ttl_seconds()
     granted_at = session_state.get("explicit_granted_at")
     if explicit_allowed and isinstance(granted_at, int) and ttl > 0:
@@ -333,7 +346,7 @@ async def chat(request: Request):
             session_state["pending_consent"] = None
             session_state["mode"] = "friend"
 
-    # Manual revoke / exit explicit
+    # Manual revoke / exit
     if _user_wants_exit_explicit(normalized_text):
         session_state["mode"] = "friend"
         session_state["explicit_consented"] = False
@@ -353,7 +366,7 @@ async def chat(request: Request):
     )
 
     # =========================
-    # STEP 5 — CONSENT HANDLER (WORKING)
+    # CONSENT HANDLER (Intimate == Explicit)
     # =========================
     CONSENT_YES = {
         "yes", "y", "yeah", "yep", "sure", "ok", "okay",
@@ -366,33 +379,37 @@ async def chat(request: Request):
 
     pending = (session_state.get("pending_consent") or "").strip().lower()
 
-    def _grant_explicit() -> Dict[str, Any]:
-        # Persist server-side
-        consent_store.set(
-            session_id=session_id,
-            explicit_allowed=True,
-            reason="user explicit consent",
-        )
+    def _grant_intimate() -> Dict[str, Any]:
+        # Persist server-side if available
+        try:
+            consent_store.set(
+                session_id=session_id,
+                explicit_allowed=True,
+                reason="user intimate/explicit consent",
+            )
+        except Exception:
+            pass
+
         out = dict(session_state)
         out["adult_verified"] = True
         out["explicit_consented"] = True
         out["pending_consent"] = None
-        out["mode"] = "explicit"
+        out["mode"] = "intimate"  # keep UI mode name
         out["explicit_granted_at"] = _now_ts()
         return out
 
-    # If we already have explicit_allowed, ensure we NEVER keep asking again
+    # If explicit already allowed, never keep asking again
     if explicit_allowed and session_state.get("pending_consent"):
         session_state["pending_consent"] = None
 
-    # If user replies while we are waiting for consent and explicit isn't allowed yet
+    # If we are waiting for consent and explicit isn't allowed yet:
     if pending and not explicit_allowed:
         if normalized_text in CONSENT_YES:
-            session_state_out = _grant_explicit()
+            session_state_out = _grant_intimate()
             return ChatResponse(
                 session_id=session_id,
-                mode="explicit",
-                reply="Thank you — explicit mode is enabled. What would you like to talk about?",
+                mode="intimate",
+                reply="Thank you — Intimate (18+) mode is enabled. What would you like to talk about?",
                 session_state=session_state_out,
             )
 
@@ -409,7 +426,7 @@ async def chat(request: Request):
             )
 
         session_state_out = dict(session_state)
-        session_state_out["pending_consent"] = pending or "explicit"
+        session_state_out["pending_consent"] = pending or "intimate"
         return ChatResponse(
             session_id=session_id,
             mode="explicit_blocked",
@@ -417,22 +434,21 @@ async def chat(request: Request):
             session_state=session_state_out,
         )
 
-    # If explicit is requested but not yet allowed, ask for consent
+    # If Intimate/Explicit requested but not allowed yet, ask for consent
     if (
         getattr(settings, "REQUIRE_EXPLICIT_CONSENT_FOR_EXPLICIT_CONTENT", True)
         and user_requesting_explicit
         and not explicit_allowed
     ):
         session_state_out = dict(session_state)
-        session_state_out["pending_consent"] = "explicit"
-        # keep mode request visible to UI but do not allow yet
-        session_state_out["mode"] = "explicit"
+        session_state_out["pending_consent"] = "intimate"
+        session_state_out["mode"] = "intimate"  # preserve UI choice
 
         return ChatResponse(
             session_id=session_id,
             mode="explicit_blocked",
             reply=(
-                "Before we go further, I need to confirm you’re 18+ and that you want explicit adult conversation. "
+                "Before we go further, I need to confirm you’re 18+ and that you want Intimate (18+) conversation. "
                 "Please reply with 'yes' to confirm."
             ),
             session_state=session_state_out,
@@ -441,10 +457,9 @@ async def chat(request: Request):
     # =========================
     # OpenAI response
     # =========================
-    # Choose the mode the model should follow
+    # Effective mode for prompting
     effective_mode = requested_mode or "friend"
-    if effective_mode == "explicit" and not explicit_allowed:
-        # safety fallback: if UI asked explicit but we haven't granted it, stay friend
+    if effective_mode in ("intimate", "explicit") and not explicit_allowed:
         effective_mode = "friend"
 
     try:
@@ -463,14 +478,13 @@ async def chat(request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"OpenAI call failed: {e}")
 
-    # Echo state back so the frontend can render plan/companion correctly
     session_state_out = dict(session_state)
 
-    # Normalize plan key variants (so UI doesn't show Unknown)
+    # Normalize plan key variants
     if "plan_name" not in session_state_out and "planName" in session_state_out:
         session_state_out["plan_name"] = session_state_out.get("planName")
 
-    # Also expose a normalized companion meta object (non-breaking)
+    # Companion meta (non-breaking)
     raw_comp = (
         session_state_out.get("companion")
         or session_state_out.get("companionName")
@@ -478,13 +492,13 @@ async def chat(request: Request):
     )
     session_state_out["companion_meta"] = _parse_companion_meta(raw_comp)
 
-    # Ensure mode reflects actual state
-    if explicit_allowed and requested_mode == "explicit":
-        session_state_out["mode"] = "explicit"
+    # Make sure mode stays intimate if allowed and requested
+    if explicit_allowed and requested_is_intimate:
+        session_state_out["mode"] = "intimate"
 
     return ChatResponse(
         session_id=session_id,
-        mode="explicit" if (explicit_allowed and requested_mode == "explicit") else "safe",
+        mode="intimate" if (explicit_allowed and requested_is_intimate) else "safe",
         reply=assistant_reply or "I’m here — what would you like to talk about?",
         session_state=session_state_out,
     )
