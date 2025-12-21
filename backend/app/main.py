@@ -66,15 +66,61 @@ def _looks_explicit(text: str) -> bool:
     return any(k in t for k in keywords)
 
 
-def _to_openai_messages(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+def _to_openai_messages(
+    messages: List[Dict[str, str]],
+    session_state: dict
+) -> List[Dict[str, str]]:
     out: List[Dict[str, str]] = []
+
+    # 🔹 Persona system prompt FIRST
+    system_prompt = _build_persona_system_prompt(session_state)
+    out.append({"role": "system", "content": system_prompt})
+
     for m in messages or []:
         role = m.get("role")
         content = m.get("content")
         if role in ("user", "assistant") and isinstance(content, str):
             out.append({"role": role, "content": content})
+
     return out
 
+
+def _build_persona_system_prompt(session_state: dict) -> str:
+    """
+    Builds a stable system prompt based on companion persona.
+    """
+    companion = session_state.get("companion") or {}
+    
+    name = companion.get("first_name", "Haven")
+    gender = companion.get("gender", "")
+    ethnicity = companion.get("ethnicity", "")
+    generation = companion.get("generation", "")
+
+    lines = [
+        f"You are {name}, an AI companion designed to be warm, attentive, and emotionally intelligent.",
+        "You speak naturally and conversationally.",
+    ]
+
+    if generation:
+        lines.append(
+            f"Your tone and references should feel familiar and comfortable to someone from {generation}."
+        )
+
+    if ethnicity:
+        lines.append(
+            f"You are culturally aware of {ethnicity} perspectives, without using stereotypes."
+        )
+
+    if gender:
+        lines.append(
+            f"Your communication style aligns gently with a {gender.lower()} identity."
+        )
+
+    lines.append(
+        "You are supportive, respectful, and focused on the user's emotional experience."
+    )
+
+    return " ".join(lines)
 
 def _call_gpt4o(messages: List[Dict[str, str]], model: str = "gpt-4o") -> str:
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
@@ -182,7 +228,10 @@ async def chat(request: Request):
 
     # ✅ Real OpenAI response (no more echo)
     try:
-        assistant_reply = _call_gpt4o(_to_openai_messages(messages), model="gpt-4o")
+        assistant_reply = _call_gpt4o(
+            _to_openai_messages(messages, norm["session_state"]),
+            model="gpt-4o"
+        )
     except HTTPException:
         raise
     except Exception as e:
