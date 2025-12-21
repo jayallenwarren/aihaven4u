@@ -379,7 +379,19 @@ export default function Page() {
     try {
       const data = await callChat(nextMessages, sessionState);
 
-      if (data.session_state) setSessionState(data.session_state);
+    if (data.session_state || data.mode) {
+      setSessionState((prev) => {
+        const next = data.session_state ?? prev;
+
+        // 🔑 IMPORTANT: sync backend mode into session state
+        if (data.mode && next.mode !== data.mode) {
+          return { ...next, mode: data.mode as Mode };
+        }
+
+        return next;
+      });
+    }
+
 
       // ✅ ensure Msg typing so Role doesn't widen to string
       const assistantMsg: Msg = { role: "assistant", content: data.reply };
