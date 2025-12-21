@@ -295,6 +295,11 @@ async def _unhandled_exception_handler(request: Request, exc: Exception):
 async def chat(request: Request):
     debug = bool(getattr(settings, "DEBUG", False))
 
+    # ChatResponse.mode allowed literals:
+    STATUS_SAFE = "safe"
+    STATUS_BLOCKED = "explicit_blocked"
+    STATUS_ALLOWED = "explicit_allowed"
+
     raw = await request.json()
     norm = _normalize_payload(raw)
 
@@ -321,7 +326,7 @@ async def chat(request: Request):
 
     # Pull server-side consent state first (authoritative)
     rec = consent_store.get(session_id)
-    intimate_allowed = bool(rec and getattr(rec, "explicit_allowed", False)) or bool(session_state.get("explicit_consented") is True)
+    intimate_allowed = bool(rec and getattr(rec, "explicit_allowed", False)) or (session_state.get("explicit_consented") is True)
 
     # Clear pending consent if already allowed (prevents loops)
     if intimate_allowed and session_state.get("pending_consent"):
@@ -349,58 +354,71 @@ async def chat(request: Request):
         out["adult_verified"] = True
         out["explicit_consented"] = True
         out["pending_consent"] = None
-        out["mode"] = "intimate"
+        out["mode"] = "intimate"           # ✅ UI mode (pill highlight)
         out["explicit_granted_at"] = _now_ts()
         return out
 
-    # If we are waiting on consent
+    # =========================
+    # CONSENT HANDLER
+    # =========================
+
+    # If we are waiting on consent (user previously requested intimate)
     if pending == "intimate" and not intimate_allowed:
         if normalized_text in CONSENT_YES:
             session_state_out = _grant_intimate()
             return ChatResponse(
                 session_id=session_id,
-                mode=STATUS_ALLOWED,  # ✅ must be one of the allowed ChatResponse literals
+                mode=STATUS_ALLOWED,  # ✅ valid ChatResponse literal
                 reply="Thank you — Intimate (18+) mode is enabled. What would you like to explore together?",
-                session_state=session_state,
+                session_state=session_state_out,  # ✅ return the updated state
             )
-
 
         if normalized_text in CONSENT_NO:
             session_state_out = dict(session_state)
             session_state_out["pending_consent"] = None
             session_state_out["explicit_consented"] = False
-            session_state_out["mode"] = "friend"
+            session_state_out["mode"] = "friend"  # ✅ UI mode
             return ChatResponse(
                 session_id=session_id,
-                mode="friend",
+                mode=STATUS_SAFE,  # ✅ valid ChatResponse literal
                 reply="No problem — we’ll keep things in Friend mode.",
                 session_state=session_state_out,
             )
 
-        # Still pending; ask again
+        # Still pending; ask again (KEEP pill highlighted in session_state)
         session_state_out = dict(session_state)
         session_state_out["pending_consent"] = "intimate"
-        session_state_out["mode"] = "intimate"  # keeps the pill highlighted while awaiting consent
+        session_state_out["mode"] = "intimate"
         return ChatResponse(
             session_id=session_id,
-            mode="intimate",
+            mode=STATUS_BLOCKED,  # ✅ valid ChatResponse literal (NOT "intimate")
             reply="Please reply with 'yes' or 'no' to continue.",
             session_state=session_state_out,
         )
 
     # If intimate is requested but not allowed, start consent
-    if getattr(settings, "REQUIRE_EXPLICIT_CONSENT_FOR_EXPLICIT_CONTENT", True) and user_requesting_intimate and not intimate_allowed:
+    if (
+        getattr(settings, "REQUIRE_EXPLICIT_CONSENT_FOR_EXPLICIT_CONTENT", True)
+        and user_requesting_intimate
+        and not intimate_allowed
+    ):
         session_state_out = dict(session_state)
         session_state_out["pending_consent"] = "intimate"
-        session_state_out["mode"] = "intimate"  # keep pill highlighted
-        return ChatResponse(
-        session_id=session_id,
-        mode=STATUS_BLOCKED,
-        reply="Before we continue, please confirm you are 18+ and consent to Intimate (18+) conversation. Reply 'yes' to continue.",
-        session_state=session_state,
-    )
+        session_state_out["mode"] = "intimate"  # ✅ keep pill highlighted in UI
 
-    # Effective mode for the model
+        return ChatResponse(
+            session_id=session_id,
+            mode=STATUS_BLOCKED,  # ✅ valid ChatResponse literal
+            reply=(
+                "Before we continue, please confirm you are 18+ and consent to Intimate (18+) conversation. "
+                "Reply 'yes' to continue."
+            ),
+            session_state=session_state_out,  # ✅ return the updated state
+        )
+
+    # =========================
+    # Determine effective mode
+    # =========================
     effective_mode = requested_mode
     if effective_mode == "intimate" and not intimate_allowed:
         effective_mode = "friend"
@@ -411,13 +429,15 @@ async def chat(request: Request):
         f"user_requesting_intimate={user_requesting_intimate} intimate_allowed={intimate_allowed} pending={pending}",
     )
 
+    # =========================
     # OpenAI response
+    # =========================
     try:
-        reply = _call_gpt4o(
+        assistant_reply = _call_gpt4o(
             _to_openai_messages(
                 messages,
                 session_state,
-                mode="intimate" if intimate_allowed else requested_mode,
+                mode=effective_mode,               # ✅ use effective_mode
                 intimate_allowed=intimate_allowed,
                 debug=debug,
             )
@@ -428,12 +448,16 @@ async def chat(request: Request):
         _dbg(debug, "OpenAI call failed:", repr(e))
         raise HTTPException(status_code=500, detail=f"OpenAI call failed: {type(e).__name__}: {e}")
 
-
-    # Echo session state back (and ensure it reflects truth)
+    # =========================
+    # Echo session state back
+    # =========================
     session_state_out = dict(session_state)
-    session_state_out["mode"] = effective_mode if not (requested_mode == "intimate" and not intimate_allowed) else "friend"
-    if intimate_allowed:
-        session_state_out["mode"] = requested_mode if requested_mode == "intimate" else session_state_out["mode"]
+
+    # Keep UI mode consistent with truth
+    if requested_mode == "intimate":
+        session_state_out["mode"] = "intimate" if intimate_allowed else "friend"
+    else:
+        session_state_out["mode"] = requested_mode
 
     # Normalize plan key variants (if you use them)
     if "plan_name" not in session_state_out and "planName" in session_state_out:
@@ -449,7 +473,7 @@ async def chat(request: Request):
 
     return ChatResponse(
         session_id=session_id,
-        mode=STATUS_ALLOWED if intimate_allowed else STATUS_SAFE,
-        reply=reply, #or "I’m here — what would you like to talk about?",
+        mode=STATUS_ALLOWED if intimate_allowed else STATUS_SAFE,  # ✅ valid ChatResponse literal
+        reply=assistant_reply,
         session_state=session_state_out,
     )
