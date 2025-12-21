@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from .settings import settings
-from .models import ChatRequest, ChatResponse
+from .models import ChatResponse
 from .consent_store import consent_store
 from .consent_routes import router as consent_router
 
@@ -66,29 +66,6 @@ def _looks_explicit(text: str) -> bool:
     return any(k in t for k in keywords)
 
 
-def _to_openai_messages(
-    messages: List[Dict[str, str]],
-    session_state: dict
-) -> List[Dict[str, str]]:
-    out: List[Dict[str, str]] = []
-
-    # 🔹 Persona system prompt FIRST
-    system_prompt = _build_persona_system_prompt(session_state)
-
-    if bool(getattr(settings, "DEBUG", False)):
-        print("Persona system prompt:", system_prompt)
-
-    out.append({"role": "system", "content": system_prompt})
-
-
-    for m in messages or []:
-        role = m.get("role")
-        content = m.get("content")
-        if role in ("user", "assistant") and isinstance(content, str):
-            out.append({"role": role, "content": content})
-
-    return out
-
 def _parse_companion_meta(raw: Any) -> Dict[str, str]:
     """
     Accepts:
@@ -97,7 +74,6 @@ def _parse_companion_meta(raw: Any) -> Dict[str, str]:
     Returns normalized dict with keys: first_name, gender, ethnicity, generation.
     """
     if isinstance(raw, dict):
-        # normalize common key variants
         first = (raw.get("first_name") or raw.get("firstName") or raw.get("name") or "").strip()
         gender = (raw.get("gender") or "").strip()
         ethnicity = (raw.get("ethnicity") or "").strip()
@@ -124,6 +100,7 @@ def _parse_companion_meta(raw: Any) -> Dict[str, str]:
             }
 
     return {"first_name": "", "gender": "", "ethnicity": "", "generation": ""}
+
 
 def _build_persona_system_prompt(session_state: dict) -> str:
     """
@@ -167,6 +144,27 @@ def _build_persona_system_prompt(session_state: dict) -> str:
 
     return " ".join(lines)
 
+
+def _to_openai_messages(messages: List[Dict[str, str]], session_state: dict) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+
+    # Persona system prompt FIRST
+    system_prompt = _build_persona_system_prompt(session_state)
+
+    if bool(getattr(settings, "DEBUG", False)):
+        print("Persona system prompt:", system_prompt)
+
+    out.append({"role": "system", "content": system_prompt})
+
+    for m in messages or []:
+        role = m.get("role")
+        content = m.get("content")
+        if role in ("user", "assistant") and isinstance(content, str):
+            out.append({"role": role, "content": content})
+
+    return out
+
+
 def _call_gpt4o(messages: List[Dict[str, str]], model: str = "gpt-4o") -> str:
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
@@ -204,15 +202,11 @@ def _normalize_payload(raw: Dict[str, Any]) -> Dict[str, Any]:
     """
     session_id = raw.get("session_id") or raw.get("sessionId") or raw.get("sid")
 
-    # messages from new client
     msgs = raw.get("messages")
-
-    # old client used `history` and/or `text`
     history = raw.get("history")
     text = raw.get("text")
 
     if not msgs:
-        # Build from history + text
         msgs = []
         if isinstance(history, list):
             for m in history:
@@ -240,20 +234,65 @@ def _normalize_payload(raw: Dict[str, Any]) -> Dict[str, Any]:
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: Request):
-    # We parse JSON ourselves so we can support both payload shapes without breaking.
     raw = await request.json()
     norm = _normalize_payload(raw)
 
     session_id: str = norm["session_id"]
     messages: List[Dict[str, str]] = norm["messages"]
-    wants_explicit: bool = norm["wants_explicit"]
+    session_state: Dict[str, Any] = norm["session_state"] or {}
+    wants_explicit: bool = bool(norm["wants_explicit"])
 
-    # Determine "explicit intent"
+    # Determine last user text early (Step 5 needs it)
     last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
-    user_text = (last_user.get("content") if last_user else "") or ""
-    user_requesting_explicit = wants_explicit or _looks_explicit(user_text)
+    user_text = ((last_user.get("content") if last_user else "") or "").strip()
+    normalized_text = user_text.lower()
 
-    # Consent gate (your existing store)
+    # Determine requested mode from session_state (fixes "requested_mode undefined")
+    requested_mode = (session_state.get("mode") or "").strip().lower()  # friend/romantic/explicit
+
+    # Determine explicit intent
+    user_requesting_explicit = wants_explicit or _looks_explicit(user_text) or (requested_mode == "explicit")
+
+    # =========================
+    # STEP 5 — CONSENT REPLY HANDLER (FIXED)
+    # =========================
+    CONSENT_YES = {
+        "yes",
+        "y",
+        "i consent",
+        "i agree",
+        "i am 18+",
+        "i'm 18+",
+        "i confirm",
+        "i confirm i am 18+",
+        "i confirm that i am 18+",
+        "i confirm and consent",
+        "i am over 18",
+        "i'm over 18",
+    }
+
+    pending = (session_state.get("pending_consent") or "").strip().lower()
+
+    # If the UI asked for explicit consent (pending_consent == "explicit") and user says yes:
+    if pending == "explicit" and normalized_text in CONSENT_YES:
+        consent_store.set(
+            session_id=session_id,
+            explicit_allowed=True,
+            reason="user explicit consent",
+        )
+
+        session_state_out = dict(session_state)
+        session_state_out["explicit_consented"] = True
+        session_state_out["pending_consent"] = None
+
+        return ChatResponse(
+            session_id=session_id,
+            mode="explicit_allowed",
+            reply="Thank you — explicit mode is enabled. What would you like to do next?",
+            session_state=session_state_out,
+        )
+
+    # If explicit is requested but not yet allowed, ask for consent (sets pending_consent)
     rec = consent_store.get(session_id)
     explicit_allowed = bool(rec and rec.explicit_allowed)
 
@@ -262,20 +301,26 @@ async def chat(request: Request):
         and user_requesting_explicit
         and not explicit_allowed
     ):
+        session_state_out = dict(session_state)
+        session_state_out["pending_consent"] = "explicit"
+
         return ChatResponse(
             session_id=session_id,
             mode="explicit_blocked",
             reply=(
                 "Before we go further, I need to confirm you’re 18+ and that you want explicit adult conversation. "
-                "Please use the consent flow to opt in (double 18+ confirmation + explicit intent)."
+                "Please reply with 'yes' to confirm."
             ),
+            session_state=session_state_out,
         )
 
-    # ✅ Real OpenAI response (no more echo)
+    # =========================
+    # OpenAI response
+    # =========================
     try:
         assistant_reply = _call_gpt4o(
-            _to_openai_messages(messages, norm["session_state"]),
-            model="gpt-4o"
+            _to_openai_messages(messages, session_state),
+            model="gpt-4o",
         )
     except HTTPException:
         raise
@@ -283,20 +328,20 @@ async def chat(request: Request):
         raise HTTPException(status_code=500, detail=f"OpenAI call failed: {e}")
 
     # Echo state back so the frontend can render plan/companion correctly
-    session_state_out = dict(norm.get("session_state") or {})
+    session_state_out = dict(session_state)
 
-    # normalize plan key variants (so UI doesn't show Unknown)
+    # Normalize plan key variants (so UI doesn't show Unknown)
     if "plan_name" not in session_state_out and "planName" in session_state_out:
         session_state_out["plan_name"] = session_state_out.get("planName")
 
-    # also expose a normalized companion object for convenience (non-breaking)
+    # Also expose a normalized companion meta object (non-breaking)
     raw_comp = (
         session_state_out.get("companion")
         or session_state_out.get("companionName")
         or session_state_out.get("companion_name")
     )
     session_state_out["companion_meta"] = _parse_companion_meta(raw_comp)
-    
+
     return ChatResponse(
         session_id=session_id,
         mode="explicit_allowed" if (user_requesting_explicit and explicit_allowed) else "safe",
