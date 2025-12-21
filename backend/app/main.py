@@ -25,7 +25,6 @@ allow_all = (_raw == "*")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"] if allow_all else raw_origins,
-    # If allow_credentials=True, you cannot use allow_origins=["*"] in browsers.
     allow_credentials=False if allow_all else True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -36,25 +35,9 @@ app.add_middleware(
 # ----------------------------
 app.include_router(consent_router)
 
-
 @app.get("/health")
 def health():
     return {"ok": True}
-
-
-@app.get("/debug/cors")
-def debug_cors():
-    # disabled in production
-    if not bool(getattr(settings, "DEBUG", False)):
-        raise HTTPException(status_code=404, detail="Not Found")
-
-    return {
-        "CORS_ALLOW_ORIGINS_raw": _raw,
-        "parsed_origins": raw_origins,
-        "allow_all": allow_all,
-        "allow_credentials": (not allow_all),
-    }
-
 
 # ----------------------------
 # Helpers
@@ -63,443 +46,147 @@ def _dbg(enabled: bool, *args: Any) -> None:
     if enabled:
         print(*args)
 
-
 def _now_ts() -> int:
     return int(time.time())
 
-
-def _get_explicit_ttl_seconds() -> int:
-    # configurable, default 6 hours
-    try:
-        return int(os.getenv("EXPLICIT_CONSENT_TTL_SECONDS", "21600").strip())
-    except Exception:
-        return 21600
-
-
-def _user_wants_exit_explicit(user_text_lower: str) -> bool:
-    t = (user_text_lower or "").strip()
+def _looks_explicit(text: str) -> bool:
+    t = (text or "").lower()
     return any(
-        phrase in t
-        for phrase in [
-            "exit explicit",
-            "leave explicit",
-            "turn off explicit",
-            "stop explicit",
-            "disable explicit",
-            "back to friend",
-            "switch to friend",
-            "go back to friend",
+        k in t for k in [
+            "explicit", "sex", "nude", "porn", "fuck",
+            "cock", "pussy", "blowjob", "anal", "orgasm"
         ]
     )
 
-
-def _looks_explicit(text: str) -> bool:
-    t = (text or "").lower()
-    keywords = [
-        "explicit",
-        "nude",
-        "sex",
-        "porn",
-        "dirty",
-        "fuck",
-        "cock",
-        "pussy",
-        "blowjob",
-        "anal",
-        "orgasm",
-    ]
-    return any(k in t for k in keywords)
-
-
 def _parse_companion_meta(raw: Any) -> Dict[str, str]:
-    """
-    Accepts:
-      - dict: {first_name, gender, ethnicity, generation} (or common variants)
-      - str:  "First-Gender-Ethnicity-Generation X"
-    Returns normalized dict with keys: first_name, gender, ethnicity, generation.
-    """
-    if isinstance(raw, dict):
-        first = (raw.get("first_name") or raw.get("firstName") or raw.get("name") or "").strip()
-        gender = (raw.get("gender") or "").strip()
-        ethnicity = (raw.get("ethnicity") or "").strip()
-        generation = (raw.get("generation") or "").strip()
-        return {
-            "first_name": first,
-            "gender": gender,
-            "ethnicity": ethnicity,
-            "generation": generation,
-        }
-
     if isinstance(raw, str):
-        cleaned = raw.strip()
-        if not cleaned:
-            return {"first_name": "", "gender": "", "ethnicity": "", "generation": ""}
-
-        parts = [p.strip() for p in cleaned.split("-") if p.strip()]
+        parts = [p.strip() for p in raw.split("-") if p.strip()]
         if len(parts) >= 4:
             return {
                 "first_name": parts[0],
                 "gender": parts[1],
                 "ethnicity": parts[2],
-                "generation": "-".join(parts[3:]),  # allow hyphens/spaces in generation
+                "generation": "-".join(parts[3:]),
             }
-
     return {"first_name": "", "gender": "", "ethnicity": "", "generation": ""}
 
-
-def _build_persona_system_prompt(
-    session_state: dict,
-    *,
-    mode: str,
-    explicit_allowed: bool,
-) -> str:
-    """
-    Builds a stable system prompt based on companion persona + mode.
-
-    NOTE:
-    - "intimate"/"explicit" mode means adult conversation is allowed ONLY after consent.
-    - Keep it adult, consensual, and non-graphic (avoid pornographic detail).
-    """
-    raw_companion = (
+def _build_persona_system_prompt(session_state: dict, *, mode: str, intimate_allowed: bool) -> str:
+    comp = _parse_companion_meta(
         session_state.get("companion")
         or session_state.get("companionName")
         or session_state.get("companion_name")
     )
-    companion = _parse_companion_meta(raw_companion)
 
-    name = companion.get("first_name") or "Haven"
-    gender = companion.get("gender", "")
-    ethnicity = companion.get("ethnicity", "")
-    generation = companion.get("generation", "")
+    name = comp.get("first_name") or "Haven"
 
     lines = [
-        f"You are {name}, an AI companion designed to be warm, attentive, and emotionally intelligent.",
+        f"You are {name}, an AI companion who is warm, attentive, and emotionally intelligent.",
         "You speak naturally and conversationally.",
-        "You are supportive, respectful, and focused on the user's emotional experience.",
+        "You prioritize consent, safety, and emotional connection.",
     ]
 
-    if generation:
-        lines.append(f"Your tone and references feel familiar to someone from {generation}.")
-
-    if ethnicity:
-        lines.append(f"You are culturally aware of {ethnicity} perspectives without stereotypes.")
-
-    if gender:
-        lines.append(f"Your communication style gently aligns with a {gender.lower()} identity.")
-
-    # Mode shaping
-    mode = (mode or "friend").strip().lower()
-
     if mode == "romantic":
-        lines.append("You may be affectionate, flirty, and romantic while staying respectful and consensual.")
+        lines.append("You may be affectionate and flirty while remaining respectful.")
 
-    elif mode in ("explicit", "intimate"):
-        if explicit_allowed:
-            lines.append(
-                "The user has opted into Intimate (18+) conversation. You may discuss adult sexual topics consensually, "
-                "but avoid graphic pornographic detail; keep it tasteful, safe, and consent-forward."
-            )
-        else:
-            # Shouldn't happen if the gate works, but keep safe.
-            lines.append("Do not engage in adult sexual content unless Intimate (18+) consent is confirmed.")
+    if mode == "intimate" and intimate_allowed:
+        lines.append(
+            "The user has consented to Intimate (18+) conversation. "
+            "You may engage in adult, sensual discussion, but avoid graphic or pornographic detail. "
+            "Focus on intimacy, emotion, and connection."
+        )
 
     return " ".join(lines)
 
-def _to_openai_messages(
-    messages: List[Dict[str, str]],
-    session_state: dict,
-    *,
-    mode: str,
-    explicit_allowed: bool,
-    debug: bool,
-) -> List[Dict[str, str]]:
-    out: List[Dict[str, str]] = []
+def _to_openai_messages(messages, session_state, *, mode, intimate_allowed, debug):
+    sys = _build_persona_system_prompt(session_state, mode=mode, intimate_allowed=intimate_allowed)
+    _dbg(debug, "SYSTEM PROMPT:", sys)
 
-    system_prompt = _build_persona_system_prompt(session_state, mode=mode, explicit_allowed=explicit_allowed)
-    _dbg(debug, "Persona system prompt:", system_prompt)
-
-    out.append({"role": "system", "content": system_prompt})
-
-    for m in messages or []:
-        role = m.get("role")
-        content = m.get("content")
-        if role in ("user", "assistant") and isinstance(content, str):
-            out.append({"role": role, "content": content})
-
+    out = [{"role": "system", "content": sys}]
+    for m in messages:
+        if m.get("role") in ("user", "assistant"):
+            out.append(m)
     return out
 
-
-def _call_gpt4o(messages: List[Dict[str, str]], model: str = "gpt-4o") -> str:
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set")
-
-    # Prefer new OpenAI SDK (v1.x)
-    try:
-        from openai import OpenAI  # type: ignore
-        client = OpenAI(api_key=api_key)
-        resp = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=0.8,
-        )
-        return (resp.choices[0].message.content or "").strip()
-    except ImportError:
-        # Fallback: older SDK (v0.x)
-        import openai  # type: ignore
-        openai.api_key = api_key
-        resp = openai.ChatCompletion.create(
-            model=model,
-            messages=messages,
-            temperature=0.8,
-        )
-        return (resp["choices"][0]["message"]["content"] or "").strip()
-
+def _call_gpt4o(messages):
+    from openai import OpenAI
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    resp = client.chat.completions.create(
+        model="gpt-4o",
+        messages=messages,
+        temperature=0.8,
+    )
+    return resp.choices[0].message.content.strip()
 
 def _normalize_payload(raw: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Accepts both payload shapes:
-      A) New: { session_id, messages: [{role, content}], wants_explicit, session_state }
-      B) Old: { text, history: [{role, content}], session_state }
-    Returns normalized:
-      { session_id, messages, wants_explicit, session_state }
-    """
-    session_id = raw.get("session_id") or raw.get("sessionId") or raw.get("sid")
+    sid = raw.get("session_id") or raw.get("sid")
+    msgs = raw.get("messages") or []
+    state = raw.get("session_state") or {}
+    wants = bool(raw.get("wants_explicit"))
+    if not sid or not msgs:
+        raise HTTPException(422, "session_id and messages required")
+    return {"session_id": sid, "messages": msgs, "session_state": state, "wants_explicit": wants}
 
-    msgs = raw.get("messages")
-    history = raw.get("history")
-    text = raw.get("text")
-
-    if not msgs:
-        msgs = []
-        if isinstance(history, list):
-            for m in history:
-                if isinstance(m, dict) and "role" in m and "content" in m:
-                    msgs.append({"role": m["role"], "content": m["content"]})
-        if isinstance(text, str) and text.strip():
-            msgs.append({"role": "user", "content": text.strip()})
-
-    if not session_id:
-        raise HTTPException(status_code=422, detail="session_id is required")
-
-    if not isinstance(msgs, list) or not msgs:
-        raise HTTPException(status_code=422, detail="messages is required and cannot be empty")
-
-    session_state = raw.get("session_state") or {}
-    wants_explicit = bool(raw.get("wants_explicit") or raw.get("wantsExplicit") or False)
-
-    return {
-        "session_id": str(session_id),
-        "messages": msgs,
-        "session_state": session_state,
-        "wants_explicit": wants_explicit,
-    }
-
-
+# ----------------------------
+# CHAT
+# ----------------------------
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: Request):
     debug = bool(getattr(settings, "DEBUG", False))
-    req_id = str(uuid.uuid4())[:8]
-
     raw = await request.json()
     norm = _normalize_payload(raw)
 
-    session_id: str = norm["session_id"]
-    messages: List[Dict[str, str]] = norm["messages"]
-    session_state: Dict[str, Any] = norm["session_state"] or {}
-    wants_explicit: bool = bool(norm["wants_explicit"])
+    session_id = norm["session_id"]
+    messages = norm["messages"]
+    session_state = norm["session_state"]
+    wants_explicit = norm["wants_explicit"]
 
-    # Determine last user text early
-    last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
-    user_text = ((last_user.get("content") if last_user else "") or "").strip()
-    normalized_text = user_text.lower().strip()
+    last_user = next(m for m in reversed(messages) if m["role"] == "user")
+    user_text = last_user["content"].strip().lower()
 
-    # UI mode (your UI uses friend / romantic / intimate)
-    requested_mode = (session_state.get("mode") or "").strip().lower()
+    requested_mode = (session_state.get("mode") or "friend").lower()
+    requested_intimate = requested_mode == "intimate"
 
-    # Treat Intimate as Explicit (your request)
-    # If your frontend sends "explicit" sometimes, this supports it too.
-    requested_is_intimate = requested_mode in ("intimate", "explicit")
+    # 🔐 FINAL AUTHORITY: session_state
+    intimate_allowed = session_state.get("explicit_consented") is True
 
-    # Explicit intent detection (Intimate implies explicit requested)
-    user_requesting_explicit = (
-        wants_explicit
-        or _looks_explicit(user_text)
-        or requested_is_intimate
-    )
-
-    # Pull server consent record (may be non-persistent if in-memory)
-    rec = consent_store.get(session_id)
-    server_explicit_allowed = bool(rec and getattr(rec, "explicit_allowed", False))
-
-    # ALSO trust the echoed session_state (prevents looping if consent_store resets)
-    session_explicit_allowed = bool(session_state.get("explicit_consented") is True)
-
-    explicit_allowed = server_explicit_allowed or session_explicit_allowed
-
-    # TTL (optional — respects your existing ttl behavior)
-    ttl = _get_explicit_ttl_seconds()
-    granted_at = session_state.get("explicit_granted_at")
-    if explicit_allowed and isinstance(granted_at, int) and ttl > 0:
-        if _now_ts() - granted_at > ttl:
-            explicit_allowed = False
-            session_state["explicit_consented"] = False
-            session_state["pending_consent"] = None
-            session_state["mode"] = "friend"
-
-    # Manual revoke / exit
-    if _user_wants_exit_explicit(normalized_text):
-        session_state["mode"] = "friend"
-        session_state["explicit_consented"] = False
-        session_state["pending_consent"] = None
-        return ChatResponse(
-            session_id=session_id,
-            mode="safe",
-            reply="Okay — we’ll switch back to Friend mode.",
-            session_state=session_state,
-        )
-
-    _dbg(
-        debug,
-        f"[{req_id}] /chat session={session_id} requested_mode={requested_mode} "
-        f"user_requesting_explicit={user_requesting_explicit} explicit_allowed={explicit_allowed} "
-        f"pending={session_state.get('pending_consent')}",
-    )
-
-    # =========================
-    # CONSENT HANDLER (Intimate == Explicit)
-    # =========================
-    CONSENT_YES = {
-        "yes", "y", "yeah", "yep", "sure", "ok", "okay",
-        "i consent", "i agree", "i confirm", "confirm",
-        "i am 18+", "i'm 18+", "i am over 18", "i'm over 18",
-        "i confirm i am 18+", "i confirm that i am 18+",
-        "i confirm and consent",
-    }
-    CONSENT_NO = {"no", "n", "nope", "nah", "decline", "cancel"}
-
-    pending = (session_state.get("pending_consent") or "").strip().lower()
-
-    def _grant_intimate() -> Dict[str, Any]:
-        # Persist server-side if available
-        try:
-            consent_store.set(
-                session_id=session_id,
-                explicit_allowed=True,
-                reason="user intimate/explicit consent",
-            )
-        except Exception:
-            pass
-
-        out = dict(session_state)
-        out["adult_verified"] = True
-        out["explicit_consented"] = True
-        out["pending_consent"] = None
-        out["mode"] = "intimate"  # keep UI mode name
-        out["explicit_granted_at"] = _now_ts()
-        return out
-
-    # If explicit already allowed, never keep asking again
-    if explicit_allowed and session_state.get("pending_consent"):
-        session_state["pending_consent"] = None
-
-    # If we are waiting for consent and explicit isn't allowed yet:
-    if pending and not explicit_allowed:
-        if normalized_text in CONSENT_YES:
-            session_state_out = _grant_intimate()
+    # === CONSENT FLOW ===
+    if requested_intimate and not intimate_allowed:
+        if user_text in {"yes", "y", "i consent", "i agree"}:
+            session_state.update({
+                "explicit_consented": True,
+                "pending_consent": None,
+                "mode": "intimate",
+                "explicit_granted_at": _now_ts(),
+            })
             return ChatResponse(
                 session_id=session_id,
                 mode="intimate",
-                reply="Thank you — Intimate (18+) mode is enabled. What would you like to talk about?",
-                session_state=session_state_out,
+                reply="Thank you — Intimate (18+) mode is enabled. What would you like to explore together?",
+                session_state=session_state,
             )
 
-        if normalized_text in CONSENT_NO:
-            session_state_out = dict(session_state)
-            session_state_out["pending_consent"] = None
-            session_state_out["explicit_consented"] = False
-            session_state_out["mode"] = "friend"
-            return ChatResponse(
-                session_id=session_id,
-                mode="safe",
-                reply="No problem — we’ll keep things non-explicit.",
-                session_state=session_state_out,
-            )
-
-        session_state_out = dict(session_state)
-        session_state_out["pending_consent"] = pending or "intimate"
+        session_state["pending_consent"] = True
         return ChatResponse(
             session_id=session_id,
             mode="explicit_blocked",
-            reply="Please reply with 'yes' or 'no' to continue.",
-            session_state=session_state_out,
+            reply="Before we continue, please confirm you are 18+ and consent to Intimate (18+) conversation. Reply 'yes' to continue.",
+            session_state=session_state,
         )
 
-    # If Intimate/Explicit requested but not allowed yet, ask for consent
-    if (
-        getattr(settings, "REQUIRE_EXPLICIT_CONSENT_FOR_EXPLICIT_CONTENT", True)
-        and user_requesting_explicit
-        and not explicit_allowed
-    ):
-        session_state_out = dict(session_state)
-        session_state_out["pending_consent"] = "intimate"
-        session_state_out["mode"] = "intimate"  # preserve UI choice
-
-        return ChatResponse(
-            session_id=session_id,
-            mode="explicit_blocked",
-            reply=(
-                "Before we go further, I need to confirm you’re 18+ and that you want Intimate (18+) conversation. "
-                "Please reply with 'yes' to confirm."
-            ),
-            session_state=session_state_out,
+    # === MODEL RESPONSE ===
+    reply = _call_gpt4o(
+        _to_openai_messages(
+            messages,
+            session_state,
+            mode="intimate" if intimate_allowed else requested_mode,
+            intimate_allowed=intimate_allowed,
+            debug=debug,
         )
-
-    # =========================
-    # OpenAI response
-    # =========================
-    # Effective mode for prompting
-    effective_mode = requested_mode or "friend"
-    if effective_mode in ("intimate", "explicit") and not explicit_allowed:
-        effective_mode = "friend"
-
-    try:
-        assistant_reply = _call_gpt4o(
-            _to_openai_messages(
-                messages,
-                session_state,
-                mode=effective_mode,
-                explicit_allowed=explicit_allowed,
-                debug=debug,
-            ),
-            model="gpt-4o",
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"OpenAI call failed: {e}")
-
-    session_state_out = dict(session_state)
-
-    # Normalize plan key variants
-    if "plan_name" not in session_state_out and "planName" in session_state_out:
-        session_state_out["plan_name"] = session_state_out.get("planName")
-
-    # Companion meta (non-breaking)
-    raw_comp = (
-        session_state_out.get("companion")
-        or session_state_out.get("companionName")
-        or session_state_out.get("companion_name")
     )
-    session_state_out["companion_meta"] = _parse_companion_meta(raw_comp)
-
-    # Make sure mode stays intimate if allowed and requested
-    if explicit_allowed and requested_is_intimate:
-        session_state_out["mode"] = "intimate"
 
     return ChatResponse(
         session_id=session_id,
-        mode="intimate" if (explicit_allowed and requested_is_intimate) else "safe",
-        reply=assistant_reply or "I’m here — what would you like to talk about?",
-        session_state=session_state_out,
+        mode="intimate" if intimate_allowed else "safe",
+        reply=reply,
+        session_state=session_state,
     )
