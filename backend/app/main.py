@@ -51,6 +51,20 @@ def health():
 # ----------------------------
 # Helpers
 # ----------------------------
+
+STATUS_SAFE = "safe"
+STATUS_BLOCKED = "explicit_blocked"
+STATUS_ALLOWED = "explicit_allowed"
+
+def _normalize_mode(v: str) -> str:
+    v = (v or "").strip().lower()
+    if v in ("friend", "romantic", "intimate"):
+        return v
+    # treat "explicit" as "intimate" if it ever comes through
+    if v == "explicit":
+        return "intimate"
+    return "friend"
+
 def _dbg(enabled: bool, *args: Any) -> None:
     if enabled:
         print(*args)
@@ -300,9 +314,10 @@ async def chat(request: Request):
         session_state["mode"] = detected_switch
 
     requested_mode = _normalize_mode(session_state.get("mode") or "friend")
+    requested_intimate = (requested_mode == "intimate")
 
     # "Intimate" == explicit intent
-    user_requesting_intimate = wants_explicit or _looks_intimate(user_text) or (requested_mode == "intimate")
+    user_requesting_intimate = wants_explicit or _looks_intimate(user_text) or requested_intimate
 
     # Pull server-side consent state first (authoritative)
     rec = consent_store.get(session_id)
@@ -344,10 +359,11 @@ async def chat(request: Request):
             session_state_out = _grant_intimate()
             return ChatResponse(
                 session_id=session_id,
-                mode="intimate",
-                reply="Thank you — Intimate (18+) mode is enabled. What would you like to talk about?",
-                session_state=session_state_out,
+                mode=STATUS_ALLOWED,  # ✅ must be one of the allowed ChatResponse literals
+                reply="Thank you — Intimate (18+) mode is enabled. What would you like to explore together?",
+                session_state=session_state,
             )
+
 
         if normalized_text in CONSENT_NO:
             session_state_out = dict(session_state)
@@ -378,14 +394,11 @@ async def chat(request: Request):
         session_state_out["pending_consent"] = "intimate"
         session_state_out["mode"] = "intimate"  # keep pill highlighted
         return ChatResponse(
-            session_id=session_id,
-            mode="intimate",
-            reply=(
-                "Before we go further, I need to confirm you’re 18+ and that you want Intimate (18+) conversation. "
-                "Please reply with 'yes' to confirm."
-            ),
-            session_state=session_state_out,
-        )
+        session_id=session_id,
+        mode=STATUS_BLOCKED,
+        reply="Before we continue, please confirm you are 18+ and consent to Intimate (18+) conversation. Reply 'yes' to continue.",
+        session_state=session_state,
+    )
 
     # Effective mode for the model
     effective_mode = requested_mode
@@ -399,15 +412,22 @@ async def chat(request: Request):
     )
 
     # OpenAI response
-    assistant_reply = _call_gpt4o(
-        _to_openai_messages(
-            messages,
-            session_state,
-            mode=effective_mode,
-            intimate_allowed=intimate_allowed,
-            debug=debug,
+    try:
+        reply = _call_gpt4o(
+            _to_openai_messages(
+                messages,
+                session_state,
+                mode="intimate" if intimate_allowed else requested_mode,
+                intimate_allowed=intimate_allowed,
+                debug=debug,
+            )
         )
-    )
+    except HTTPException:
+        raise
+    except Exception as e:
+        _dbg(debug, "OpenAI call failed:", repr(e))
+        raise HTTPException(status_code=500, detail=f"OpenAI call failed: {type(e).__name__}: {e}")
+
 
     # Echo session state back (and ensure it reflects truth)
     session_state_out = dict(session_state)
@@ -429,7 +449,7 @@ async def chat(request: Request):
 
     return ChatResponse(
         session_id=session_id,
-        mode=session_state_out["mode"],
-        reply=assistant_reply or "I’m here — what would you like to talk about?",
+        mode=STATUS_ALLOWED if intimate_allowed else STATUS_SAFE,
+        reply=reply, #or "I’m here — what would you like to talk about?",
         session_state=session_state_out,
     )
