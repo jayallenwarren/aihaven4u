@@ -36,7 +36,6 @@ function parseCompanionMeta(raw: string): CompanionMeta {
     .map((p) => p.trim())
     .filter(Boolean);
 
-  // If the string isn't 4 parts, treat as Haven-ish fallback
   if (parts.length < 4) {
     return {
       first: cleaned || DEFAULT_COMPANION_NAME,
@@ -76,21 +75,18 @@ function buildAvatarCandidates(companionKeyOrName: string) {
     candidates.push(`${base}.png`);
   }
 
-  // Always end with bundled default avatar
   candidates.push(DEFAULT_AVATAR);
   return candidates;
 }
 
 async function pickFirstExisting(urls: string[]) {
   for (const url of urls) {
-    // If this is the bundled default, just take it (no need to probe)
     if (url === DEFAULT_AVATAR) return url;
-
     try {
       const res = await fetch(url, { method: "HEAD", cache: "no-store" });
       if (res.ok) return url;
     } catch {
-      // ignore and continue
+      // ignore
     }
   }
   return DEFAULT_AVATAR;
@@ -101,15 +97,20 @@ function greetingFor(name: string) {
   return `Hi, ${n} here. 😊 What's on your mind?`;
 }
 
-// ✅ Intimate replaces Explicit everywhere
+/**
+ * Canonical UI modes (match backend):
+ * - friend
+ * - romantic
+ * - intimate
+ */
 type Mode = "friend" | "romantic" | "intimate";
 
 type SessionState = {
   mode: Mode;
   adult_verified: boolean;
   romance_consented: boolean;
-  intimate_consented: boolean; // ✅ was explicit_consented
-  pending_consent: "romance" | "adult" | "intimate" | null; // ✅ was explicit
+  explicit_consented: boolean; // keep key name for backward compatibility
+  pending_consent: "romance" | "adult" | "explicit" | "intimate" | null;
   model: string;
 };
 
@@ -128,6 +129,12 @@ type PlanName =
   | "Test - Romantic"
   | "Test - Intimate (18+)"
   | null;
+
+type ChatApiResponse = {
+  reply: string;
+  session_state?: Partial<SessionState>;
+  mode?: string; // backend hint
+};
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
 const UPGRADE_URL = "https://www.aihaven4u.com/pricing-plans/list";
@@ -161,15 +168,38 @@ function isAllowedOrigin(origin: string) {
   }
 }
 
+/**
+ * Normalize any backend/UI “mode-ish” string into our 3 Mode values.
+ * Treat Explicit as Intimate.
+ */
+function normalizeMode(raw: any): Mode | null {
+  const t = String(raw || "").toLowerCase().trim();
+  if (!t) return null;
+
+  if (t === "friend") return "friend";
+  if (t === "romantic") return "romantic";
+  if (t === "intimate") return "intimate";
+
+  // synonyms
+  if (t.includes("explicit")) return "intimate";
+  if (t.includes("intimate")) return "intimate";
+  if (t.includes("adult")) return "intimate";
+  if (t.includes("allowed")) return "intimate";
+
+  // ignore safe/blocked as "not a mode"
+  if (t.includes("safe")) return null;
+  if (t.includes("blocked")) return null;
+
+  return null;
+}
+
 function requestedModeFromHint(text: string): Mode | null {
   const t = (text || "").toLowerCase();
   if (t.includes("mode:friend") || t.includes("[mode:friend]")) return "friend";
   if (t.includes("mode:romantic") || t.includes("[mode:romantic]")) return "romantic";
   if (t.includes("mode:intimate") || t.includes("[mode:intimate]")) return "intimate";
-
-  // Back-compat: treat "explicit" hints as intimate
+  // backward compatible
   if (t.includes("mode:explicit") || t.includes("[mode:explicit]")) return "intimate";
-
   return null;
 }
 
@@ -180,15 +210,8 @@ function isRomanticRequest(text: string) {
 
 function isIntimateRequest(text: string) {
   const t = (text || "").toLowerCase();
-  // NOTE: "intimate" is treated as adult/18+ requests
-  return /\b(intimate|sensual|sexual|nsfw|touch|body|desire|nude|sex|oral|penetration)\b/.test(t);
+  return /\b(sex|nude|explicit|intimate|nsfw|oral|penetration|hardcore)\b/.test(t);
 }
-
-type ChatApiResponse = {
-  reply: string;
-  session_state?: Partial<SessionState>;
-  mode?: Mode; // backend may return top-level mode; keep optional
-};
 
 export default function Page() {
   const sessionIdRef = useRef<string | null>(null);
@@ -213,14 +236,13 @@ export default function Page() {
     model: "gpt-4o",
     adult_verified: false,
     romance_consented: false,
-    intimate_consented: false,
+    explicit_consented: false,
     pending_consent: null,
   });
 
   const [planName, setPlanName] = useState<PlanName>(null);
   const [companionName, setCompanionName] = useState<string>(DEFAULT_COMPANION_NAME);
   const [avatarSrc, setAvatarSrc] = useState<string>(DEFAULT_AVATAR);
-  // full companion key string (e.g. "Aaliyah-Female-Black-Generation Z") used for avatar matching
   const [companionKey, setCompanionKey] = useState<string>("");
 
   const [allowedModes, setAllowedModes] = useState<Mode[]>(["friend"]);
@@ -245,7 +267,6 @@ export default function Page() {
     const keyName = normalizeKeyForFile(companionName || DEFAULT_COMPANION_NAME);
     const greetKey = `${GREET_ONCE_KEY}:${keyName}`;
 
-    // short delay so UI mounts + companionName can arrive from Wix postMessage
     const tmr = window.setTimeout(() => {
       const already = sessionStorage.getItem(greetKey) === "1";
       if (already) return;
@@ -286,7 +307,6 @@ export default function Page() {
       const incomingPlan = (data.planName ?? null) as PlanName;
       setPlanName(incomingPlan);
 
-      // Companion key/meta used for avatar matching (e.g. "Aaliyah-Female-Black-Generation Z")
       const incomingCompanion =
         typeof (data as any).companion === "string" ? (data as any).companion.trim() : "";
       const resolvedCompanionKey = incomingCompanion || "";
@@ -318,7 +338,7 @@ export default function Page() {
     return () => window.removeEventListener("message", onMessage);
   }, []);
 
-  async function callChat(nextMessages: Msg[], stateToSend: SessionState): Promise<ChatApiResponse> {
+  async function callChat(nextMessages: Msg[], stateToSend: SessionState) {
     if (!API_BASE) throw new Error("NEXT_PUBLIC_API_BASE_URL is not set");
 
     const session_id =
@@ -326,14 +346,13 @@ export default function Page() {
       (crypto as any).randomUUID?.() ||
       `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
-    // ✅ Send what backend expects: session_id + messages (+ wants_explicit/intimate)
     const res = await fetch(`${API_BASE}/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         session_id,
-        // Back-compat: backend may still read wants_explicit; we map intimate consent to it
-        wants_explicit: stateToSend?.intimate_consented === true,
+        // keep backend compatibility: "wants_explicit" means "wants intimate"
+        wants_explicit: stateToSend.mode === "intimate" || stateToSend.explicit_consented === true,
         session_state: stateToSend,
         messages: nextMessages.map((m) => ({ role: m.role, content: m.content })),
       }),
@@ -387,14 +406,21 @@ export default function Page() {
     try {
       const data = await callChat(nextMessages, sessionState);
 
-      // ✅ Sync backend state into UI state (pills highlight correctly)
+      // Merge backend session_state safely + accept backend mode hint
       setSessionState((prev) => {
-        const merged = { ...prev, ...(data.session_state ?? {}) };
+        const merged: SessionState = {
+          ...prev,
+          ...(data.session_state || {}),
+        } as SessionState;
 
-        // If backend sends a top-level mode, prefer it
-        if (data.mode) merged.mode = data.mode;
+        const modeFromBackend =
+          normalizeMode((data.session_state as any)?.mode) ?? normalizeMode(data.mode);
 
-        return merged as SessionState;
+        const nextMode: Mode = modeFromBackend
+          ? (allowedModes.includes(modeFromBackend) ? modeFromBackend : "friend")
+          : prev.mode;
+
+        return { ...merged, mode: nextMode };
       });
 
       const assistantMsg: Msg = { role: "assistant", content: data.reply };
@@ -442,6 +468,7 @@ export default function Page() {
               disabled={disabled}
               onClick={() => {
                 if (disabled) return showUpgradeMessage(m);
+
                 setSessionState((prev) => ({ ...prev, mode: m }));
 
                 const modeMsg: Msg = { role: "assistant", content: `Mode set to: ${MODE_LABELS[m]}` };
@@ -511,7 +538,7 @@ export default function Page() {
         </button>
       </section>
 
-      {/* Consent overlay (existing behavior) */}
+      {/* Consent overlay */}
       {sessionState.pending_consent && (
         <div
           style={{
