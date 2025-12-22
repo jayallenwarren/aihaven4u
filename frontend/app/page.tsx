@@ -6,6 +6,36 @@ import havenHeart from "../public/ai-haven-heart.png";
 type Role = "user" | "assistant";
 type Msg = { role: Role; content: string };
 
+type Mode = "friend" | "romantic" | "intimate";
+type ChatStatus = "safe" | "explicit_blocked" | "explicit_allowed";
+
+type SessionState = {
+  mode: Mode;
+  adult_verified: boolean;
+  romance_consented: boolean;
+  explicit_consented: boolean;
+  pending_consent: "intimate" | null;
+  model: string;
+  // optional extras tolerated
+  [k: string]: any;
+};
+
+type ChatApiResponse = {
+  reply: string;
+  mode?: ChatStatus; // IMPORTANT: this is STATUS, not the UI pill mode
+  session_state?: Partial<SessionState>;
+};
+
+type PlanName =
+  | "Week - Trial"
+  | "Weekly - Friend"
+  | "Weekly - Romantic"
+  | "Weekly - Intimate (18+)"
+  | "Test - Friend"
+  | "Test - Romantic"
+  | "Test - Intimate (18+)"
+  | null;
+
 type CompanionMeta = {
   first: string;
   gender: string;
@@ -17,12 +47,31 @@ type CompanionMeta = {
 const DEFAULT_COMPANION_NAME = "Haven";
 const HEADSHOT_DIR = "/companion/headshot";
 const GREET_ONCE_KEY = "AIHAVEN_GREETED";
-
-// Bundled default avatar (avoids public-path issues when embedded in Wix iframe)
 const DEFAULT_AVATAR = havenHeart.src;
 
-function modeHint(m: Mode) {
-  return `[mode:${m}]`;
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
+const UPGRADE_URL = "https://www.aihaven4u.com/pricing-plans/list";
+
+const MODE_LABELS: Record<Mode, string> = {
+  friend: "Friend",
+  romantic: "Romantic",
+  intimate: "Intimate (18+)",
+};
+
+const ROMANTIC_ALLOWED_PLANS: PlanName[] = [
+  "Week - Trial",
+  "Weekly - Romantic",
+  "Weekly - Intimate (18+)",
+  "Test - Romantic",
+  "Test - Intimate (18+)",
+];
+
+function allowedModesForPlan(planName: PlanName): Mode[] {
+  const modes: Mode[] = ["friend"];
+  if (ROMANTIC_ALLOWED_PLANS.includes(planName)) modes.push("romantic");
+  if (planName === "Weekly - Intimate (18+)" || planName === "Test - Intimate (18+)")
+    modes.push("intimate");
+  return modes;
 }
 
 function stripExt(s: string) {
@@ -62,11 +111,6 @@ function parseCompanionMeta(raw: string): CompanionMeta {
   };
 }
 
-/**
- * Generates candidate headshot URLs:
- * - We try .jpeg, .jpg, then .png
- * - We normalize spaces to hyphens ONLY for filenames
- */
 function buildAvatarCandidates(companionKeyOrName: string) {
   const raw = (companionKeyOrName || "").trim();
   const normalized = normalizeKeyForFile(stripExt(raw));
@@ -78,8 +122,6 @@ function buildAvatarCandidates(companionKeyOrName: string) {
     candidates.push(`${base}.jpg`);
     candidates.push(`${base}.png`);
   }
-
-  // Always end with bundled default avatar
   candidates.push(DEFAULT_AVATAR);
   return candidates;
 }
@@ -87,12 +129,11 @@ function buildAvatarCandidates(companionKeyOrName: string) {
 async function pickFirstExisting(urls: string[]) {
   for (const url of urls) {
     if (url === DEFAULT_AVATAR) return url;
-
     try {
       const res = await fetch(url, { method: "HEAD", cache: "no-store" });
       if (res.ok) return url;
     } catch {
-      // ignore and continue
+      // ignore
     }
   }
   return DEFAULT_AVATAR;
@@ -103,69 +144,6 @@ function greetingFor(name: string) {
   return `Hi, ${n} here. 😊 What's on your mind?`;
 }
 
-type Mode = "friend" | "romantic" | "intimate";
-
-/**
- * IMPORTANT:
- * Backend ChatResponse.mode is a STATUS:
- *   "safe" | "explicit_blocked" | "explicit_allowed"
- * Conversational mode is session_state.mode:
- *   "friend" | "romantic" | "intimate"
- */
-type ChatStatus = "safe" | "explicit_blocked" | "explicit_allowed";
-
-type SessionState = {
-  mode: Mode;
-  adult_verified?: boolean;
-  romance_consented?: boolean;
-  explicit_consented?: boolean;
-  pending_consent?: "intimate" | null;
-  model?: string;
-
-  // optional extras we might echo back
-  planName?: string;
-  plan_name?: string;
-  companion?: string;
-  companionName?: string;
-  companion_name?: string;
-  companion_meta?: any;
-};
-
-const MODE_LABELS: Record<Mode, string> = {
-  friend: "Friend",
-  romantic: "Romantic",
-  intimate: "Intimate (18+)",
-};
-
-type PlanName =
-  | "Week - Trial"
-  | "Weekly - Friend"
-  | "Weekly - Romantic"
-  | "Weekly - Intimate (18+)"
-  | "Test - Friend"
-  | "Test - Romantic"
-  | "Test - Intimate (18+)"
-  | null;
-
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
-const UPGRADE_URL = "https://www.aihaven4u.com/pricing-plans/list";
-
-const ROMANTIC_ALLOWED_PLANS: PlanName[] = [
-  "Week - Trial",
-  "Weekly - Romantic",
-  "Weekly - Intimate (18+)",
-  "Test - Romantic",
-  "Test - Intimate (18+)",
-];
-
-function allowedModesForPlan(planName: PlanName): Mode[] {
-  const modes: Mode[] = ["friend"];
-  if (ROMANTIC_ALLOWED_PLANS.includes(planName)) modes.push("romantic");
-  if (planName === "Weekly - Intimate (18+)" || planName === "Test - Intimate (18+)")
-    modes.push("intimate");
-  return modes;
-}
-
 function isAllowedOrigin(origin: string) {
   try {
     const u = new URL(origin);
@@ -173,40 +151,58 @@ function isAllowedOrigin(origin: string) {
     if (host.endsWith("aihaven4u.com")) return true;
     if (host.endsWith("wix.com")) return true;
     if (host.endsWith("wixsite.com")) return true;
-    if (host.endsWith("azurestaticapps.net")) return true; // editor/preview environments
-    if (host === "localhost" || host === "127.0.0.1") return true;
     return false;
   } catch {
     return false;
   }
 }
 
-function requestedModeFromHint(text: string): Mode | null {
-  const t = (text || "").toLowerCase();
-  if (t.includes("mode:friend") || t.includes("[mode:friend]")) return "friend";
-  if (t.includes("mode:romantic") || t.includes("[mode:romantic]")) return "romantic";
-  if (t.includes("mode:intimate") || t.includes("[mode:intimate]")) return "intimate";
-  if (t.includes("mode:explicit") || t.includes("[mode:explicit]")) return "intimate";
-  return null;
-}
+/**
+ * Detects a mode switch request in *user text* and returns:
+ * - mode: desired mode
+ * - cleaned: text with explicit [mode:*] removed (so it won't pollute the chat)
+ *
+ * Supports:
+ * - [mode:romantic], mode:romantic
+ * - "switch to romantic", "romantic mode", "set mode to romantic", etc.
+ */
+function detectModeSwitchAndClean(text: string): { mode: Mode | null; cleaned: string } {
+  const raw = text || "";
+  const t = raw.toLowerCase();
 
-// optional intent detection (plan gating)
-function isRomanticRequest(text: string) {
-  const t = (text || "").toLowerCase();
-  return /\b(flirt|romance|romantic|date|kiss|love|boyfriend|girlfriend)\b/.test(t);
-}
+  // explicit tokens
+  const tokenRe = /\[mode:(friend|romantic|intimate|explicit)\]|mode:(friend|romantic|intimate|explicit)/gi;
 
-function isIntimateRequest(text: string) {
-  const t = (text || "").toLowerCase();
-  return /\b(sex|nude|explicit|intimate|nsfw|oral|penetration|hardcore)\b/.test(t);
-}
+  let tokenMode: Mode | null = null;
+  let cleaned = raw.replace(tokenRe, (m) => {
+    const mm = m.toLowerCase();
+    if (mm.includes("friend")) tokenMode = "friend";
+    else if (mm.includes("romantic")) tokenMode = "romantic";
+    else if (mm.includes("intimate") || mm.includes("explicit")) tokenMode = "intimate";
+    return "";
+  });
 
-type ChatResponse = {
-  session_id: string;
-  reply: string;
-  mode: ChatStatus;
-  session_state?: SessionState;
-};
+  cleaned = cleaned.trim();
+
+  if (tokenMode) return { mode: tokenMode, cleaned };
+
+  // soft phrasing (covers friend->romantic and intimate->romantic)
+  const soft = t.trim();
+
+  const wantsFriend =
+    /\b(switch|set|turn|go|back)\b.*\b(friend)\b/.test(soft) || /\bfriend mode\b/.test(soft);
+  const wantsRomantic =
+    /\b(switch|set|turn|go|back)\b.*\b(romantic)\b/.test(soft) || /\bromantic mode\b/.test(soft);
+  const wantsIntimate =
+    /\b(switch|set|turn|go|back)\b.*\b(intimate|explicit)\b/.test(soft) ||
+    /\b(intimate|explicit) mode\b/.test(soft);
+
+  if (wantsFriend) return { mode: "friend", cleaned: raw };
+  if (wantsRomantic) return { mode: "romantic", cleaned: raw };
+  if (wantsIntimate) return { mode: "intimate", cleaned: raw };
+
+  return { mode: null, cleaned: raw.trim() };
+}
 
 export default function Page() {
   const sessionIdRef = useRef<string | null>(null);
@@ -216,8 +212,7 @@ export default function Page() {
     const key = "AIHAVEN_SESSION_ID";
     let id = window.sessionStorage.getItem(key);
     if (!id) {
-      id =
-        (crypto as any).randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      id = (crypto as any).randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
       window.sessionStorage.setItem(key, id);
     }
     sessionIdRef.current = id;
@@ -227,7 +222,8 @@ export default function Page() {
   const [messages, setMessages] = useState<Msg[]>([]);
   const [loading, setLoading] = useState(false);
 
-  // conversational session state (synced with backend session_state)
+  const [chatStatus, setChatStatus] = useState<ChatStatus>("safe");
+
   const [sessionState, setSessionState] = useState<SessionState>({
     mode: "friend",
     model: "gpt-4o",
@@ -237,15 +233,12 @@ export default function Page() {
     pending_consent: null,
   });
 
-  // backend status (safe/blocked/allowed)
-  const [chatStatus, setChatStatus] = useState<ChatStatus>("safe");
-
   const [planName, setPlanName] = useState<PlanName>(null);
+  const [allowedModes, setAllowedModes] = useState<Mode[]>(["friend"]);
+
   const [companionName, setCompanionName] = useState<string>(DEFAULT_COMPANION_NAME);
   const [avatarSrc, setAvatarSrc] = useState<string>(DEFAULT_AVATAR);
   const [companionKey, setCompanionKey] = useState<string>("");
-
-  const [allowedModes, setAllowedModes] = useState<Mode[]>(["friend"]);
 
   const modePills = useMemo(() => ["friend", "romantic", "intimate"] as const, []);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -260,7 +253,7 @@ export default function Page() {
     scrollToBottom();
   }, [messages, loading, scrollToBottom]);
 
-  // Greeting: once per *browser session* per companion
+  // Greeting once per browser session per companion
   useEffect(() => {
     if (typeof window === "undefined") return;
 
@@ -276,11 +269,7 @@ export default function Page() {
         content: greetingFor(companionName || DEFAULT_COMPANION_NAME),
       };
 
-      setMessages((prev) => {
-        if (prev && prev.length > 0) return prev;
-        return [greetingMsg];
-      });
-
+      setMessages((prev) => (prev.length > 0 ? prev : [greetingMsg]));
       sessionStorage.setItem(greetKey, "1");
     }, 150);
 
@@ -293,11 +282,10 @@ export default function Page() {
       `The requested mode (${modeLabel}) isn't available on your current plan. ` +
       `Please upgrade here: ${UPGRADE_URL}`;
 
-    const upgradeMsg: Msg = { role: "assistant", content: msg };
-    setMessages((prev) => [...prev, upgradeMsg]);
+    setMessages((prev) => [...prev, { role: "assistant", content: msg }]);
   }
 
-  // Listen for Wix postMessage with plan + companion meta
+  // Receive plan + companion from Wix postMessage
   useEffect(() => {
     function onMessage(event: MessageEvent) {
       if (!isAllowedOrigin(event.origin)) return;
@@ -322,17 +310,15 @@ export default function Page() {
       }
 
       const avatarCandidates = buildAvatarCandidates(resolvedCompanionKey || DEFAULT_COMPANION_NAME);
-      pickFirstExisting(avatarCandidates).then((picked) => {
-        setAvatarSrc(picked);
-      });
+      pickFirstExisting(avatarCandidates).then((picked) => setAvatarSrc(picked));
 
       const nextAllowed = allowedModesForPlan(incomingPlan);
       setAllowedModes(nextAllowed);
 
-      // If current mode is not allowed, drop to friend
+      // If current mode is not allowed, force friend
       setSessionState((prev) => {
         if (nextAllowed.includes(prev.mode)) return prev;
-        return { ...prev, mode: "friend" };
+        return { ...prev, mode: "friend", pending_consent: null };
       });
     }
 
@@ -340,7 +326,7 @@ export default function Page() {
     return () => window.removeEventListener("message", onMessage);
   }, []);
 
-  async function callChat(nextMessages: Msg[], stateToSend: SessionState): Promise<ChatResponse> {
+  async function callChat(nextMessages: Msg[], stateToSend: SessionState): Promise<ChatApiResponse> {
     if (!API_BASE) throw new Error("NEXT_PUBLIC_API_BASE_URL is not set");
 
     const session_id =
@@ -348,13 +334,14 @@ export default function Page() {
       (crypto as any).randomUUID?.() ||
       `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
+    const wants_explicit = stateToSend.mode === "intimate" || stateToSend.explicit_consented === true;
+
     const res = await fetch(`${API_BASE}/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      // wants_explicit is a HINT; backend is authoritative and will return explicit_blocked/allowed
       body: JSON.stringify({
         session_id,
-        wants_explicit: stateToSend?.mode === "intimate" || stateToSend?.explicit_consented === true,
+        wants_explicit,
         session_state: stateToSend,
         messages: nextMessages.map((m) => ({ role: m.role, content: m.content })),
       }),
@@ -365,42 +352,73 @@ export default function Page() {
       throw new Error(`Backend error ${res.status}: ${errText}`);
     }
 
-    return (await res.json()) as ChatResponse;
+    return (await res.json()) as ChatApiResponse;
   }
 
-  // Main send function
-  async function send(textOverride?: string) {
+  // This is the mode that drives the UI highlight:
+  // - If backend is asking for intimate consent, keep intimate pill highlighted
+  const effectiveActiveMode: Mode =
+    sessionState.pending_consent === "intimate" ? "intimate" : sessionState.mode;
+
+  const showConsentOverlay =
+    sessionState.pending_consent === "intimate" || chatStatus === "explicit_blocked";
+
+  function setModeFromPill(m: Mode) {
+    if (!allowedModes.includes(m)) {
+      showUpgradeMessage(m);
+      return;
+    }
+
+    setSessionState((prev) => {
+      // If switching away from intimate while pending consent, clear pending
+      const nextPending = m === "intimate" ? prev.pending_consent : null;
+      return { ...prev, mode: m, pending_consent: nextPending };
+    });
+
+    setMessages((prev) => [...prev, { role: "assistant", content: `Mode set to: ${MODE_LABELS[m]}` }]);
+  }
+
+  async function send(textOverride?: string, stateOverride?: Partial<SessionState>) {
     if (loading) return;
 
-    const userText = (textOverride ?? input).trim();
-    if (!userText) return;
+    const rawText = (textOverride ?? input).trim();
+    if (!rawText) return;
 
-    // allow [mode:xxx] hints
-    const hintedMode = requestedModeFromHint(userText);
-    if (hintedMode) {
-      if (!allowedModes.includes(hintedMode)) {
-        showUpgradeMessage(hintedMode);
-        setInput("");
-        return;
-      }
-      setSessionState((prev) => ({ ...prev, mode: hintedMode }));
+    // detect mode switch from prompt text
+    const { mode: detectedMode, cleaned } = detectModeSwitchAndClean(rawText);
+
+    // Plan-gate mode if user is attempting to switch
+    if (detectedMode && !allowedModes.includes(detectedMode)) {
+      showUpgradeMessage(detectedMode);
       setInput("");
       return;
     }
 
-    // Plan gating (soft detection)
-    if (isIntimateRequest(userText) && !allowedModes.includes("intimate")) {
-      showUpgradeMessage("intimate");
-      setInput("");
-      return;
-    }
-    if (isRomanticRequest(userText) && !allowedModes.includes("romantic")) {
-      showUpgradeMessage("romantic");
+    // If the user message is ONLY a mode switch token, apply locally and don't call backend
+    // e.g. "[mode:romantic]" by itself
+    if (detectedMode && cleaned.length === 0) {
+      setSessionState((prev) => ({ ...prev, mode: detectedMode, pending_consent: null }));
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: `Mode set to: ${MODE_LABELS[detectedMode]}` },
+      ]);
       setInput("");
       return;
     }
 
-    const userMsg: Msg = { role: "user", content: userText };
+    // Apply mode locally (so pill highlights immediately), but still send message.
+    // If detectedMode is intimate, keep/trigger pending overlay on response.
+    let nextState: SessionState = sessionState;
+    if (detectedMode) {
+      nextState = { ...sessionState, mode: detectedMode };
+      setSessionState(nextState);
+    }
+
+    // Build user message content:
+    // If a [mode:*] token was present, we remove it from content (cleaned) to keep chat natural.
+    const outgoingText = detectedMode ? cleaned : rawText;
+
+    const userMsg: Msg = { role: "user", content: outgoingText };
     const nextMessages: Msg[] = [...messages, userMsg];
 
     setMessages(nextMessages);
@@ -408,81 +426,50 @@ export default function Page() {
     setLoading(true);
 
     try {
-      const data = await callChat(nextMessages, sessionState);
+      const sendState: SessionState = { ...nextState, ...(stateOverride || {}) };
+      const data = await callChat(nextMessages, sendState);
 
-      // backend status determines consent overlay behavior
+      // status from backend (safe/explicit_blocked/explicit_allowed)
       if (data.mode) setChatStatus(data.mode);
 
-      // Merge backend session_state (authoritative) into ours
+      // merge session_state from backend WITHOUT using data.mode as pill mode
       if (data.session_state) {
-        setSessionState((prev) => ({
-          ...prev,
-          ...data.session_state,
-          // ensure mode always exists
-          mode: (data.session_state?.mode as Mode) || prev.mode,
-        }));
+        setSessionState((prev) => {
+          const merged = { ...prev, ...data.session_state };
+
+          // If backend says blocked, keep pill as intimate AND set pending
+          if (data.mode === "explicit_blocked") {
+            merged.mode = "intimate";
+            merged.pending_consent = "intimate";
+          }
+
+          // If backend says allowed, clear pending (and keep mode whatever backend returned in session_state)
+          if (data.mode === "explicit_allowed" && merged.pending_consent) {
+            merged.pending_consent = null;
+          }
+
+          return merged;
+        });
+      } else {
+        // If blocked but session_state missing, still reflect pending
+        if (data.mode === "explicit_blocked") {
+          setSessionState((prev) => ({ ...prev, mode: "intimate", pending_consent: "intimate" }));
+        }
+        if (data.mode === "explicit_allowed") {
+          setSessionState((prev) => ({ ...prev, pending_consent: null, explicit_consented: true }));
+        }
       }
 
-      const assistantMsg: Msg = { role: "assistant", content: data.reply };
-      setMessages((prev) => [...prev, assistantMsg]);
+      setMessages((prev) => [...prev, { role: "assistant", content: data.reply }]);
     } catch (err: any) {
-      const errorMsg: Msg = {
-        role: "assistant",
-        content: `Error: ${err?.message ?? "Unknown error"}`,
-      };
-      setMessages((prev) => [...prev, errorMsg]);
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: `Error: ${err?.message ?? "Unknown error"}` },
+      ]);
     } finally {
       setLoading(false);
     }
   }
-
-  // UI pill click: sets conversational mode locally, and adds a visible message
-  async function setModeFromPill(m: Mode) {
-    if (!allowedModes.includes(m)) {
-        showUpgradeMessage(m);
-        return;
-    }
-
-    // Update local UI immediately (snappy)
-    setSessionState((prev) => {
-        const next: SessionState = { ...prev, mode: m };
-        if (m !== "intimate") next.pending_consent = null;
-        return next;
-    });
-
-    // Also show user-facing confirmation
-    setMessages((prev) => [...prev, { role: "assistant", content: `Mode set to: ${MODE_LABELS[m]}` }]);
-
-        // ✅ Force server-side mode update (authoritative)
-        try {
-            await send(modeHint(m)); // <-- uses your existing send(textOverride)
-        } catch {
-            // send() already appends error message on failure
-        }
-    }
-
-
-    setSessionState((prev) => {
-      const next: SessionState = { ...prev, mode: m };
-      // IMPORTANT: do NOT set explicit_consented here.
-      // Backend will set it only after user responds "yes" while pending_consent=intimate.
-      if (m !== "intimate") {
-        next.pending_consent = null;
-      }
-      return next;
-    });
-
-    const modeMsg: Msg = { role: "assistant", content: `Mode set to: ${MODE_LABELS[m]}` };
-    setMessages((prev) => [...prev, modeMsg]);
-  }
-
-  // Consent overlay: show when backend says explicit_blocked OR session_state.pending_consent==intimate
-  const showConsentOverlay =
-    chatStatus === "explicit_blocked" || sessionState.pending_consent === "intimate";
-
-  // Cosmetic: if we are pending consent, keep pill highlighted on intimate
-  const effectiveActiveMode: Mode =
-    sessionState.pending_consent === "intimate" ? "intimate" : sessionState.mode;
 
   return (
     <main style={{ maxWidth: 880, margin: "24px auto", padding: "0 16px", fontFamily: "system-ui" }}>
@@ -522,7 +509,10 @@ export default function Page() {
             <button
               key={m}
               disabled={disabled}
-              onClick={() => setModeFromPill(m)}
+              onClick={() => {
+                if (disabled) return showUpgradeMessage(m);
+                setModeFromPill(m);
+              }}
               style={{
                 padding: "8px 12px",
                 borderRadius: 999,
@@ -619,10 +609,9 @@ export default function Page() {
             <div style={{ display: "flex", gap: 8 }}>
               <button
                 onClick={() => {
-                  // We must send "Yes" as a user message so the backend can grant consent.
-                  // Also keep session_state pending so backend knows we were asked.
+                  // Ensure backend receives pending_consent + intimate mode
                   setSessionState((prev) => ({ ...prev, pending_consent: "intimate", mode: "intimate" }));
-                  send("Yes");
+                  send("Yes", { pending_consent: "intimate", mode: "intimate" });
                 }}
                 style={{
                   padding: "10px 12px",
@@ -637,13 +626,8 @@ export default function Page() {
 
               <button
                 onClick={() => {
-                  // decline locally and tell backend
-                  setSessionState((prev) => ({
-                    ...prev,
-                    pending_consent: "intimate",
-                    mode: "intimate",
-                  }));
-                  send("No");
+                  setSessionState((prev) => ({ ...prev, pending_consent: "intimate", mode: "intimate" }));
+                  send("No", { pending_consent: "intimate", mode: "intimate" });
                 }}
                 style={{
                   padding: "10px 12px",
@@ -657,7 +641,6 @@ export default function Page() {
 
               <button
                 onClick={() => {
-                  // just dismiss UI (keeps current state)
                   setChatStatus("safe");
                   setSessionState((prev) => ({ ...prev, pending_consent: null, mode: "friend" }));
                 }}
@@ -674,14 +657,13 @@ export default function Page() {
             </div>
 
             <div style={{ marginTop: 10, fontSize: 12, color: "#666" }}>
-              Tip: If you don’t see the overlay when you tap Intimate, send a message like{" "}
-              <b>[mode:intimate]</b>.
+              Tip: You can also type <b>[mode:intimate]</b> or <b>[mode:romantic]</b> to switch.
             </div>
           </div>
         </div>
       )}
 
-      {/* Hidden: useful for debugging in Wix iframe */}
+      {/* Optional debug */}
       <div style={{ marginTop: 14, fontSize: 12, color: "#777" }}>
         <div>
           Debug: companionKey=<code>{companionKey || "(none)"}</code>
