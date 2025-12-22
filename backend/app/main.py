@@ -1,23 +1,27 @@
 from __future__ import annotations
 
 import os
-import re
 import time
-import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from .settings import settings
 from .models import ChatResponse
-from .consent_store import consent_store
-from .consent_routes import router as consent_router
+
+# If you still want the consent router, keep it BUT don't let it break boot.
+# (Boot failures are what cause "CORS missing" + 503.)
+try:
+    from .consent_routes import router as consent_router  # type: ignore
+except Exception:
+    consent_router = None
 
 
-# =============================================================================
-# App
-# =============================================================================
+STATUS_SAFE = "safe"
+STATUS_BLOCKED = "explicit_blocked"
+STATUS_ALLOWED = "explicit_allowed"
+
 app = FastAPI(title="AIHaven4U API")
 
 # ----------------------------
@@ -38,23 +42,18 @@ app.add_middleware(
 # ----------------------------
 # Routes
 # ----------------------------
-app.include_router(consent_router)
+if consent_router is not None:
+    app.include_router(consent_router)
+
 
 @app.get("/health")
 def health():
     return {"ok": True}
 
 
-# =============================================================================
+# ----------------------------
 # Helpers
-# =============================================================================
-STATUS_SAFE = "safe"
-STATUS_BLOCKED = "explicit_blocked"
-STATUS_ALLOWED = "explicit_allowed"
-
-Mode = str  # runtime only; frontend uses "friend"|"romantic"|"explicit"
-
-
+# ----------------------------
 def _dbg(enabled: bool, *args: Any) -> None:
     if enabled:
         print(*args)
@@ -64,54 +63,46 @@ def _now_ts() -> int:
     return int(time.time())
 
 
-def _looks_explicit(text: str) -> bool:
-    t = (text or "").lower()
-    keywords = [
-        "explicit", "intimate", "18+",
-        "sex", "nude", "porn",
-        "fuck", "cock", "pussy", "blowjob", "anal", "orgasm",
-        "nsfw",
-    ]
-    return any(k in t for k in keywords)
-
-
-def _normalize_mode(raw: Any) -> Mode:
-    """
-    Canonical UI modes:
-      - friend
-      - romantic
-      - explicit  (UI label: "Intimate (18+)")
-    Accept synonyms (intimate/18+/nsfw -> explicit).
-    """
-    t = (str(raw or "")).strip().lower()
-    if t in ("friend", "friendly", "safe"):
-        return "friend"
-    if t in ("romantic", "romance", "flirty"):
+def _normalize_mode(raw: str) -> str:
+    t = (raw or "").strip().lower()
+    # allow some synonyms from older frontend builds
+    if t in {"explicit", "intimate", "18+", "adult"}:
+        return "intimate"
+    if t in {"romance", "romantic"}:
         return "romantic"
-    if t in ("explicit", "intimate", "adult", "18+", "nsfw"):
-        return "explicit"
     return "friend"
 
 
-_MODE_SWITCH_RE = re.compile(
-    r"\b(switch|change|set|go|return|move|put|back)\b.*\b(friend|romantic|romance|explicit|intimate|18\+|nsfw)\b",
-    re.IGNORECASE,
-)
+def _detect_mode_switch_from_text(text: str) -> Optional[str]:
+    t = (text or "").lower()
+    # allow [mode:romantic] etc
+    if "mode:friend" in t or "[mode:friend]" in t:
+        return "friend"
+    if "mode:romantic" in t or "[mode:romantic]" in t:
+        return "romantic"
+    if "mode:intimate" in t or "[mode:intimate]" in t or "mode:explicit" in t or "[mode:explicit]" in t:
+        return "intimate"
 
-def _detect_mode_switch_from_text(text: str) -> Optional[Mode]:
-    t = (text or "").strip()
-    if not t:
-        return None
-    m = _MODE_SWITCH_RE.search(t)
-    if not m:
-        return None
+    # soft detection
+    if "switch to friend" in t:
+        return "friend"
+    if "switch to romantic" in t:
+        return "romantic"
+    if "switch to intimate" in t or "switch to explicit" in t:
+        return "intimate"
 
-    target = m.group(2).lower()
-    if target == "romance":
-        target = "romantic"
-    if target in ("intimate", "18+", "nsfw"):
-        target = "explicit"
-    return _normalize_mode(target)
+    return None
+
+
+def _looks_intimate(text: str) -> bool:
+    t = (text or "").lower()
+    return any(
+        k in t
+        for k in [
+            "explicit", "intimate", "nsfw", "sex", "nude", "porn",
+            "fuck", "cock", "pussy", "blowjob", "anal", "orgasm",
+        ]
+    )
 
 
 def _parse_companion_meta(raw: Any) -> Dict[str, str]:
@@ -127,7 +118,7 @@ def _parse_companion_meta(raw: Any) -> Dict[str, str]:
     return {"first_name": "", "gender": "", "ethnicity": "", "generation": ""}
 
 
-def _build_persona_system_prompt(session_state: Dict[str, Any], *, mode: Mode, explicit_allowed: bool) -> str:
+def _build_persona_system_prompt(session_state: dict, *, mode: str, intimate_allowed: bool) -> str:
     comp = _parse_companion_meta(
         session_state.get("companion")
         or session_state.get("companionName")
@@ -144,114 +135,89 @@ def _build_persona_system_prompt(session_state: Dict[str, Any], *, mode: Mode, e
     if mode == "romantic":
         lines.append("You may be affectionate and flirty while remaining respectful.")
 
-    # Intentionally non-graphic.
-    if mode == "explicit" and explicit_allowed:
+    if mode == "intimate" and intimate_allowed:
         lines.append(
             "The user has consented to Intimate (18+) conversation. "
-            "You may engage in adult, sensual discussion, but avoid graphic/pornographic detail. "
+            "You may engage in adult, sensual discussion, but avoid graphic or pornographic detail. "
             "Focus on intimacy, emotion, and connection."
         )
 
     return " ".join(lines)
 
 
-def _to_openai_messages(
-    messages: List[Dict[str, str]],
-    session_state: Dict[str, Any],
-    *,
-    mode: Mode,
-    explicit_allowed: bool,
-    debug: bool,
-) -> List[Dict[str, str]]:
-    sys = _build_persona_system_prompt(session_state, mode=mode, explicit_allowed=explicit_allowed)
+def _to_openai_messages(messages: List[Dict[str, str]], session_state: dict, *, mode: str, intimate_allowed: bool, debug: bool):
+    sys = _build_persona_system_prompt(session_state, mode=mode, intimate_allowed=intimate_allowed)
     _dbg(debug, "SYSTEM PROMPT:", sys)
 
-    out: List[Dict[str, str]] = [{"role": "system", "content": sys}]
+    out = [{"role": "system", "content": sys}]
     for m in messages:
-        if m.get("role") in ("user", "assistant") and isinstance(m.get("content"), str):
-            out.append({"role": m["role"], "content": m["content"]})
+        if m.get("role") in ("user", "assistant"):
+            out.append({"role": m["role"], "content": m.get("content", "")})
     return out
 
 
-def _call_gpt4o(messages: List[Dict[str, str]]) -> str:
-    from openai import OpenAI  # type: ignore
+def _call_gpt4o(messages):
+    from openai import OpenAI
 
-    api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set")
+        raise RuntimeError("OPENAI_API_KEY is not set")
 
     client = OpenAI(api_key=api_key)
     resp = client.chat.completions.create(
-        model=getattr(settings, "OPENAI_MODEL", "gpt-4o"),
+        model="gpt-4o",
         messages=messages,
-        temperature=float(getattr(settings, "OPENAI_TEMPERATURE", 0.8)),
+        temperature=0.8,
     )
     return (resp.choices[0].message.content or "").strip()
 
 
-def _normalize_payload(raw: Dict[str, Any]) -> Dict[str, Any]:
-    sid = raw.get("session_id") or raw.get("sessionId") or raw.get("sid")
-    msgs = raw.get("messages")
-
-    if not msgs:
-        msgs = []
-        history = raw.get("history")
-        text = raw.get("text")
-        if isinstance(history, list):
-            for m in history:
-                if isinstance(m, dict) and "role" in m and "content" in m:
-                    msgs.append({"role": m["role"], "content": m["content"]})
-        if isinstance(text, str) and text.strip():
-            msgs.append({"role": "user", "content": text.strip()})
-
-    if not sid:
-        raise HTTPException(status_code=422, detail="session_id is required")
-    if not isinstance(msgs, list) or not msgs:
-        raise HTTPException(status_code=422, detail="messages is required and cannot be empty")
-
+def _normalize_payload(raw: Dict[str, Any]) -> Tuple[str, List[Dict[str, str]], Dict[str, Any], bool]:
+    sid = raw.get("session_id") or raw.get("sid")
+    msgs = raw.get("messages") or []
     state = raw.get("session_state") or {}
-    wants = bool(raw.get("wants_explicit") or raw.get("wantsExplicit") or False)
-    return {"session_id": str(sid), "messages": msgs, "session_state": state, "wants_explicit": wants}
+    wants = bool(raw.get("wants_explicit"))
+
+    if not sid or not isinstance(sid, str):
+        raise HTTPException(422, "session_id required")
+    if not msgs or not isinstance(msgs, list):
+        raise HTTPException(422, "messages required")
+    if not isinstance(state, dict):
+        state = {}
+
+    return sid, msgs, state, wants
 
 
-# =============================================================================
+# ----------------------------
 # CHAT
-# =============================================================================
+# ----------------------------
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: Request):
     debug = bool(getattr(settings, "DEBUG", False))
-    req_id = uuid.uuid4().hex[:8]
 
     raw = await request.json()
-    norm = _normalize_payload(raw)
+    session_id, messages, session_state, wants_explicit = _normalize_payload(raw)
 
-    session_id: str = norm["session_id"]
-    messages: List[Dict[str, str]] = norm["messages"]
-    session_state: Dict[str, Any] = norm["session_state"] or {}
-    wants_explicit: bool = bool(norm["wants_explicit"])
-
+    # last user message
     last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
     user_text = ((last_user.get("content") if last_user else "") or "").strip()
     normalized_text = user_text.lower().strip()
 
+    # allow text-based mode switching
     detected_switch = _detect_mode_switch_from_text(user_text)
     if detected_switch:
         session_state["mode"] = detected_switch
 
-    requested_mode: Mode = _normalize_mode(session_state.get("mode") or "friend")
+    requested_mode = _normalize_mode(str(session_state.get("mode") or "friend"))
+    requested_intimate = (requested_mode == "intimate")
 
-    user_requesting_explicit = (requested_mode == "explicit") or wants_explicit or _looks_explicit(user_text)
+    # authoritative consent flag should live in session_state (works across gunicorn workers)
+    intimate_allowed = bool(session_state.get("explicit_consented") is True)
 
-    rec = consent_store.get(session_id)
-    server_allowed = bool(rec and getattr(rec, "explicit_allowed", False))
-    session_allowed = bool(session_state.get("explicit_consented") is True)
-    explicit_allowed = server_allowed or session_allowed
+    # if user is requesting intimate OR the UI is in intimate mode, treat as intimate request
+    user_requesting_intimate = wants_explicit or requested_intimate or _looks_intimate(user_text)
 
-    if explicit_allowed and session_state.get("pending_consent"):
-        session_state["pending_consent"] = None
-
-    pending = (session_state.get("pending_consent") or "").strip().lower()
-
+    # consent keywords
     CONSENT_YES = {
         "yes", "y", "yeah", "yep", "sure", "ok", "okay",
         "i consent", "i agree", "i confirm", "confirm",
@@ -261,24 +227,22 @@ async def chat(request: Request):
     }
     CONSENT_NO = {"no", "n", "nope", "nah", "decline", "cancel"}
 
-    def _grant_explicit() -> Dict[str, Any]:
-        try:
-            consent_store.set(session_id=session_id, explicit_allowed=True, reason="user explicit consent")
-        except Exception:
-            pass
+    pending = (session_state.get("pending_consent") or "")
+    pending = pending.strip().lower() if isinstance(pending, str) else ""
 
-        out = dict(session_state)
+    def _grant_intimate(state_in: Dict[str, Any]) -> Dict[str, Any]:
+        out = dict(state_in)
         out["adult_verified"] = True
         out["explicit_consented"] = True
         out["pending_consent"] = None
-        out["mode"] = "explicit"
+        out["mode"] = "intimate"
         out["explicit_granted_at"] = _now_ts()
         return out
 
-    # If we are waiting on consent
-    if pending == "explicit" and not explicit_allowed:
+    # If we are waiting on consent, only accept yes/no
+    if pending == "intimate" and not intimate_allowed:
         if normalized_text in CONSENT_YES:
-            session_state_out = _grant_explicit()
+            session_state_out = _grant_intimate(session_state)
             return ChatResponse(
                 session_id=session_id,
                 mode=STATUS_ALLOWED,
@@ -298,9 +262,10 @@ async def chat(request: Request):
                 session_state=session_state_out,
             )
 
+        # still pending; remind
         session_state_out = dict(session_state)
-        session_state_out["pending_consent"] = "explicit"
-        session_state_out["mode"] = "explicit"
+        session_state_out["pending_consent"] = "intimate"
+        session_state_out["mode"] = "intimate"  # keep pill highlighted
         return ChatResponse(
             session_id=session_id,
             mode=STATUS_BLOCKED,
@@ -308,73 +273,58 @@ async def chat(request: Request):
             session_state=session_state_out,
         )
 
-    # Start consent flow
-    if (
-        getattr(settings, "REQUIRE_EXPLICIT_CONSENT_FOR_EXPLICIT_CONTENT", True)
-        and user_requesting_explicit
-        and not explicit_allowed
-    ):
+    # Start consent if intimate requested but not allowed
+    require_consent = bool(getattr(settings, "REQUIRE_EXPLICIT_CONSENT_FOR_EXPLICIT_CONTENT", True))
+    if require_consent and user_requesting_intimate and not intimate_allowed:
         session_state_out = dict(session_state)
-        session_state_out["pending_consent"] = "explicit"
-        session_state_out["mode"] = "explicit"
-
+        session_state_out["pending_consent"] = "intimate"
+        session_state_out["mode"] = "intimate"
         return ChatResponse(
             session_id=session_id,
             mode=STATUS_BLOCKED,
-            reply=(
-                "Before we continue, please confirm you are 18+ and consent to Intimate (18+) conversation. "
-                "Reply 'yes' to continue."
-            ),
+            reply="Before we continue, please confirm you are 18+ and consent to Intimate (18+) conversation. Reply 'yes' to continue.",
             session_state=session_state_out,
         )
 
-    effective_mode: Mode = requested_mode
-    if effective_mode == "explicit" and not explicit_allowed:
+    # Effective mode for the model (never intimate unless allowed)
+    effective_mode = requested_mode
+    if effective_mode == "intimate" and not intimate_allowed:
         effective_mode = "friend"
 
     _dbg(
         debug,
-        f"[{req_id}] /chat session={session_id} requested_mode={requested_mode} "
-        f"effective_mode={effective_mode} user_requesting_explicit={user_requesting_explicit} "
-        f"explicit_allowed={explicit_allowed} pending={pending}",
+        f"/chat session={session_id} requested_mode={requested_mode} effective_mode={effective_mode} "
+        f"user_requesting_intimate={user_requesting_intimate} intimate_allowed={intimate_allowed} pending={pending}",
     )
 
+    # call model
     try:
         assistant_reply = _call_gpt4o(
             _to_openai_messages(
                 messages,
                 session_state,
                 mode=effective_mode,
-                explicit_allowed=explicit_allowed,
+                intimate_allowed=intimate_allowed,
                 debug=debug,
             )
         )
-    except HTTPException:
-        raise
     except Exception as e:
         _dbg(debug, "OpenAI call failed:", repr(e))
         raise HTTPException(status_code=500, detail=f"OpenAI call failed: {type(e).__name__}: {e}")
 
+    # echo back session_state (ensure correct mode)
     session_state_out = dict(session_state)
-    session_state_out["mode"] = requested_mode
-    session_state_out["explicit_consented"] = bool(session_state_out.get("explicit_consented") is True) or explicit_allowed
-    if explicit_allowed:
-        session_state_out["pending_consent"] = None
-        session_state_out["adult_verified"] = True
-
-    if "plan_name" not in session_state_out and "planName" in session_state_out:
-        session_state_out["plan_name"] = session_state_out.get("planName")
-
-    raw_comp = (
+    session_state_out["mode"] = effective_mode
+    session_state_out["pending_consent"] = None if intimate_allowed else session_state_out.get("pending_consent")
+    session_state_out["companion_meta"] = _parse_companion_meta(
         session_state_out.get("companion")
         or session_state_out.get("companionName")
         or session_state_out.get("companion_name")
     )
-    session_state_out["companion_meta"] = _parse_companion_meta(raw_comp)
 
     return ChatResponse(
         session_id=session_id,
-        mode=STATUS_ALLOWED if explicit_allowed else STATUS_SAFE,
-        reply=assistant_reply or "I’m here — what would you like to talk about?",
+        mode=STATUS_ALLOWED if intimate_allowed else STATUS_SAFE,
+        reply=assistant_reply,
         session_state=session_state_out,
     )
