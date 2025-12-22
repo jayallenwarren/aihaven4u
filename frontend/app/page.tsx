@@ -21,6 +21,10 @@ const GREET_ONCE_KEY = "AIHAVEN_GREETED";
 // Bundled default avatar (avoids public-path issues when embedded in Wix iframe)
 const DEFAULT_AVATAR = havenHeart.src;
 
+function modeHint(m: Mode) {
+  return `[mode:${m}]`;
+}
+
 function stripExt(s: string) {
   return (s || "").replace(/\.(png|jpg|jpeg|webp)$/i, "");
 }
@@ -433,11 +437,30 @@ export default function Page() {
   }
 
   // UI pill click: sets conversational mode locally, and adds a visible message
-  function setModeFromPill(m: Mode) {
+  async function setModeFromPill(m: Mode) {
     if (!allowedModes.includes(m)) {
-      showUpgradeMessage(m);
-      return;
+        showUpgradeMessage(m);
+        return;
     }
+
+    // Update local UI immediately (snappy)
+    setSessionState((prev) => {
+        const next: SessionState = { ...prev, mode: m };
+        if (m !== "intimate") next.pending_consent = null;
+        return next;
+    });
+
+    // Also show user-facing confirmation
+    setMessages((prev) => [...prev, { role: "assistant", content: `Mode set to: ${MODE_LABELS[m]}` }]);
+
+        // ✅ Force server-side mode update (authoritative)
+        try {
+            await send(modeHint(m)); // <-- uses your existing send(textOverride)
+        } catch {
+            // send() already appends error message on failure
+        }
+    }
+
 
     setSessionState((prev) => {
       const next: SessionState = { ...prev, mode: m };

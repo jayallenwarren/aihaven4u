@@ -74,24 +74,66 @@ def _normalize_mode(raw: str) -> str:
 
 
 def _detect_mode_switch_from_text(text: str) -> Optional[str]:
-    t = (text or "").lower()
-    # allow [mode:romantic] etc
+    t = (text or "").lower().strip()
+
+    # explicit hints: allow [mode:romantic] etc
     if "mode:friend" in t or "[mode:friend]" in t:
         return "friend"
     if "mode:romantic" in t or "[mode:romantic]" in t:
         return "romantic"
-    if "mode:intimate" in t or "[mode:intimate]" in t or "mode:explicit" in t or "[mode:explicit]" in t:
+    if (
+        "mode:intimate" in t
+        or "[mode:intimate]" in t
+        or "mode:explicit" in t
+        or "[mode:explicit]" in t
+    ):
         return "intimate"
 
-    # soft detection
-    if "switch to friend" in t:
+    # soft detection (more natural language coverage)
+    # friend
+    if any(p in t for p in [
+        "switch to friend",
+        "go to friend",
+        "back to friend",
+        "friend mode",
+        "set friend",
+        "set mode to friend",
+        "turn on friend",
+    ]):
         return "friend"
-    if "switch to romantic" in t:
+
+    # romantic
+    if any(p in t for p in [
+        "switch to romantic",
+        "go to romantic",
+        "back to romantic",
+        "romantic mode",
+        "set romantic",
+        "set mode to romantic",
+        "turn on romantic",
+        "let's be romantic",
+    ]):
         return "romantic"
-    if "switch to intimate" in t or "switch to explicit" in t:
+
+    # intimate/explicit
+    if any(p in t for p in [
+        "switch to intimate",
+        "go to intimate",
+        "back to intimate",
+        "intimate mode",
+        "set intimate",
+        "set mode to intimate",
+        "turn on intimate",
+        "switch to explicit",
+        "explicit mode",
+        "set explicit",
+        "set mode to explicit",
+        "turn on explicit",
+    ]):
         return "intimate"
 
     return None
+
 
 
 def _looks_intimate(text: str) -> bool:
