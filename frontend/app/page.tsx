@@ -664,6 +664,7 @@ export default function Page() {
       )}
 
       {/* Optional debug */}
+      {process.env.NODE_ENV !== "production" && (
       <div style={{ marginTop: 14, fontSize: 12, color: "#777" }}>
         <div>
           Debug: companionKey=<code>{companionKey || "(none)"}</code>
@@ -671,7 +672,8 @@ export default function Page() {
         <div>
           Debug: api=<code>{API_BASE || "(missing NEXT_PUBLIC_API_BASE_URL)"}</code>
         </div>
-      </div>
+        </div>
+      )}
     </main>
   );
 }
