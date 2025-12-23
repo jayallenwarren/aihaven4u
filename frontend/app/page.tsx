@@ -430,12 +430,21 @@ export default function Page() {
       const data = await callChat(nextMessages, sendState);
 
       // status from backend (safe/explicit_blocked/explicit_allowed)
-      if (data.mode) setChatStatus(data.mode);
+      if (
+        data.mode === "safe" ||
+        data.mode === "explicit_blocked" ||
+        data.mode === "explicit_allowed"
+      ) {
+        setChatStatus(data.mode);
+      }
+
+      // Accept either snake_case or camelCase session state from backend
+      const serverSessionState: any = (data as any).session_state ?? (data as any).sessionState;
 
       // merge session_state from backend WITHOUT using data.mode as pill mode
-      if (data.session_state) {
+      if (serverSessionState) {
         setSessionState((prev) => {
-          const merged = { ...prev, ...data.session_state };
+          const merged = { ...prev, ...serverSessionState };
 
           // If backend says blocked, keep pill as intimate AND set pending
           if (data.mode === "explicit_blocked") {
@@ -443,9 +452,15 @@ export default function Page() {
             merged.pending_consent = "intimate";
           }
 
-          // If backend says allowed, clear pending (and keep mode whatever backend returned in session_state)
+          // If backend says allowed, clear pending
           if (data.mode === "explicit_allowed" && merged.pending_consent) {
             merged.pending_consent = null;
+          }
+
+          // Normalize and apply backend mode if present (fixes "romance" vs "romantic")
+          const backendMode = normalizeMode(serverSessionState?.mode);
+          if (backendMode && data.mode !== "explicit_blocked") {
+            merged.mode = backendMode;
           }
 
           return merged;
@@ -664,6 +679,7 @@ export default function Page() {
       )}
 
       {/* Optional debug */}
+      {process.env.NODE_ENV !== "production" && (
       <div style={{ marginTop: 14, fontSize: 12, color: "#777" }}>
         <div>
           Debug: companionKey=<code>{companionKey || "(none)"}</code>
@@ -671,7 +687,8 @@ export default function Page() {
         <div>
           Debug: api=<code>{API_BASE || "(missing NEXT_PUBLIC_API_BASE_URL)"}</code>
         </div>
-      </div>
+        </div>
+      )}
     </main>
   );
 }
