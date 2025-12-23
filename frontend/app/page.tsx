@@ -171,13 +171,15 @@ function detectModeSwitchAndClean(text: string): { mode: Mode | null; cleaned: s
   const t = raw.toLowerCase();
 
   // explicit tokens
-  const tokenRe = /\[mode:(friend|romantic|intimate|explicit)\]|mode:(friend|romantic|intimate|explicit)/gi;
+  // NOTE: allow "romance" token from older builds as a synonym for "romantic"
+  const tokenRe =
+    /\[mode:(friend|romantic|romance|intimate|explicit)\]|mode:(friend|romantic|romance|intimate|explicit)/gi;
 
   let tokenMode: Mode | null = null;
   let cleaned = raw.replace(tokenRe, (m) => {
     const mm = m.toLowerCase();
     if (mm.includes("friend")) tokenMode = "friend";
-    else if (mm.includes("romantic")) tokenMode = "romantic";
+    else if (mm.includes("romantic") || mm.includes("romance")) tokenMode = "romantic";
     else if (mm.includes("intimate") || mm.includes("explicit")) tokenMode = "intimate";
     return "";
   });
@@ -190,14 +192,22 @@ function detectModeSwitchAndClean(text: string): { mode: Mode | null; cleaned: s
   const soft = t.trim();
 
   const wantsFriend =
-    /\b(switch|set|turn|go|back)\b.*\b(friend)\b/.test(soft) || /\bfriend mode\b/.test(soft);
+    /\b(switch|set|turn|go|back)\b.*\bfriend\b/.test(soft) || /\bfriend mode\b/.test(soft);
+
   const wantsRomantic =
-    /\b(switch|set|turn|go|back|be|try)\b.*\b(romantic|romance)\b/.test(soft) ||
+    // "romantic mode" / "romance mode"
     /\b(romantic|romance) mode\b/.test(soft) ||
-    /^\s*(lets|let\'s)\s+be\s+(romantic|in\s+romance)\b/.test(soft) ||
-    /\bromance\s+again\b/.test(soft);
+    // switch/set/back/go/turn ... romantic
+    /\b(switch|set|turn|go|back)\b.*\b(romantic|romance)\b/.test(soft) ||
+    // natural phrasing users actually type
+    /\b(let['’]?s|lets)\b.*\b(romantic|romance)\b/.test(soft) ||
+    /\b(be|being|try|trying|have|having)\b.*\b(romantic|romance)\b/.test(soft) ||
+    /\bromantic conversation\b/.test(soft) ||
+    /\bromance again\b/.test(soft) ||
+    /\btry romance again\b/.test(soft);
+
   const wantsIntimate =
-    /\b(switch|set|turn|go|back)\b.*\b(intimate|explicit)\b/.test(soft) ||
+    /\b(switch|set|turn|go|back)\b.*\b(intimate|explicit|adult|18\+)\b/.test(soft) ||
     /\b(intimate|explicit) mode\b/.test(soft);
 
   if (wantsFriend) return { mode: "friend", cleaned: raw };
@@ -207,14 +217,17 @@ function detectModeSwitchAndClean(text: string): { mode: Mode | null; cleaned: s
   return { mode: null, cleaned: raw.trim() };
 }
 
-function normalizeMode(input: any): Mode | null {
-  if (input == null) return null;
-  const s = String(input).toLowerCase().trim();
-  if (s === "friend") return "friend";
-  if (s === "romantic" || s === "romance") return "romantic";
-  if (s === "intimate" || s === "explicit") return "intimate";
+function normalizeMode(raw: any): Mode | null {
+  const t = String(raw ?? "").trim().toLowerCase();
+  if (!t) return null;
+
+  if (t === "friend") return "friend";
+  if (t === "romantic" || t === "romance") return "romantic";
+  if (t === "intimate" || t === "explicit" || t === "adult" || t === "18+" || t === "18") return "intimate";
+
   return null;
 }
+
 
 export default function Page() {
   const sessionIdRef = useRef<string | null>(null);
@@ -422,9 +435,15 @@ export default function Page() {
     // If detectedMode is intimate, keep/trigger pending overlay on response.
     let nextState: SessionState = sessionState;
     if (detectedMode) {
-      nextState = { ...sessionState, mode: detectedMode };
-      // If switching away from intimate via text, clear pending consent so pills don't "stick"
-      if (detectedMode !== "intimate") nextState.pending_consent = null;
+      // If we switch away from intimate while consent is pending, clear the pending flag
+      const nextPending = detectedMode === "intimate" ? sessionState.pending_consent : null;
+      nextState = { ...sessionState, mode: detectedMode, pending_consent: nextPending };
+
+      // If user is switching away from intimate, also clear any explicit_blocked overlay state
+      if (detectedMode !== "intimate") {
+        setChatStatus("safe");
+      }
+
       setSessionState(nextState);
     }
 
@@ -448,11 +467,13 @@ export default function Page() {
         setChatStatus(data.mode);
       }
 
-      // merge session_state from backend WITHOUT using data.mode as pill mode
+      // Some backends return camelCase "sessionState" instead of snake_case "session_state"
       const serverSessionState: any = (data as any).session_state ?? (data as any).sessionState;
+
+      // Normalize & apply server session state WITHOUT using data.mode as pill mode
       if (serverSessionState) {
         setSessionState((prev) => {
-          const merged = { ...prev, ...serverSessionState };
+          const merged: SessionState = { ...(prev as any), ...(serverSessionState as any) };
 
           // If backend says blocked, keep pill as intimate AND set pending
           if (data.mode === "explicit_blocked") {
@@ -460,16 +481,20 @@ export default function Page() {
             merged.pending_consent = "intimate";
           }
 
-          // If backend says allowed, clear pending (and keep mode whatever backend returned in session_state)
+          // If backend says allowed, clear pending (and keep mode whatever backend returned in session state)
           if (data.mode === "explicit_allowed" && merged.pending_consent) {
             merged.pending_consent = null;
           }
 
-          // Normalize and apply backend mode if present (fixes "romance" vs "romantic")
-          const backendMode = normalizeMode(serverSessionState?.mode);
+          // If the backend sent a mode (in session state OR top-level), normalize it so Romantic always highlights
+          const backendMode = normalizeMode((serverSessionState as any)?.mode ?? (data as any)?.mode);
           if (backendMode && data.mode !== "explicit_blocked") {
             merged.mode = backendMode;
-            if (backendMode !== "intimate") merged.pending_consent = null;
+          }
+
+          // If we are not in intimate, never keep the intimate pending flag (prevents the Intimate pill from "sticking")
+          if (merged.mode !== "intimate" && merged.pending_consent === "intimate") {
+            merged.pending_consent = null;
           }
 
           return merged;
@@ -479,8 +504,20 @@ export default function Page() {
         if (data.mode === "explicit_blocked") {
           setSessionState((prev) => ({ ...prev, mode: "intimate", pending_consent: "intimate" }));
         }
+
+        // If allowed but session_state missing, clear pending and mark consented
         if (data.mode === "explicit_allowed") {
           setSessionState((prev) => ({ ...prev, pending_consent: null, explicit_consented: true }));
+        }
+
+        // Fallback: if backend returned a pill mode at top-level, apply it
+        const backendMode = normalizeMode((data as any)?.mode);
+        if (backendMode && data.mode !== "explicit_blocked") {
+          setSessionState((prev) => ({
+            ...prev,
+            mode: backendMode,
+            pending_consent: backendMode === "intimate" ? prev.pending_consent : null,
+          }));
         }
       }
 
@@ -688,6 +725,7 @@ export default function Page() {
       )}
 
       {/* Optional debug */}
+      {process.env.NODE_ENV !== "production" && (
       <div style={{ marginTop: 14, fontSize: 12, color: "#777" }}>
         <div>
           Debug: companionKey=<code>{companionKey || "(none)"}</code>
@@ -695,7 +733,8 @@ export default function Page() {
         <div>
           Debug: api=<code>{API_BASE || "(missing NEXT_PUBLIC_API_BASE_URL)"}</code>
         </div>
-      </div>
+        </div>
+      )}
     </main>
   );
 }
