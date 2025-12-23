@@ -82,6 +82,14 @@ function normalizeKeyForFile(raw: string) {
   return (raw || "").trim().replace(/\s+/g, "-");
 }
 
+function normalizeMode(raw: any): Mode | null {
+  const t = String(raw ?? "").trim().toLowerCase();
+  if (t === "friend") return "friend";
+  if (t === "romantic" || t === "romance") return "romantic";
+  if (t === "intimate" || t === "explicit" || t === "18+") return "intimate";
+  return null;
+}
+
 function parseCompanionMeta(raw: string): CompanionMeta {
   const cleaned = stripExt(raw || "");
   const parts = cleaned
@@ -191,14 +199,24 @@ function detectModeSwitchAndClean(text: string): { mode: Mode | null; cleaned: s
 
   const wantsFriend =
     /\b(switch|set|turn|go|back)\b.*\b(friend)\b/.test(soft) || /\bfriend mode\b/.test(soft);
+
   const wantsRomantic =
-    /\b(switch|set|turn|go|back)\b.*\b(romantic)\b/.test(soft) || /\bromantic mode\b/.test(soft);
+    /\bromantic\b/.test(soft) ||
+    /\bromance\b/.test(soft) ||
+    /\blet['’]s be romantic\b/.test(soft) ||
+    /\bbe romantic\b/.test(soft) ||
+    /\bromantic mode\b/.test(soft) ||
+    /\b(switch|set|turn|go|back|enable)\b.*\b(romantic|romance)\b/.test(soft);
+
   const wantsIntimate =
     /\b(switch|set|turn|go|back)\b.*\b(intimate|explicit)\b/.test(soft) ||
     /\b(intimate|explicit) mode\b/.test(soft);
 
   if (wantsFriend) return { mode: "friend", cleaned: raw };
-  if (wantsRomantic) return { mode: "romantic", cleaned: raw };
+
+  // Optional: treat exact "romantic"/"romance" as a switch request
+  if (/^\s*(romantic|romance)\s*$/i.test(raw)) return { mode: "romantic", cleaned: "" };
+
   if (wantsIntimate) return { mode: "intimate", cleaned: raw };
 
   return { mode: null, cleaned: raw.trim() };
@@ -430,12 +448,21 @@ export default function Page() {
       const data = await callChat(nextMessages, sendState);
 
       // status from backend (safe/explicit_blocked/explicit_allowed)
-      if (data.mode) setChatStatus(data.mode);
+      if (
+        data.mode === "safe" ||
+        data.mode === "explicit_blocked" ||
+        data.mode === "explicit_allowed"
+      ) {
+        setChatStatus(data.mode);
+      }
+
+      // Accept either snake_case or camelCase session state from backend
+      const serverSessionState: any = data.session_state ?? (data as any).sessionState;
 
       // merge session_state from backend WITHOUT using data.mode as pill mode
-      if (data.session_state) {
+      if (serverSessionState) {
         setSessionState((prev) => {
-          const merged = { ...prev, ...data.session_state };
+          const merged = { ...prev, ...serverSessionState };
 
           // If backend says blocked, keep pill as intimate AND set pending
           if (data.mode === "explicit_blocked") {
@@ -446,6 +473,12 @@ export default function Page() {
           // If backend says allowed, clear pending (and keep mode whatever backend returned in session_state)
           if (data.mode === "explicit_allowed" && merged.pending_consent) {
             merged.pending_consent = null;
+          }
+
+          // NOW: normalize & apply backend session_state mode if it exists
+          const backendMode = normalizeMode(serverSessionState?.mode);
+          if (backendMode && data.mode !== "explicit_blocked") {
+            merged.mode = backendMode;
           }
 
           return merged;
@@ -460,16 +493,16 @@ export default function Page() {
         }
       }
 
-      setMessages((prev) => [...prev, { role: "assistant", content: data.reply }]);
-    } catch (err: any) {
-      setMessages((prev) => [
-        ...prev,
-        { role: "assistant", content: `Error: ${err?.message ?? "Unknown error"}` },
-      ]);
-    } finally {
-      setLoading(false);
-    }
-  }
+  setMessages((prev) => [...prev, { role: "assistant", content: data.reply }]);
+} catch (err: any) {
+  setMessages((prev) => [
+    ...prev,
+    { role: "assistant", content: `Error: ${err?.message ?? "Unknown error"}` },
+  ]);
+} finally {
+  setLoading(false);
+}
+
 
   return (
     <main style={{ maxWidth: 880, margin: "24px auto", padding: "0 16px", fontFamily: "system-ui" }}>
