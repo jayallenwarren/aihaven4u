@@ -82,16 +82,6 @@ function normalizeKeyForFile(raw: string) {
   return (raw || "").trim().replace(/\s+/g, "-");
 }
 
-
-function normalizeMode(raw: any): Mode | null {
-  const t = String(raw ?? "").trim().toLowerCase();
-  if (t === "friend") return "friend";
-  if (t === "romantic" || t === "romance") return "romantic";
-  if (t === "intimate" || t === "explicit" || t === "18+") return "intimate";
-  return null;
-}
-
-
 function parseCompanionMeta(raw: string): CompanionMeta {
   const cleaned = stripExt(raw || "");
   const parts = cleaned
@@ -178,7 +168,7 @@ function isAllowedOrigin(origin: string) {
  */
 function detectModeSwitchAndClean(text: string): { mode: Mode | null; cleaned: string } {
   const raw = text || "";
-  const t = raw.toLowerCase().trim();
+  const t = raw.toLowerCase();
 
   // explicit tokens
   const tokenRe = /\[mode:(friend|romantic|intimate|explicit)\]|mode:(friend|romantic|intimate|explicit)/gi;
@@ -193,64 +183,38 @@ function detectModeSwitchAndClean(text: string): { mode: Mode | null; cleaned: s
   });
 
   cleaned = cleaned.trim();
+
   if (tokenMode) return { mode: tokenMode, cleaned };
 
-  // Soft detection (match backend phrases + common user phrasing seen in transcripts)
-  // Friend
-  if (
-    t.includes("switch to friend") ||
-    t.includes("go to friend") ||
-    t.includes("back to friend") ||
-    t.includes("friend mode") ||
-    t.includes("set friend") ||
-    t.includes("set mode to friend") ||
-    t.includes("turn on friend")
-  ) {
-    return { mode: "friend", cleaned: raw };
-  }
+  // soft phrasing (covers friend->romantic and intimate->romantic)
+  const soft = t.trim();
 
-  // Romantic (covers: "let's be romantic", "try romance again", etc.)
-  if (
-    t.includes("switch to romantic") ||
-    t.includes("go to romantic") ||
-    t.includes("back to romantic") ||
-    t.includes("romantic mode") ||
-    t.includes("set romantic") ||
-    t.includes("set mode to romantic") ||
-    t.includes("turn on romantic") ||
-    t.includes("let's be romantic") ||
-    t.includes("lets be romantic") ||
-    t.includes("be romantic") ||
-    t.includes("try romance") ||
-    t.includes("romance again") ||
-    t.includes("go back to romance") ||
-    t.includes("switch to romance") ||
-    t.includes("back to romance") ||
-    /^\s*(romantic|romance)\s*$/i.test(raw)
-  ) {
-    return { mode: "romantic", cleaned: raw };
-  }
+  const wantsFriend =
+    /\b(switch|set|turn|go|back)\b.*\b(friend)\b/.test(soft) || /\bfriend mode\b/.test(soft);
+  const wantsRomantic =
+    /\b(switch|set|turn|go|back|be|try)\b.*\b(romantic|romance)\b/.test(soft) ||
+    /\b(romantic|romance) mode\b/.test(soft) ||
+    /^\s*(lets|let\'s)\s+be\s+(romantic|in\s+romance)\b/.test(soft) ||
+    /\bromance\s+again\b/.test(soft);
+  const wantsIntimate =
+    /\b(switch|set|turn|go|back)\b.*\b(intimate|explicit)\b/.test(soft) ||
+    /\b(intimate|explicit) mode\b/.test(soft);
 
-  // Intimate / Explicit
-  if (
-    t.includes("switch to intimate") ||
-    t.includes("go to intimate") ||
-    t.includes("back to intimate") ||
-    t.includes("intimate mode") ||
-    t.includes("set intimate") ||
-    t.includes("set mode to intimate") ||
-    t.includes("turn on intimate") ||
-    t.includes("switch to explicit") ||
-    t.includes("explicit mode") ||
-    t.includes("set explicit") ||
-    t.includes("set mode to explicit")
-  ) {
-    return { mode: "intimate", cleaned: raw };
-  }
+  if (wantsFriend) return { mode: "friend", cleaned: raw };
+  if (wantsRomantic) return { mode: "romantic", cleaned: raw };
+  if (wantsIntimate) return { mode: "intimate", cleaned: raw };
 
   return { mode: null, cleaned: raw.trim() };
 }
 
+function normalizeMode(input: any): Mode | null {
+  if (input == null) return null;
+  const s = String(input).toLowerCase().trim();
+  if (s === "friend") return "friend";
+  if (s === "romantic" || s === "romance") return "romantic";
+  if (s === "intimate" || s === "explicit") return "intimate";
+  return null;
+}
 
 export default function Page() {
   const sessionIdRef = useRef<string | null>(null);
@@ -458,12 +422,9 @@ export default function Page() {
     // If detectedMode is intimate, keep/trigger pending overlay on response.
     let nextState: SessionState = sessionState;
     if (detectedMode) {
-      // Switching away from Intimate should clear any consent-pending highlight state
-      nextState = {
-        ...sessionState,
-        mode: detectedMode,
-        pending_consent: detectedMode === "intimate" ? sessionState.pending_consent : null,
-      };
+      nextState = { ...sessionState, mode: detectedMode };
+      // If switching away from intimate via text, clear pending consent so pills don't "stick"
+      if (detectedMode !== "intimate") nextState.pending_consent = null;
       setSessionState(nextState);
     }
 
@@ -489,7 +450,6 @@ export default function Page() {
 
       // merge session_state from backend WITHOUT using data.mode as pill mode
       const serverSessionState: any = (data as any).session_state ?? (data as any).sessionState;
-
       if (serverSessionState) {
         setSessionState((prev) => {
           const merged = { ...prev, ...serverSessionState };
@@ -509,6 +469,7 @@ export default function Page() {
           const backendMode = normalizeMode(serverSessionState?.mode);
           if (backendMode && data.mode !== "explicit_blocked") {
             merged.mode = backendMode;
+            if (backendMode !== "intimate") merged.pending_consent = null;
           }
 
           return merged;
@@ -518,10 +479,6 @@ export default function Page() {
         if (data.mode === "explicit_blocked") {
           setSessionState((prev) => ({ ...prev, mode: "intimate", pending_consent: "intimate" }));
         }
-        if (data.mode === "explicit_allowed") {
-          setSessionState((prev) => ({ ...prev, pending_consent: null, explicit_consented: true }));
-        }
-      }
         if (data.mode === "explicit_allowed") {
           setSessionState((prev) => ({ ...prev, pending_consent: null, explicit_consented: true }));
         }
