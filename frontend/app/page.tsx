@@ -279,27 +279,52 @@ export default function Page() {
   }, [messages, loading, scrollToBottom]);
 
   // Greeting once per browser session per companion
-  useEffect(() => {
-    if (typeof window === "undefined") return;
+// Fix: if companionName arrives AFTER the initial greeting timer (e.g., slow Wix postMessage),
+// we may have already inserted the default "Haven" greeting. If the user hasn't typed yet,
+// replace the greeting so it matches the selected companion.
+useEffect(() => {
+  if (typeof window === "undefined") return;
 
-    const keyName = normalizeKeyForFile(companionName || DEFAULT_COMPANION_NAME);
-    const greetKey = `${GREET_ONCE_KEY}:${keyName}`;
+  const desiredName =
+    (companionName || DEFAULT_COMPANION_NAME).trim() || DEFAULT_COMPANION_NAME;
 
-    const tmr = window.setTimeout(() => {
-      const already = sessionStorage.getItem(greetKey) === "1";
-      if (already) return;
+  const keyName = normalizeKeyForFile(desiredName);
+  const greetKey = `${GREET_ONCE_KEY}:${keyName}`;
 
-      const greetingMsg: Msg = {
-        role: "assistant",
-        content: greetingFor(companionName || DEFAULT_COMPANION_NAME),
-      };
+  const tmr = window.setTimeout(() => {
+    const already = sessionStorage.getItem(greetKey) === "1";
+    const greetingText = greetingFor(desiredName);
 
-      setMessages((prev) => (prev.length > 0 ? prev : [greetingMsg]));
-      sessionStorage.setItem(greetKey, "1");
-    }, 150);
+    const greetingMsg: Msg = {
+      role: "assistant",
+      content: greetingText,
+    };
 
-    return () => window.clearTimeout(tmr);
-  }, [companionName]);
+    setMessages((prev) => {
+      // If no messages yet, insert greeting only if we haven't greeted this companion in this session.
+      if (prev.length === 0) {
+        return already ? prev : [greetingMsg];
+      }
+
+      // If the only existing message is a greeting for a different companion (and no user messages yet),
+      // replace it so the name matches the current companion.
+      if (prev.length === 1 && prev[0].role === "assistant") {
+        const existing = String((prev[0] as any)?.content ?? "");
+        const m = existing.match(/^Hi,\s*(.+?)\s+here\./i);
+        const existingName = m?.[1]?.trim();
+        if (existingName && existingName.toLowerCase() !== desiredName.toLowerCase()) {
+          return [{ ...prev[0], content: greetingText }];
+        }
+      }
+
+      return prev;
+    });
+
+    if (!already) sessionStorage.setItem(greetKey, "1");
+  }, 150);
+
+  return () => window.clearTimeout(tmr);
+}, [companionName]);
 
   function showUpgradeMessage(requestedMode: Mode) {
     const modeLabel = MODE_LABELS[requestedMode];
@@ -329,9 +354,24 @@ export default function Page() {
         const parsed = parseCompanionMeta(resolvedCompanionKey);
         setCompanionKey(parsed.key);
         setCompanionName(parsed.first || DEFAULT_COMPANION_NAME);
+
+        // Keep session_state aligned with the selected companion so the backend can apply the correct persona.
+        setSessionState((prev) => ({
+          ...prev,
+          companion: parsed.key,
+          companionName: parsed.key,
+          companion_name: parsed.key,
+        }));
       } else {
         setCompanionKey("");
         setCompanionName(DEFAULT_COMPANION_NAME);
+
+        setSessionState((prev) => ({
+          ...prev,
+          companion: DEFAULT_COMPANION_NAME,
+          companionName: DEFAULT_COMPANION_NAME,
+          companion_name: DEFAULT_COMPANION_NAME,
+        }));
       }
 
       const avatarCandidates = buildAvatarCandidates(resolvedCompanionKey || DEFAULT_COMPANION_NAME);
@@ -359,7 +399,22 @@ export default function Page() {
       (crypto as any).randomUUID?.() ||
       `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
-    const wants_explicit = stateToSend.mode === "intimate";
+const wants_explicit = stateToSend.mode === "intimate";
+
+// Ensure backend receives the selected companion so it can apply the correct persona.
+// Without this, the backend may fall back to the default companion ("Haven") even when the UI shows another.
+const companionForBackend =
+  (companionKey || "").trim() ||
+  (companionName || DEFAULT_COMPANION_NAME).trim() ||
+  DEFAULT_COMPANION_NAME;
+
+const stateToSendWithCompanion: SessionState = {
+  ...stateToSend,
+  companion: companionForBackend,
+  // Backward/forward compatibility with any backend expecting different field names
+  companionName: companionForBackend,
+  companion_name: companionForBackend,
+};
 
     const res = await fetch(`${API_BASE}/chat`, {
       method: "POST",
@@ -367,7 +422,7 @@ export default function Page() {
       body: JSON.stringify({
         session_id,
         wants_explicit,
-        session_state: stateToSend,
+        session_state: stateToSendWithCompanion,
         messages: nextMessages.map((m) => ({ role: m.role, content: m.content })),
       }),
     });
@@ -723,7 +778,6 @@ export default function Page() {
           </div>
         </div>
       )}
-
-    </main>
+</main>
   );
 }
