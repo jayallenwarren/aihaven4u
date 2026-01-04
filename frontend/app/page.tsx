@@ -27,10 +27,10 @@ type ChatApiResponse = {
 };
 
 type PlanName =
-  | "Week - Trial"
-  | "Weekly - Friend"
-  | "Weekly - Romantic"
-  | "Weekly - Intimate (18+)"
+  | "Trial"
+  | "Friend"
+  | "Romantic"
+  | "Intimate (18+)"
   | "Test - Friend"
   | "Test - Romantic"
   | "Test - Intimate (18+)"
@@ -59,9 +59,9 @@ const MODE_LABELS: Record<Mode, string> = {
 };
 
 const ROMANTIC_ALLOWED_PLANS: PlanName[] = [
-  "Week - Trial",
-  "Weekly - Romantic",
-  "Weekly - Intimate (18+)",
+  "Trial",
+  "Romantic",
+  "Intimate (18+)",
   "Test - Romantic",
   "Test - Intimate (18+)",
 ];
@@ -69,7 +69,7 @@ const ROMANTIC_ALLOWED_PLANS: PlanName[] = [
 function allowedModesForPlan(planName: PlanName): Mode[] {
   const modes: Mode[] = ["friend"];
   if (ROMANTIC_ALLOWED_PLANS.includes(planName)) modes.push("romantic");
-  if (planName === "Weekly - Intimate (18+)" || planName === "Test - Intimate (18+)")
+  if (planName === "Intimate (18+)" || planName === "Test - Intimate (18+)")
     modes.push("intimate");
   return modes;
 }
