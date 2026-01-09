@@ -1,11 +1,28 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+
+# --- Phase 1 TTS (ElevenLabs) + Azure Blob (for D-ID audio_url) ---
+import base64
+import hashlib
+from datetime import datetime, timedelta
+
+import requests
+from starlette.concurrency import run_in_threadpool
+
+from azure.core.exceptions import ResourceExistsError
+from azure.storage.blob import (
+    BlobServiceClient,
+    ContentSettings,
+    BlobSasPermissions,
+    generate_blob_sas,
+)
 
 from .settings import settings
 from .models import ChatResponse
@@ -370,3 +387,142 @@ async def chat(request: Request):
         reply=assistant_reply,
         session_state=session_state_out,
     )
+
+# ----------------------------
+# Phase 1: ElevenLabs TTS -> Azure Blob -> return public (SAS) audio_url
+# ----------------------------
+
+_BLOB_SERVICE: Optional[BlobServiceClient] = None
+_BLOB_ACCOUNT_NAME: Optional[str] = None
+_BLOB_ACCOUNT_KEY: Optional[str] = None
+
+
+def _parse_azure_conn_str(conn_str: str) -> Dict[str, str]:
+    parts: Dict[str, str] = {}
+    for chunk in conn_str.split(";"):
+        chunk = chunk.strip()
+        if not chunk or "=" not in chunk:
+            continue
+        k, v = chunk.split("=", 1)
+        parts[k.strip()] = v.strip()
+    return parts
+
+
+def _get_blob_service() -> Tuple[BlobServiceClient, str, str, str]:
+    """Return (service, account_name, account_key, container_name)."""
+    global _BLOB_SERVICE, _BLOB_ACCOUNT_NAME, _BLOB_ACCOUNT_KEY
+
+    conn_str = (os.getenv("AZURE_STORAGE_CONNECTION_STRING") or "").strip()
+    if not conn_str:
+        raise RuntimeError("Missing AZURE_STORAGE_CONNECTION_STRING")
+
+    container_name = (os.getenv("AZURE_STORAGE_CONTAINER_NAME") or "tts").strip() or "tts"
+
+    if _BLOB_SERVICE is None:
+        parts = _parse_azure_conn_str(conn_str)
+        acct_name = (os.getenv("AZURE_STORAGE_ACCOUNT_NAME") or parts.get("AccountName") or "").strip()
+        acct_key = (parts.get("AccountKey") or "").strip()
+
+        if not acct_name:
+            raise RuntimeError("Could not determine Azure Storage account name")
+        if not acct_key:
+            # Without an account key, we can't generate SAS (unless container is public).
+            raise RuntimeError("Could not determine Azure Storage account key (needed for SAS URLs)")
+
+        _BLOB_SERVICE = BlobServiceClient.from_connection_string(conn_str)
+        _BLOB_ACCOUNT_NAME = acct_name
+        _BLOB_ACCOUNT_KEY = acct_key
+
+        # Ensure container exists
+        try:
+            _BLOB_SERVICE.create_container(container_name)
+        except ResourceExistsError:
+            pass
+
+    assert _BLOB_SERVICE is not None
+    assert _BLOB_ACCOUNT_NAME is not None
+    assert _BLOB_ACCOUNT_KEY is not None
+    return _BLOB_SERVICE, _BLOB_ACCOUNT_NAME, _BLOB_ACCOUNT_KEY, container_name
+
+
+def _make_blob_name(session_id: str, voice_id: str, text: str) -> str:
+    sid = re.sub(r"[^a-zA-Z0-9_-]+", "_", session_id or "anon")[:48]
+    vid = re.sub(r"[^a-zA-Z0-9_-]+", "_", voice_id or "voice")[:48]
+    digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    return f"{sid}/{vid}/{ts}_{digest}.mp3"
+
+
+def _elevenlabs_tts_bytes(voice_id: str, text: str) -> bytes:
+    api_key = (os.getenv("ELEVENLABS_API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError("Missing ELEVENLABS_API_KEY")
+
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+    headers = {
+        "xi-api-key": api_key,
+        "Accept": "audio/mpeg",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "text": text,
+        # Model is optional; ElevenLabs defaults vary by account. If you want to pin:
+        # "model_id": "eleven_multilingual_v2",
+    }
+    r = requests.post(url, headers=headers, json=payload, timeout=60)
+    if r.status_code >= 400:
+        raise RuntimeError(f"ElevenLabs TTS failed: {r.status_code} {r.text[:500]}")
+    return r.content
+
+
+def _upload_mp3_and_get_sas_url(blob_name: str, audio_bytes: bytes) -> str:
+    service, account_name, account_key, container_name = _get_blob_service()
+
+    blob_client = service.get_blob_client(container=container_name, blob=blob_name)
+    blob_client.upload_blob(
+        audio_bytes,
+        overwrite=True,
+        content_settings=ContentSettings(content_type="audio/mpeg"),
+    )
+
+    sas = generate_blob_sas(
+        account_name=account_name,
+        container_name=container_name,
+        blob_name=blob_name,
+        account_key=account_key,
+        permission=BlobSasPermissions(read=True),
+        expiry=datetime.utcnow() + timedelta(hours=6),
+    )
+
+    return f"https://{account_name}.blob.core.windows.net/{container_name}/{blob_name}?{sas}"
+
+
+@app.post("/tts/audio-url")
+async def tts_audio_url(request: Request):
+    """
+    Request JSON: {"session_id":"...", "voice_id":"ElevenLabsVoiceId", "text":"..."}
+    Response JSON: {"audio_url":"https://..."}
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    session_id = str(body.get("session_id") or "anon")
+    voice_id = str(body.get("voice_id") or "").strip()
+    text = str(body.get("text") or "").strip()
+
+    if not voice_id:
+        raise HTTPException(status_code=400, detail="Missing voice_id")
+    if not text:
+        raise HTTPException(status_code=400, detail="Missing text")
+
+    try:
+        audio_bytes = await run_in_threadpool(_elevenlabs_tts_bytes, voice_id, text)
+        blob_name = _make_blob_name(session_id=session_id, voice_id=voice_id, text=text)
+        audio_url = await run_in_threadpool(_upload_mp3_and_get_sas_url, blob_name, audio_bytes)
+        return {"audio_url": audio_url}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"TTS/audio-url error: {e}")

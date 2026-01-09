@@ -2,6 +2,7 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import havenHeart from "../public/ai-haven-heart.png";
+import sdk, { AgentManager } from "@d-id/client-sdk";
 
 type Role = "user" | "assistant";
 type Msg = { role: Role; content: string };
@@ -50,6 +51,43 @@ const GREET_ONCE_KEY = "AIHAVEN_GREETED";
 const DEFAULT_AVATAR = havenHeart.src;
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
+
+type Phase1AvatarMedia = {
+  didAgentId: string;
+  didClientKey: string;
+  elevenVoiceId: string;
+};
+
+const PHASE1_AVATAR_MEDIA: Record<string, Phase1AvatarMedia> = {
+  "Jennifer": {
+    "didAgentId": "v2_agt_n7itFF6f",
+    "didClientKey": "YXV0aDB8Njk2MDdmMjQxNTNhMDBjOTQ2ZjExMjk0Ong3TExORDhuSUdhOEdyNUpMNTBQTA==",
+    "elevenVoiceId": "19STyYD15bswVz51nqLf"
+  },
+  "Jason": {
+    "didAgentId": "v2_agt_WpC1hOBQ",
+    "didClientKey": "YXV0aDB8Njk2MDdmMjQxNTNhMDBjOTQ2ZjExMjk0Ong3TExORDhuSUdhOEdyNUpMNTBQTA==",
+    "elevenVoiceId": "j0jBf06B5YHDbCWVmlmr"
+  },
+  "Tonya": {
+    "didAgentId": "v2_agt_2lL6f5YY",
+    "didClientKey": "YXV0aDB8Njk2MDdmMjQxNTNhMDBjOTQ2ZjExMjk0Ong3TExORDhuSUdhOEdyNUpMNTBQTA==",
+    "elevenVoiceId": "Hybl6rg76ZOcgqZqN5WN"
+  }
+} as any;
+
+function getPhase1AvatarMedia(avatarName: string | null | undefined): Phase1AvatarMedia | null {
+  if (!avatarName) return null;
+
+  const direct = PHASE1_AVATAR_MEDIA[avatarName];
+  if (direct) return direct;
+
+  const key = Object.keys(PHASE1_AVATAR_MEDIA).find(
+    (k) => k.toLowerCase() === avatarName.toLowerCase()
+  );
+  return key ? PHASE1_AVATAR_MEDIA[key] : null;
+}
+
 const UPGRADE_URL = "https://www.aihaven4u.com/pricing-plans/list";
 
 const MODE_LABELS: Record<Mode, string> = {
@@ -231,6 +269,148 @@ function normalizeMode(raw: any): Mode | null {
 
 export default function Page() {
   const sessionIdRef = useRef<string | null>(null);
+
+// ----------------------------
+// Phase 1: Live Avatar (D-ID) + TTS (ElevenLabs -> Azure Blob)
+// ----------------------------
+const avatarVideoRef = useRef<HTMLVideoElement | null>(null);
+const didAgentMgrRef = useRef<AgentManager | null>(null);
+
+const [avatarStatus, setAvatarStatus] = useState<"idle" | "connecting" | "connected" | "error">(
+  "idle"
+);
+const [avatarError, setAvatarError] = useState<string | null>(null);
+
+const phase1AvatarMedia = useMemo(() => getPhase1AvatarMedia(companionName), [companionName]);
+
+const stopLiveAvatar = useCallback(async () => {
+  try {
+    const mgr = didAgentMgrRef.current;
+    didAgentMgrRef.current = null;
+
+    if (mgr) {
+      await mgr.disconnect();
+    }
+
+    const vid = avatarVideoRef.current;
+    if (vid) {
+      const srcObj = vid.srcObject as MediaStream | null;
+      if (srcObj) {
+        srcObj.getTracks().forEach((t) => t.stop());
+      }
+      vid.srcObject = null;
+    }
+  } catch {
+    // ignore
+  } finally {
+    setAvatarStatus("idle");
+    setAvatarError(null);
+  }
+}, []);
+
+const startLiveAvatar = useCallback(async () => {
+  setAvatarError(null);
+
+  if (!phase1AvatarMedia) {
+    setAvatarStatus("error");
+    setAvatarError("Live Avatar is not enabled for this companion in Phase 1.");
+    return;
+  }
+
+  if (avatarStatus === "connecting" || avatarStatus === "connected") return;
+
+  setAvatarStatus("connecting");
+
+  try {
+    const mgr = await sdk.createAgentManager(phase1AvatarMedia.didAgentId, {
+      auth: { key: phase1AvatarMedia.didClientKey },
+      callbacks: {
+        onConnectionStateChange: (state) => {
+          if (state === "connected") setAvatarStatus("connected");
+          if (state === "disconnected") setAvatarStatus("idle");
+        },
+        onVideoStateChange: (_state, stream) => {
+          if (!stream) return;
+          const vid = avatarVideoRef.current;
+          if (!vid) return;
+
+          vid.srcObject = stream;
+          vid.play().catch(() => {});
+        },
+        onError: (err) => {
+          setAvatarStatus("error");
+          setAvatarError(err?.message ? String(err.message) : "Live Avatar error");
+        },
+      },
+      streamOptions: { compat: "auto" },
+    });
+
+    didAgentMgrRef.current = mgr;
+    await mgr.connect();
+  } catch (e: any) {
+    setAvatarStatus("error");
+    setAvatarError(e?.message ? String(e.message) : "Failed to start Live Avatar");
+    didAgentMgrRef.current = null;
+  }
+}, [phase1AvatarMedia, avatarStatus]);
+
+useEffect(() => {
+  // Stop when switching companions
+  void stopLiveAvatar();
+}, [companionKey]); // eslint-disable-line react-hooks/exhaustive-deps
+
+const getTtsAudioUrl = useCallback(async (text: string, voiceId: string): Promise<string | null> => {
+  try {
+    const res = await fetch(`${API_BASE}/tts/audio-url`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: sessionIdRef.current || "anon",
+        voice_id: voiceId,
+        text,
+      }),
+    });
+
+    if (!res.ok) {
+      const msg = await res.text().catch(() => "");
+      console.warn("TTS/audio-url failed:", res.status, msg);
+      return null;
+    }
+
+    const data = (await res.json()) as { audio_url?: string };
+    return data.audio_url || null;
+  } catch (e) {
+    console.warn("TTS/audio-url error:", e);
+    return null;
+  }
+}, []);
+
+const speakAssistantReply = useCallback(
+  async (replyText: string) => {
+    const mgr = didAgentMgrRef.current;
+    if (!mgr) return;
+    if (avatarStatus !== "connected") return;
+    if (!phase1AvatarMedia) return;
+
+    const clean = (replyText || "").trim();
+    if (!clean) return;
+    if (clean.startsWith("Error:")) return;
+
+    const audioUrl = await getTtsAudioUrl(clean, phase1AvatarMedia.elevenVoiceId);
+    if (!audioUrl) return;
+
+    try {
+      await mgr.speak({
+        type: "audio",
+        audio_url: audioUrl,
+        audioType: "audio/mpeg",
+      } as any);
+    } catch (e) {
+      console.warn("D-ID speak failed:", e);
+    }
+  },
+  [avatarStatus, phase1AvatarMedia, getTtsAudioUrl]
+);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -577,6 +757,9 @@ const stateToSendWithCompanion: SessionState = {
       }
 
       setMessages((prev) => [...prev, { role: "assistant", content: data.reply }]);
+
+      // Phase 1: Speak the assistant reply (if Live Avatar is connected)
+      void speakAssistantReply(String(data.reply || ""));
     } catch (err: any) {
       setMessages((prev) => [
         ...prev,
@@ -644,6 +827,53 @@ const stateToSendWithCompanion: SessionState = {
           );
         })}
       </section>
+
+
+{phase1AvatarMedia && (
+  <section style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12, flexWrap: "wrap" }}>
+    <button
+      onClick={() => {
+        if (avatarStatus === "connected" || avatarStatus === "connecting") {
+          void stopLiveAvatar();
+        } else {
+          void startLiveAvatar();
+        }
+      }}
+      style={{
+        padding: "10px 14px",
+        borderRadius: 10,
+        border: "1px solid #111",
+        background: "#fff",
+        color: "#111",
+        cursor: "pointer",
+        fontWeight: 700,
+      }}
+    >
+      {avatarStatus === "connected" || avatarStatus === "connecting"
+        ? "Stop Live Avatar"
+        : "Start Live Avatar"}
+    </button>
+
+    <div style={{ fontSize: 12, color: "#666" }}>
+      Live Avatar: <b>{avatarStatus}</b>
+      {avatarError ? <span style={{ color: "#b00020" }}> — {avatarError}</span> : null}
+    </div>
+  </section>
+)}
+
+{phase1AvatarMedia && (
+  <section
+    style={{
+      border: "1px solid #e5e5e5",
+      borderRadius: 12,
+      overflow: "hidden",
+      background: "#000",
+      marginBottom: 12,
+    }}
+  >
+    <video ref={avatarVideoRef} style={{ width: "100%", aspectRatio: "16 / 9" }} playsInline autoPlay muted={false} />
+  </section>
+)}
 
       <section
         style={{
