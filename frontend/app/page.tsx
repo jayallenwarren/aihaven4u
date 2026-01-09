@@ -66,38 +66,6 @@ const ROMANTIC_ALLOWED_PLANS: PlanName[] = [
   "Test - Intimate (18+)",
 ];
 
-// --- Phase 1: Live streaming talking-head avatars (D-ID) + unique ElevenLabs voices ---
-// Source of truth: "Voice and Video Mappings v2.xlsx" (rows where Phase == 1)
-type Phase1LiveAvatarConfig = {
-  didAgentId: string;
-  didClientKey: string;
-  elevenVoiceId: string;
-};
-
-const PHASE1_LIVE_AVATARS: Record<string, Phase1LiveAvatarConfig> = {
-  jennifer: {
-    didAgentId: "v2_agt_n7itFF6f",
-    didClientKey: "YXV0aDB8Njk2MDdmMjQxNTNhMDBjOTQ2ZjExMjk0Ong3TExORDhuSUdhOEdyNUpMNTBQTA==",
-    elevenVoiceId: "19STyYD15bswVz51nqLf",
-  },
-  jason: {
-    didAgentId: "v2_agt_WpC1hOBQ",
-    didClientKey: "YXV0aDB8Njk2MDdmMjQxNTNhMDBjOTQ2ZjExMjk0Ong3TExORDhuSUdhOEdyNUpMNTBQTA==",
-    elevenVoiceId: "j0jBf06B5YHDbCWVmlmr",
-  },
-  tonya: {
-    didAgentId: "v2_agt_2lL6f5YY",
-    didClientKey: "YXV0aDB8Njk2MDdmMjQxNTNhMDBjOTQ2ZjExMjk0Ong3TExORDhuSUdhOEdyNUpMNTBQTA==",
-    elevenVoiceId: "Hybl6rg76ZOcgqZqN5WN",
-  },
-};
-
-function getPhase1LiveAvatarConfig(companionFirstName: string): Phase1LiveAvatarConfig | null {
-  const k = String(companionFirstName || "").trim().toLowerCase();
-  if (!k) return null;
-  return (PHASE1_LIVE_AVATARS as any)[k] ?? null;
-}
-
 function allowedModesForPlan(planName: PlanName): Mode[] {
   const modes: Mode[] = ["friend"];
   if (ROMANTIC_ALLOWED_PLANS.includes(planName)) modes.push("romantic");
@@ -260,7 +228,6 @@ function normalizeMode(raw: any): Mode | null {
   return null;
 }
 
-type LiveAvatarStatus = "off" | "connecting" | "connected" | "error";
 
 export default function Page() {
   const sessionIdRef = useRef<string | null>(null);
@@ -298,19 +265,6 @@ export default function Page() {
   const [avatarSrc, setAvatarSrc] = useState<string>(DEFAULT_AVATAR);
   const [companionKey, setCompanionKey] = useState<string>("");
 
-  // Phase 1 D-ID + ElevenLabs config
-  const phase1LiveCfg = useMemo(() => getPhase1LiveAvatarConfig(companionName), [companionName]);
-  const liveAvatarAvailable = !!phase1LiveCfg;
-
-  // D-ID streaming refs/state
-  const didVideoRef = useRef<HTMLVideoElement | null>(null);
-  const didAgentManagerRef = useRef<any>(null);
-  const didAgentIdRef = useRef<string | null>(null);
-
-  const [liveAvatarEnabled, setLiveAvatarEnabled] = useState(false);
-  const [liveAvatarStatus, setLiveAvatarStatus] = useState<LiveAvatarStatus>("off");
-  const [liveAvatarError, setLiveAvatarError] = useState("");
-
   const modePills = useMemo(() => ["friend", "romantic", "intimate"] as const, []);
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -325,206 +279,52 @@ export default function Page() {
   }, [messages, loading, scrollToBottom]);
 
   // Greeting once per browser session per companion
-  useEffect(() => {
-    if (typeof window === "undefined") return;
+// Fix: if companionName arrives AFTER the initial greeting timer (e.g., slow Wix postMessage),
+// we may have already inserted the default "Haven" greeting. If the user hasn't typed yet,
+// replace the greeting so it matches the selected companion.
+useEffect(() => {
+  if (typeof window === "undefined") return;
 
-    const desiredName = (companionName || DEFAULT_COMPANION_NAME).trim() || DEFAULT_COMPANION_NAME;
+  const desiredName =
+    (companionName || DEFAULT_COMPANION_NAME).trim() || DEFAULT_COMPANION_NAME;
 
-    const keyName = normalizeKeyForFile(desiredName);
-    const greetKey = `${GREET_ONCE_KEY}:${keyName}`;
+  const keyName = normalizeKeyForFile(desiredName);
+  const greetKey = `${GREET_ONCE_KEY}:${keyName}`;
 
-    const tmr = window.setTimeout(() => {
-      const already = sessionStorage.getItem(greetKey) === "1";
-      const greetingText = greetingFor(desiredName);
+  const tmr = window.setTimeout(() => {
+    const already = sessionStorage.getItem(greetKey) === "1";
+    const greetingText = greetingFor(desiredName);
 
-      const greetingMsg: Msg = {
-        role: "assistant",
-        content: greetingText,
-      };
-
-      setMessages((prev) => {
-        if (prev.length === 0) {
-          return already ? prev : [greetingMsg];
-        }
-
-        if (prev.length === 1 && prev[0].role === "assistant") {
-          const existing = String((prev[0] as any)?.content ?? "");
-          const m = existing.match(/^Hi,\s*(.+?)\s+here\./i);
-          const existingName = m?.[1]?.trim();
-          if (existingName && existingName.toLowerCase() !== desiredName.toLowerCase()) {
-            return [{ ...prev[0], content: greetingText }];
-          }
-        }
-
-        return prev;
-      });
-
-      if (!already) sessionStorage.setItem(greetKey, "1");
-    }, 150);
-
-    return () => window.clearTimeout(tmr);
-  }, [companionName]);
-
-  async function disconnectLiveAvatar() {
-    try {
-      await didAgentManagerRef.current?.disconnect?.();
-    } catch {
-      // ignore
-    }
-    didAgentManagerRef.current = null;
-    didAgentIdRef.current = null;
-
-    if (didVideoRef.current) {
-      try {
-        (didVideoRef.current as any).srcObject = null;
-      } catch {
-        // ignore
-      }
-    }
-  }
-
-  async function connectLiveAvatar(): Promise<boolean> {
-    if (!phase1LiveCfg || !liveAvatarAvailable) {
-      setLiveAvatarStatus("error");
-      setLiveAvatarError("Live avatar is not configured for this companion.");
-      return false;
-    }
-
-    if (didAgentManagerRef.current && didAgentIdRef.current === phase1LiveCfg.didAgentId) {
-      setLiveAvatarStatus("connected");
-      return true;
-    }
-
-    setLiveAvatarStatus("connecting");
-    setLiveAvatarError("");
-
-    await disconnectLiveAvatar();
-
-    try {
-      const sdk: any = await import("@d-id/client-sdk");
-      const createAgentManager: any = sdk.createAgentManager || sdk.default?.createAgentManager;
-
-      if (!createAgentManager) throw new Error("D-ID SDK: createAgentManager not found");
-
-      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
-      const videoEl = didVideoRef.current;
-      if (!videoEl) throw new Error("Live Avatar video element is not ready.");
-
-      const manager: any = await createAgentManager(phase1LiveCfg.didAgentId, {
-        auth: { type: "key", clientKey: phase1LiveCfg.didClientKey },
-        callbacks: {
-          onSrcObjectReady: (stream: MediaStream) => {
-            if (!didVideoRef.current) return;
-            (didVideoRef.current as any).srcObject = stream as any;
-
-            const p = didVideoRef.current.play?.();
-            if (p && typeof (p as any).catch === "function") {
-              (p as any).catch(() => {});
-            }
-          },
-        },
-        streamOptions: { compatibilityMode: "auto", streamWarmup: true },
-      });
-
-      didAgentManagerRef.current = manager;
-      didAgentIdRef.current = phase1LiveCfg.didAgentId;
-
-      await manager.connect?.();
-      setLiveAvatarStatus("connected");
-      return true;
-    } catch (err: any) {
-      setLiveAvatarStatus("error");
-      setLiveAvatarError(err?.message ?? "Failed to connect to live avatar");
-      await disconnectLiveAvatar();
-      return false;
-    }
-  }
-
-  async function startLiveAvatar() {
-    if (!liveAvatarAvailable) {
-      setLiveAvatarStatus("error");
-      setLiveAvatarError("Live avatar is not available for this companion.");
-      return;
-    }
-    setLiveAvatarEnabled(true);
-    await connectLiveAvatar();
-  }
-
-  async function stopLiveAvatar() {
-    setLiveAvatarEnabled(false);
-    setLiveAvatarStatus("off");
-    setLiveAvatarError("");
-    await disconnectLiveAvatar();
-  }
-
-  useEffect(() => {
-    return () => {
-      void disconnectLiveAvatar();
+    const greetingMsg: Msg = {
+      role: "assistant",
+      content: greetingText,
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
 
-  useEffect(() => {
-    if (!liveAvatarEnabled) return;
-    void stopLiveAvatar();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [companionName]);
-
-  async function getTtsAudioUrl(text: string): Promise<string | null> {
-    if (!API_BASE) return null;
-    if (!phase1LiveCfg?.elevenVoiceId) return null;
-
-    const session_id =
-      sessionIdRef.current ||
-      (crypto as any).randomUUID?.() ||
-      `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-
-    try {
-      const res = await fetch(`${API_BASE}/tts/audio-url`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          session_id,
-          voice_id: phase1LiveCfg.elevenVoiceId,
-          text,
-        }),
-      });
-
-      if (!res.ok) {
-        const errText = await res.text().catch(() => "");
-        throw new Error(`TTS error ${res.status}: ${errText}`);
+    setMessages((prev) => {
+      // If no messages yet, insert greeting only if we haven't greeted this companion in this session.
+      if (prev.length === 0) {
+        return already ? prev : [greetingMsg];
       }
 
-      const data = await res.json().catch(() => ({} as any));
-      return (data as any)?.audio_url ?? null;
-    } catch (e: any) {
-      setLiveAvatarStatus("error");
-      setLiveAvatarError(e?.message ?? "Failed to fetch TTS audio URL");
-      return null;
-    }
-  }
+      // If the only existing message is a greeting for a different companion (and no user messages yet),
+      // replace it so the name matches the current companion.
+      if (prev.length === 1 && prev[0].role === "assistant") {
+        const existing = String((prev[0] as any)?.content ?? "");
+        const m = existing.match(/^Hi,\s*(.+?)\s+here\./i);
+        const existingName = m?.[1]?.trim();
+        if (existingName && existingName.toLowerCase() !== desiredName.toLowerCase()) {
+          return [{ ...prev[0], content: greetingText }];
+        }
+      }
 
-  async function speakAssistantReply(text: string, statusFromBackend?: ChatStatus) {
-    try {
-      if (!liveAvatarEnabled) return;
-      if (liveAvatarStatus !== "connected") return;
-      if (!phase1LiveCfg) return;
-      if (!didAgentManagerRef.current) return;
+      return prev;
+    });
 
-      if (statusFromBackend === "explicit_blocked") return;
+    if (!already) sessionStorage.setItem(greetKey, "1");
+  }, 150);
 
-      const audioUrl = await getTtsAudioUrl(text);
-      if (!audioUrl) return;
-
-      await didAgentManagerRef.current.speak?.({
-        type: "audio",
-        audio_url: audioUrl,
-      });
-    } catch (e: any) {
-      setLiveAvatarStatus("error");
-      setLiveAvatarError(e?.message ?? "Failed to speak via live avatar");
-    }
-  }
+  return () => window.clearTimeout(tmr);
+}, [companionName]);
 
   function showUpgradeMessage(requestedMode: Mode) {
     const modeLabel = MODE_LABELS[requestedMode];
@@ -535,6 +335,7 @@ export default function Page() {
     setMessages((prev) => [...prev, { role: "assistant", content: msg }]);
   }
 
+  // Receive plan + companion from Wix postMessage
   useEffect(() => {
     function onMessage(event: MessageEvent) {
       if (!isAllowedOrigin(event.origin)) return;
@@ -554,6 +355,7 @@ export default function Page() {
         setCompanionKey(parsed.key);
         setCompanionName(parsed.first || DEFAULT_COMPANION_NAME);
 
+        // Keep session_state aligned with the selected companion so the backend can apply the correct persona.
         setSessionState((prev) => ({
           ...prev,
           companion: parsed.key,
@@ -578,6 +380,7 @@ export default function Page() {
       const nextAllowed = allowedModesForPlan(incomingPlan);
       setAllowedModes(nextAllowed);
 
+      // If current mode is not allowed, force friend
       setSessionState((prev) => {
         if (nextAllowed.includes(prev.mode)) return prev;
         return { ...prev, mode: "friend", pending_consent: null };
@@ -596,19 +399,22 @@ export default function Page() {
       (crypto as any).randomUUID?.() ||
       `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
-    const wants_explicit = stateToSend.mode === "intimate";
+const wants_explicit = stateToSend.mode === "intimate";
 
-    const companionForBackend =
-      (companionKey || "").trim() ||
-      (companionName || DEFAULT_COMPANION_NAME).trim() ||
-      DEFAULT_COMPANION_NAME;
+// Ensure backend receives the selected companion so it can apply the correct persona.
+// Without this, the backend may fall back to the default companion ("Haven") even when the UI shows another.
+const companionForBackend =
+  (companionKey || "").trim() ||
+  (companionName || DEFAULT_COMPANION_NAME).trim() ||
+  DEFAULT_COMPANION_NAME;
 
-    const stateToSendWithCompanion: SessionState = {
-      ...stateToSend,
-      companion: companionForBackend,
-      companionName: companionForBackend,
-      companion_name: companionForBackend,
-    };
+const stateToSendWithCompanion: SessionState = {
+  ...stateToSend,
+  companion: companionForBackend,
+  // Backward/forward compatibility with any backend expecting different field names
+  companionName: companionForBackend,
+  companion_name: companionForBackend,
+};
 
     const res = await fetch(`${API_BASE}/chat`, {
       method: "POST",
@@ -629,6 +435,8 @@ export default function Page() {
     return (await res.json()) as ChatApiResponse;
   }
 
+  // This is the mode that drives the UI highlight:
+  // - If backend is asking for intimate consent, keep intimate pill highlighted
   const effectiveActiveMode: Mode =
     sessionState.pending_consent === "intimate" ? "intimate" : sessionState.mode;
 
@@ -642,6 +450,7 @@ export default function Page() {
     }
 
     setSessionState((prev) => {
+      // If switching away from intimate while pending consent, clear pending
       const nextPending = m === "intimate" ? prev.pending_consent : null;
       return { ...prev, mode: m, pending_consent: nextPending };
     });
@@ -655,14 +464,18 @@ export default function Page() {
     const rawText = (textOverride ?? input).trim();
     if (!rawText) return;
 
+    // detect mode switch from prompt text
     const { mode: detectedMode, cleaned } = detectModeSwitchAndClean(rawText);
 
+    // Plan-gate mode if user is attempting to switch
     if (detectedMode && !allowedModes.includes(detectedMode)) {
       showUpgradeMessage(detectedMode);
       setInput("");
       return;
     }
 
+    // If the user message is ONLY a mode switch token, apply locally and don't call backend
+    // e.g. "[mode:romantic]" by itself
     if (detectedMode && cleaned.length === 0) {
       setSessionState((prev) => ({ ...prev, mode: detectedMode, pending_consent: null }));
       setMessages((prev) => [
@@ -673,11 +486,15 @@ export default function Page() {
       return;
     }
 
+    // Apply mode locally (so pill highlights immediately), but still send message.
+    // If detectedMode is intimate, keep/trigger pending overlay on response.
     let nextState: SessionState = sessionState;
     if (detectedMode) {
+      // If we switch away from intimate while consent is pending, clear the pending flag
       const nextPending = detectedMode === "intimate" ? sessionState.pending_consent : null;
       nextState = { ...sessionState, mode: detectedMode, pending_consent: nextPending };
 
+      // If user is switching away from intimate, also clear any explicit_blocked overlay state
       if (detectedMode !== "intimate") {
         setChatStatus("safe");
       }
@@ -685,6 +502,8 @@ export default function Page() {
       setSessionState(nextState);
     }
 
+    // Build user message content:
+    // If a [mode:*] token was present, we remove it from content (cleaned) to keep chat natural.
     const outgoingText = detectedMode ? cleaned : rawText;
 
     const userMsg: Msg = { role: "user", content: outgoingText };
@@ -698,30 +517,37 @@ export default function Page() {
       const sendState: SessionState = { ...nextState, ...(stateOverride || {}) };
       const data = await callChat(nextMessages, sendState);
 
+      // status from backend (safe/explicit_blocked/explicit_allowed)
       if (data.mode === "safe" || data.mode === "explicit_blocked" || data.mode === "explicit_allowed") {
         setChatStatus(data.mode);
       }
 
+      // Some backends return camelCase "sessionState" instead of snake_case "session_state"
       const serverSessionState: any = (data as any).session_state ?? (data as any).sessionState;
 
+      // Normalize & apply server session state WITHOUT using data.mode as pill mode
       if (serverSessionState) {
         setSessionState((prev) => {
           const merged: SessionState = { ...(prev as any), ...(serverSessionState as any) };
 
+          // If backend says blocked, keep pill as intimate AND set pending
           if (data.mode === "explicit_blocked") {
             merged.mode = "intimate";
             merged.pending_consent = "intimate";
           }
 
+          // If backend says allowed, clear pending (and keep mode whatever backend returned in session state)
           if (data.mode === "explicit_allowed" && merged.pending_consent) {
             merged.pending_consent = null;
           }
 
+          // If the backend sent a mode (in session state OR top-level), normalize it so Romantic always highlights
           const backendMode = normalizeMode((serverSessionState as any)?.mode ?? (data as any)?.mode);
           if (backendMode && data.mode !== "explicit_blocked") {
             merged.mode = backendMode;
           }
 
+          // If we are not in intimate, never keep the intimate pending flag (prevents the Intimate pill from "sticking")
           if (merged.mode !== "intimate" && merged.pending_consent === "intimate") {
             merged.pending_consent = null;
           }
@@ -729,14 +555,17 @@ export default function Page() {
           return merged;
         });
       } else {
+        // If blocked but session_state missing, still reflect pending
         if (data.mode === "explicit_blocked") {
           setSessionState((prev) => ({ ...prev, mode: "intimate", pending_consent: "intimate" }));
         }
 
+        // If allowed but session_state missing, clear pending and mark consented
         if (data.mode === "explicit_allowed") {
           setSessionState((prev) => ({ ...prev, pending_consent: null, explicit_consented: true }));
         }
 
+        // Fallback: if backend returned a pill mode at top-level, apply it
         const backendMode = normalizeMode((data as any)?.mode);
         if (backendMode && data.mode !== "explicit_blocked") {
           setSessionState((prev) => ({
@@ -748,8 +577,6 @@ export default function Page() {
       }
 
       setMessages((prev) => [...prev, { role: "assistant", content: data.reply }]);
-
-      void speakAssistantReply(data.reply, data.mode as any);
     } catch (err: any) {
       setMessages((prev) => [
         ...prev,
@@ -787,35 +614,6 @@ export default function Page() {
               <span style={{ marginLeft: 8, color: "#b00020" }}>• Consent: Required</span>
             ) : null}
           </div>
-
-          {liveAvatarAvailable && (
-            <div style={{ marginTop: 8, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-              <button
-                onClick={() => {
-                  if (liveAvatarEnabled) void stopLiveAvatar();
-                  else void startLiveAvatar();
-                }}
-                style={{
-                  padding: "6px 10px",
-                  borderRadius: 10,
-                  border: "1px solid #111",
-                  background: liveAvatarEnabled ? "#fff" : "#111",
-                  color: liveAvatarEnabled ? "#111" : "#fff",
-                  cursor: "pointer",
-                }}
-              >
-                {liveAvatarEnabled ? "Stop Live Avatar" : "Start Live Avatar"}
-              </button>
-
-              <span style={{ fontSize: 12, color: "#666" }}>
-                Live Avatar: <b>{liveAvatarStatus}</b>
-              </span>
-
-              {liveAvatarStatus === "error" && liveAvatarError ? (
-                <span style={{ fontSize: 12, color: "#b00020" }}>{liveAvatarError}</span>
-              ) : null}
-            </div>
-          )}
         </div>
       </header>
 
@@ -855,22 +653,6 @@ export default function Page() {
           minHeight: 360,
         }}
       >
-        {liveAvatarEnabled && (
-          <div style={{ marginBottom: 12 }}>
-            <video
-              ref={didVideoRef}
-              playsInline
-              autoPlay
-              style={{
-                width: "100%",
-                maxHeight: 320,
-                borderRadius: 12,
-                background: "#000",
-              }}
-            />
-          </div>
-        )}
-
         {messages.map((m, i) => (
           <div key={i} style={{ marginBottom: 10 }}>
             <div style={{ fontSize: 12, color: "#666" }}>{m.role === "user" ? "You" : "AI"}</div>
@@ -911,6 +693,7 @@ export default function Page() {
         </button>
       </section>
 
+      {/* Consent overlay */}
       {showConsentOverlay && (
         <div
           style={{
@@ -942,6 +725,7 @@ export default function Page() {
             <div style={{ display: "flex", gap: 8 }}>
               <button
                 onClick={() => {
+                  // Ensure backend receives pending_consent + intimate mode
                   setSessionState((prev) => ({ ...prev, pending_consent: "intimate", mode: "intimate" }));
                   send("Yes", { pending_consent: "intimate", mode: "intimate" });
                 }}
@@ -994,6 +778,6 @@ export default function Page() {
           </div>
         </div>
       )}
-    </main>
+</main>
   );
 }
