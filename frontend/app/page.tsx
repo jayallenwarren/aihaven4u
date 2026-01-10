@@ -2,7 +2,7 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import havenHeart from "../public/ai-haven-heart.png";
-import sdk, { AgentManager } from "@d-id/client-sdk";
+import type { AgentManager } from "@d-id/client-sdk";
 
 type Role = "user" | "assistant";
 type Msg = { role: Role; content: string };
@@ -322,7 +322,8 @@ const startLiveAvatar = useCallback(async () => {
   setAvatarStatus("connecting");
 
   try {
-    const mgr = await sdk.createAgentManager(phase1AvatarMedia.didAgentId, {
+    const { createAgentManager } = await import("@d-id/client-sdk");
+    const mgr = await createAgentManager(phase1AvatarMedia.didAgentId, {
       auth: { key: phase1AvatarMedia.didClientKey },
       callbacks: {
         onConnectionStateChange: (state) => {
