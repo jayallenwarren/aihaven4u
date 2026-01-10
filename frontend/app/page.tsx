@@ -324,49 +324,22 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
 
 const phase1AvatarMedia = useMemo(() => getPhase1AvatarMedia(companionName), [companionName]);
 
-  // UI layout
-  const conversationHeight = 520;
-  const showAvatarFrame = Boolean(phase1AvatarMedia) && avatarStatus !== "idle";
-
-
 const stopLiveAvatar = useCallback(async () => {
   try {
     const mgr = didAgentMgrRef.current;
     didAgentMgrRef.current = null;
 
-    // Stop any remembered MediaStream (important if we were showing idle_video and vid.srcObject is null)
-    const remembered = didSrcObjectRef.current;
-    didSrcObjectRef.current = null;
-
     if (mgr) {
       await mgr.disconnect();
-    }
-
-    try {
-      if (remembered && typeof remembered.getTracks === "function") {
-        remembered.getTracks().forEach((t: any) => t?.stop?.());
-      }
-    } catch {
-      // ignore
     }
 
     const vid = avatarVideoRef.current;
     if (vid) {
       const srcObj = vid.srcObject as MediaStream | null;
-      if (srcObj && typeof srcObj.getTracks === "function") {
+      if (srcObj) {
         srcObj.getTracks().forEach((t) => t.stop());
       }
       vid.srcObject = null;
-
-      // If we were displaying the presenter's idle_video, clear it too.
-      try {
-        vid.pause();
-        vid.removeAttribute("src");
-        (vid as any).src = "";
-        vid.load?.();
-      } catch {
-        // ignore
-      }
     }
   } catch {
     // ignore
@@ -436,18 +409,7 @@ const startLiveAvatar = useCallback(async () => {
       }
     } catch {}
     didSrcObjectRef.current = null;
-    if (avatarVideoRef.current) {
-      try {
-        const vid = avatarVideoRef.current;
-        vid.srcObject = null;
-        vid.pause();
-        vid.removeAttribute("src");
-        (vid as any).src = "";
-        vid.load?.();
-      } catch {
-        // ignore
-      }
-    }
+    if (avatarVideoRef.current) avatarVideoRef.current.srcObject = null;
 
     const { createAgentManager } = await import("@d-id/client-sdk");
     // NOTE: Some versions of @d-id/client-sdk ship stricter TS types (e.g., requiring
@@ -472,15 +434,6 @@ const startLiveAvatar = useCallback(async () => {
           didSrcObjectRef.current = value;
           const vid = avatarVideoRef.current;
           if (vid) {
-            // If we were showing the presenter's idle_video, clear it before attaching the MediaStream
-            try {
-              vid.removeAttribute("src");
-              (vid as any).src = "";
-              vid.load?.();
-            } catch {
-              // ignore
-            }
-            vid.loop = false;
             vid.srcObject = value;
             vid.play().catch(() => {});
           }
@@ -488,46 +441,12 @@ const startLiveAvatar = useCallback(async () => {
         },
 
         onVideoStateChange: (state: any) => {
+          if (state === "STOP") return;
           const vid = avatarVideoRef.current;
-          if (!vid) return;
-
-          const s = typeof state === "string" ? state : String(state ?? "");
-          const mgr = didAgentMgrRef.current;
           const stream = didSrcObjectRef.current;
-
-          // When the live stream stops, switch to the presenter's idle_video so the avatar isn't frozen.
-          if (s === "STOP") {
-            const idleUrl = mgr?.agent?.presenter?.idle_video;
-            if (idleUrl) {
-              try {
-                // Detach the MediaStream (do NOT stop tracks; we may resume).
-                vid.srcObject = null;
-                if (vid.src !== idleUrl) vid.src = idleUrl;
-                vid.loop = true;
-                vid.play().catch(() => {});
-              } catch {
-                // ignore
-              }
-            }
-            return;
-          }
-
-          // Any non-STOP state: ensure we are showing the live MediaStream.
-          if (stream) {
-            try {
-              // Clear idle video if it was set
-              if (vid.src) {
-                vid.pause();
-                vid.removeAttribute("src");
-                (vid as any).src = "";
-                vid.load?.();
-              }
-              vid.loop = false;
-              vid.srcObject = stream;
-              vid.play().catch(() => {});
-            } catch {
-              // ignore
-            }
+          if (vid && stream) {
+            vid.srcObject = stream;
+            vid.play().catch(() => {});
           }
         },
 
@@ -541,7 +460,7 @@ const startLiveAvatar = useCallback(async () => {
           setAvatarError(formatDidError(err));
         },
       },
-      streamOptions: { compatibilityMode: "auto", streamWarmup: true },
+      streamOptions: { compatibilityMode: "auto", streamWarmup: true, sessionTimeout: 300 },
       } as any
     );
 
@@ -654,23 +573,17 @@ const speakAssistantReply = useCallback(
   const [allowedModes, setAllowedModes] = useState<Mode[]>(["friend"]);
 
   const modePills = useMemo(() => ["friend", "romantic", "intimate"] as const, []);
-  const messagesBoxRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  const scrollToBottom = useCallback(() => {
+    requestAnimationFrame(() => {
+      scrollRef.current?.scrollIntoView({ behavior: "smooth" });
+    });
+  }, []);
 
   useEffect(() => {
-    const el = messagesBoxRef.current;
-    if (!el) return;
-
-    // Keep scrolling inside the message box so the page itself doesn't "jump"
-    el.scrollTop = el.scrollHeight;
-  }, [messages, loading]);
-
-  // Speech-to-text (Web Speech API)
-  const sttRecRef = useRef<any>(null);
-  const sttSilenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const sttTranscriptRef = useRef<string>("");
-  const [sttListening, setSttListening] = useState(false);
-  const [sttError, setSttError] = useState<string | null>(null);
-
+    scrollToBottom();
+  }, [messages, loading, scrollToBottom]);
 
   // Greeting once per browser session per companion
 // Fix: if companionName arrives AFTER the initial greeting timer (e.g., slow Wix postMessage),
@@ -984,116 +897,6 @@ const stateToSendWithCompanion: SessionState = {
     }
   }
 
-  function clearSttSilenceTimer() {
-    if (sttSilenceTimerRef.current) {
-      try {
-        clearTimeout(sttSilenceTimerRef.current);
-      } catch {}
-      sttSilenceTimerRef.current = null;
-    }
-  }
-
-  function scheduleSttAutoSend() {
-    clearSttSilenceTimer();
-
-    // If the user is silent for 2 seconds, treat it as the end of the utterance.
-    sttSilenceTimerRef.current = setTimeout(() => {
-      const text = sttTranscriptRef.current.trim();
-      if (!text) return;
-
-      // Stop STT before sending so we don't pick up the avatar's audio.
-      try {
-        sttRecRef.current?.stop?.();
-      } catch {}
-
-      setSttListening(false);
-      sttSilenceTimerRef.current = null;
-      sttTranscriptRef.current = "";
-
-      void send(text);
-    }, 2000);
-  }
-
-  function stopSpeechToText() {
-    clearSttSilenceTimer();
-    sttTranscriptRef.current = "";
-    try {
-      sttRecRef.current?.stop?.();
-    } catch {}
-    setSttListening(false);
-  }
-
-  function toggleSpeechToText() {
-    setSttError(null);
-
-    // Stop if already listening
-    if (sttListening) {
-      stopSpeechToText();
-      return;
-    }
-
-    if (typeof window === "undefined") return;
-
-    const SpeechRecognition =
-      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-
-    if (!SpeechRecognition) {
-      setSttError("Speech-to-text is not supported in this browser.");
-      return;
-    }
-
-    // Always create a fresh recognition instance to avoid stale handlers.
-    const rec = new SpeechRecognition();
-    sttRecRef.current = rec;
-    sttTranscriptRef.current = "";
-    clearSttSilenceTimer();
-
-    rec.continuous = true;
-    rec.interimResults = true;
-    rec.lang = "en-US";
-    rec.maxAlternatives = 1;
-
-    rec.onstart = () => setSttListening(true);
-    rec.onend = () => setSttListening(false);
-    rec.onerror = (e: any) => {
-      setSttListening(false);
-      clearSttSilenceTimer();
-      sttTranscriptRef.current = "";
-      setSttError(e?.error ? `Speech-to-text error: ${e.error}` : "Speech-to-text error");
-    };
-    rec.onresult = (event: any) => {
-      let transcript = "";
-      const results = event?.results;
-      if (results) {
-        for (let i = 0; i < results.length; i++) transcript += results[i][0].transcript;
-      }
-      transcript = String(transcript).trim();
-      if (!transcript) return;
-
-      sttTranscriptRef.current = transcript;
-      setInput(transcript);
-      scheduleSttAutoSend();
-    };
-
-    try {
-      rec.start();
-    } catch {
-      setSttListening(false);
-      sttRecRef.current = null;
-      setSttError("Speech-to-text could not start (microphone permission?)");
-    }
-  }
-
-  useEffect(() => {
-    return () => {
-      clearSttSilenceTimer();
-      try {
-        sttRecRef.current?.abort?.();
-      } catch {}
-    };
-  }, []);
-
-
   return (
     <main style={{ maxWidth: 880, margin: "24px auto", padding: "0 16px", fontFamily: "system-ui" }}>
       <header style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 10 }}>
@@ -1191,160 +994,69 @@ const stateToSendWithCompanion: SessionState = {
   </section>
 )}
 
+{phase1AvatarMedia && (
+  <section
+    style={{
+      border: "1px solid #e5e5e5",
+      borderRadius: 12,
+      overflow: "hidden",
+      background: "#000",
+      marginBottom: 12,
+    }}
+  >
+    <video ref={avatarVideoRef} style={{ width: "100%", aspectRatio: "16 / 9" }} playsInline autoPlay muted={false} />
+  </section>
+)}
 
-      {/* Conversation area (Avatar + Chat) */}
       <section
         style={{
-          display: "flex",
-          gap: 12,
-          alignItems: "stretch",
-          flexWrap: "wrap",
-          marginBottom: 12,
+          border: "1px solid #e5e5e5",
+          borderRadius: 12,
+          padding: 12,
+          minHeight: 360,
         }}
       >
-        {showAvatarFrame ? (
-          <div style={{ flex: "1 1 0", minWidth: 260, height: conversationHeight }}>
-            <div
-              style={{
-                border: "1px solid #e5e5e5",
-                borderRadius: 12,
-                overflow: "hidden",
-                background: "#000",
-                height: "100%",
-                position: "relative",
-              }}
-            >
-              <video
-                ref={avatarVideoRef}
-                style={{ width: "100%", height: "100%", objectFit: "contain" }}
-                playsInline
-                autoPlay
-                muted={false}
-              />
-              {avatarStatus !== "connected" ? (
-                <div
-                  style={{
-                    position: "absolute",
-                    inset: 0,
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    color: "#fff",
-                    fontSize: 14,
-                    background: "rgba(0,0,0,0.25)",
-                    padding: 12,
-                    textAlign: "center",
-                  }}
-                >
-                  {avatarStatus === "connecting"
-                    ? "Connecting…"
-                    : avatarStatus === "reconnecting"
-                    ? "Reconnecting…"
-                    : avatarStatus === "error"
-                    ? "Avatar error"
-                    : null}
-                </div>
-              ) : null}
-            </div>
+        {messages.map((m, i) => (
+          <div key={i} style={{ marginBottom: 10 }}>
+            <div style={{ fontSize: 12, color: "#666" }}>{m.role === "user" ? "You" : "AI"}</div>
+            <div style={{ whiteSpace: "pre-wrap" }}>{m.content}</div>
           </div>
-        ) : null}
-
-        <div
-          style={{
-            flex: showAvatarFrame ? "2 1 0" : "1 1 0",
-            minWidth: 280,
-            height: conversationHeight,
-            display: "flex",
-            flexDirection: "column",
-          }}
-        >
-          <div
-            ref={messagesBoxRef}
-            style={{
-              flex: "1 1 auto",
-              border: "1px solid #e5e5e5",
-              borderRadius: 12,
-              padding: 12,
-              overflowY: "auto",
-              background: "#fff",
-            }}
-          >
-            {messages.map((m, i) => (
-              <div
-                key={i}
-                style={{
-                  marginBottom: 10,
-                  whiteSpace: "pre-wrap",
-                  color: m.role === "assistant" ? "#111" : "#333",
-                }}
-              >
-                <b>{m.role === "assistant" ? companionName : "You"}:</b> {m.content}
-              </div>
-            ))}
-            {loading ? <div style={{ color: "#666" }}>Thinking…</div> : null}
-          </div>
-
-          <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
-            <button
-              type="button"
-              onClick={toggleSpeechToText}
-              disabled={loading}
-              title={sttListening ? "Stop speech-to-text" : "Start speech-to-text"}
-              style={{
-                width: 44,
-                minWidth: 44,
-                borderRadius: 10,
-                border: "1px solid #111",
-                background: sttListening ? "#b00020" : "#fff",
-                color: sttListening ? "#fff" : "#111",
-                cursor: "pointer",
-                fontWeight: 700,
-              }}
-            >
-              🎤
-            </button>
-
-            <input
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") {
-                  e.preventDefault();
-                  send();
-                }
-              }}
-              placeholder={sttListening ? "Listening…" : "Type a message…"}
-              style={{
-                flex: 1,
-                padding: "10px 12px",
-                borderRadius: 10,
-                border: "1px solid #ddd",
-              }}
-            />
-
-            <button
-              onClick={() => send()}
-              disabled={loading}
-              style={{
-                padding: "10px 14px",
-                borderRadius: 10,
-                border: "1px solid #111",
-                background: "#111",
-                color: "#fff",
-                cursor: "pointer",
-              }}
-            >
-              Send
-            </button>
-          </div>
-
-          {sttError ? (
-            <div style={{ marginTop: 6, fontSize: 12, color: "#b00020" }}>{sttError}</div>
-          ) : null}
-        </div>
+        ))}
+        {loading && <div style={{ color: "#666" }}>Thinking…</div>}
+        <div ref={scrollRef} />
       </section>
 
-{/* Consent overlay */}
+      <section style={{ display: "flex", gap: 8, marginTop: 12 }}>
+        <input
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") send();
+          }}
+          placeholder="Type a message…"
+          style={{
+            flex: 1,
+            padding: "10px 12px",
+            borderRadius: 10,
+            border: "1px solid #ddd",
+          }}
+        />
+        <button
+          onClick={() => send()}
+          style={{
+            padding: "10px 14px",
+            borderRadius: 10,
+            border: "1px solid #111",
+            background: "#111",
+            color: "#fff",
+            cursor: "pointer",
+          }}
+        >
+          Send
+        </button>
+      </section>
+
+      {/* Consent overlay */}
       {showConsentOverlay && (
         <div
           style={{
