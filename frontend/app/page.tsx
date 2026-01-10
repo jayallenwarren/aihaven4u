@@ -329,17 +329,39 @@ const stopLiveAvatar = useCallback(async () => {
     const mgr = didAgentMgrRef.current;
     didAgentMgrRef.current = null;
 
+    // Stop any remembered MediaStream (important if we were showing idle_video and vid.srcObject is null)
+    const remembered = didSrcObjectRef.current;
+    didSrcObjectRef.current = null;
+
     if (mgr) {
       await mgr.disconnect();
+    }
+
+    try {
+      if (remembered && typeof remembered.getTracks === "function") {
+        remembered.getTracks().forEach((t: any) => t?.stop?.());
+      }
+    } catch {
+      // ignore
     }
 
     const vid = avatarVideoRef.current;
     if (vid) {
       const srcObj = vid.srcObject as MediaStream | null;
-      if (srcObj) {
+      if (srcObj && typeof srcObj.getTracks === "function") {
         srcObj.getTracks().forEach((t) => t.stop());
       }
       vid.srcObject = null;
+
+      // If we were displaying the presenter's idle_video, clear it too.
+      try {
+        vid.pause();
+        vid.removeAttribute("src");
+        (vid as any).src = "";
+        vid.load?.();
+      } catch {
+        // ignore
+      }
     }
   } catch {
     // ignore
@@ -409,7 +431,18 @@ const startLiveAvatar = useCallback(async () => {
       }
     } catch {}
     didSrcObjectRef.current = null;
-    if (avatarVideoRef.current) avatarVideoRef.current.srcObject = null;
+    if (avatarVideoRef.current) {
+      try {
+        const vid = avatarVideoRef.current;
+        vid.srcObject = null;
+        vid.pause();
+        vid.removeAttribute("src");
+        (vid as any).src = "";
+        vid.load?.();
+      } catch {
+        // ignore
+      }
+    }
 
     const { createAgentManager } = await import("@d-id/client-sdk");
     // NOTE: Some versions of @d-id/client-sdk ship stricter TS types (e.g., requiring
@@ -434,6 +467,15 @@ const startLiveAvatar = useCallback(async () => {
           didSrcObjectRef.current = value;
           const vid = avatarVideoRef.current;
           if (vid) {
+            // If we were showing the presenter's idle_video, clear it before attaching the MediaStream
+            try {
+              vid.removeAttribute("src");
+              (vid as any).src = "";
+              vid.load?.();
+            } catch {
+              // ignore
+            }
+            vid.loop = false;
             vid.srcObject = value;
             vid.play().catch(() => {});
           }
@@ -441,12 +483,46 @@ const startLiveAvatar = useCallback(async () => {
         },
 
         onVideoStateChange: (state: any) => {
-          if (state === "STOP") return;
           const vid = avatarVideoRef.current;
+          if (!vid) return;
+
+          const s = typeof state === "string" ? state : String(state ?? "");
+          const mgr = didAgentMgrRef.current;
           const stream = didSrcObjectRef.current;
-          if (vid && stream) {
-            vid.srcObject = stream;
-            vid.play().catch(() => {});
+
+          // When the live stream stops, switch to the presenter's idle_video so the avatar isn't frozen.
+          if (s === "STOP") {
+            const idleUrl = mgr?.agent?.presenter?.idle_video;
+            if (idleUrl) {
+              try {
+                // Detach the MediaStream (do NOT stop tracks; we may resume).
+                vid.srcObject = null;
+                if (vid.src !== idleUrl) vid.src = idleUrl;
+                vid.loop = true;
+                vid.play().catch(() => {});
+              } catch {
+                // ignore
+              }
+            }
+            return;
+          }
+
+          // Any non-STOP state: ensure we are showing the live MediaStream.
+          if (stream) {
+            try {
+              // Clear idle video if it was set
+              if (vid.src) {
+                vid.pause();
+                vid.removeAttribute("src");
+                (vid as any).src = "";
+                vid.load?.();
+              }
+              vid.loop = false;
+              vid.srcObject = stream;
+              vid.play().catch(() => {});
+            } catch {
+              // ignore
+            }
           }
         },
 
