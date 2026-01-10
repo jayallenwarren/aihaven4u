@@ -671,27 +671,6 @@ const speakAssistantReply = useCallback(
   const [sttListening, setSttListening] = useState(false);
   const [sttError, setSttError] = useState<string | null>(null);
 
-  const getEmbedHint = useCallback(() => {
-    if (typeof window === "undefined") return "";
-    const hint =
-      " (If this page is embedded, ensure the embed/iframe allows microphone access.)";
-    try {
-      return window.self !== window.top ? hint : "";
-    } catch {
-      return hint;
-    }
-  }, []);
-
-  const requestMicPermission = useCallback(async () => {
-    if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
-      throw new Error("Microphone access is not available in this browser.");
-    }
-
-    // Trigger the browser mic permission prompt explicitly.
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    stream.getTracks().forEach((t) => t.stop());
-  }, []);
-
 
   // Greeting once per browser session per companion
 // Fix: if companionName arrives AFTER the initial greeting timer (e.g., slow Wix postMessage),
@@ -1044,7 +1023,7 @@ const stateToSendWithCompanion: SessionState = {
     setSttListening(false);
   }
 
-  async function toggleSpeechToText() {
+  function toggleSpeechToText() {
     setSttError(null);
 
     // Stop if already listening
@@ -1060,17 +1039,6 @@ const stateToSendWithCompanion: SessionState = {
 
     if (!SpeechRecognition) {
       setSttError("Speech-to-text is not supported in this browser.");
-      return;
-    }
-
-    // Request mic permission in a user gesture (this click handler) before starting STT.
-    try {
-      await requestMicPermission();
-    } catch {
-      setSttListening(false);
-      clearSttSilenceTimer();
-      sttTranscriptRef.current = "";
-      setSttError(`Speech-to-text blocked: please allow microphone access in your browser${getEmbedHint()}`);
       return;
     }
 
@@ -1091,12 +1059,7 @@ const stateToSendWithCompanion: SessionState = {
       setSttListening(false);
       clearSttSilenceTimer();
       sttTranscriptRef.current = "";
-      const code = String(e?.error ?? "");
-      if (code === "not-allowed" || code === "service-not-allowed") {
-        setSttError(`Speech-to-text blocked: please allow microphone access in your browser${getEmbedHint()}`);
-      } else {
-        setSttError(code ? `Speech-to-text error: ${code}` : "Speech-to-text error");
-      }
+      setSttError(e?.error ? `Speech-to-text error: ${e.error}` : "Speech-to-text error");
     };
     rec.onresult = (event: any) => {
       let transcript = "";
@@ -1117,7 +1080,7 @@ const stateToSendWithCompanion: SessionState = {
     } catch {
       setSttListening(false);
       sttRecRef.current = null;
-      setSttError(`Speech-to-text could not start (microphone permission?)${getEmbedHint()}`);
+      setSttError("Speech-to-text could not start (microphone permission?)");
     }
   }
 
