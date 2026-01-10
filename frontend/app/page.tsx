@@ -87,6 +87,38 @@ function getPhase1AvatarMedia(avatarName: string | null | undefined): Phase1Avat
   return key ? PHASE1_AVATAR_MEDIA[key] : null;
 }
 
+function isDidSessionError(err: any): boolean {
+  const kind = typeof err?.kind === "string" ? err.kind : "";
+  const description = typeof err?.description === "string" ? err.description : "";
+  const message = typeof err?.message === "string" ? err.message : "";
+
+  // The SDK sometimes uses { kind, description } and sometimes uses message strings.
+  return (
+    kind === "SessionError" ||
+    description.toLowerCase().includes("session_id") ||
+    message.toLowerCase().includes("session_id")
+  );
+}
+
+function formatDidError(err: any): string {
+  if (!err) return "Unknown error";
+  if (typeof err === "string") return err;
+  if (typeof err?.message === "string") return err.message;
+
+  const kind = typeof err?.kind === "string" ? err.kind : undefined;
+  const description = typeof err?.description === "string" ? err.description : undefined;
+
+  if (kind || description) {
+    return JSON.stringify({ kind, description });
+  }
+
+  try {
+    return JSON.stringify(err);
+  } catch {
+    return String(err);
+  }
+}
+
 const UPGRADE_URL = "https://www.aihaven4u.com/pricing-plans/list";
 
 const MODE_LABELS: Record<Mode, string> = {
@@ -281,8 +313,11 @@ export default function Page() {
 const avatarVideoRef = useRef<HTMLVideoElement | null>(null);
 const didSrcObjectRef = useRef<any | null>(null);
 const didAgentMgrRef = useRef<any | null>(null);
+const didReconnectInFlightRef = useRef<boolean>(false);
 
-const [avatarStatus, setAvatarStatus] = useState<"idle" | "connecting" | "connected" | "error">(
+  const [avatarStatus, setAvatarStatus] = useState<
+    "idle" | "connecting" | "connected" | "reconnecting" | "error"
+  >(
   "idle"
 );
 const [avatarError, setAvatarError] = useState<string | null>(null);
@@ -314,6 +349,32 @@ const stopLiveAvatar = useCallback(async () => {
   }
 }, []);
 
+const reconnectLiveAvatar = useCallback(async () => {
+  const mgr = didAgentMgrRef.current;
+  if (!mgr) return;
+  if (didReconnectInFlightRef.current) return;
+
+  didReconnectInFlightRef.current = true;
+  setAvatarError(null);
+  setAvatarStatus("reconnecting");
+
+  try {
+    if (typeof (mgr as any).reconnect === "function") {
+      await (mgr as any).reconnect();
+    } else {
+      // Fallback for SDK versions without reconnect()
+      await mgr.disconnect();
+      await mgr.connect();
+    }
+  } catch (err: any) {
+    console.error("D-ID reconnect failed", err);
+    setAvatarStatus("idle");
+    setAvatarError(`Live Avatar reconnect failed: ${formatDidError(err)}`);
+  } finally {
+    didReconnectInFlightRef.current = false;
+  }
+}, []);
+
 const startLiveAvatar = useCallback(async () => {
   setAvatarError(null);
 
@@ -323,11 +384,33 @@ const startLiveAvatar = useCallback(async () => {
     return;
   }
 
-  if (avatarStatus === "connecting" || avatarStatus === "connected") return;
+  if (
+    avatarStatus === "connecting" ||
+    avatarStatus === "connected" ||
+    avatarStatus === "reconnecting"
+  )
+    return;
 
   setAvatarStatus("connecting");
 
   try {
+    // Defensive: if something is lingering from a prior attempt, disconnect & clear.
+    try {
+      if (didAgentMgrRef.current) {
+        await didAgentMgrRef.current.disconnect();
+      }
+    } catch {}
+    didAgentMgrRef.current = null;
+
+    try {
+      const existingStream = didSrcObjectRef.current;
+      if (existingStream && typeof existingStream.getTracks === "function") {
+        existingStream.getTracks().forEach((t: any) => t?.stop?.());
+      }
+    } catch {}
+    didSrcObjectRef.current = null;
+    if (avatarVideoRef.current) avatarVideoRef.current.srcObject = null;
+
     const { createAgentManager } = await import("@d-id/client-sdk");
     // NOTE: Some versions of @d-id/client-sdk ship stricter TS types (e.g., requiring
     // additional top-level fields like `mode`) that are not present in the public
@@ -339,7 +422,10 @@ const startLiveAvatar = useCallback(async () => {
       auth: { type: "key", clientKey: phase1AvatarMedia.didClientKey },
       callbacks: {
         onConnectionStateChange: (state: any) => {
-          if (state === "connected") setAvatarStatus("connected");
+          if (state === "connected") {
+            setAvatarStatus("connected");
+            setAvatarError(null);
+          }
           if (state === "disconnected" || state === "closed") setAvatarStatus("idle");
         },
 
@@ -365,11 +451,16 @@ const startLiveAvatar = useCallback(async () => {
         },
 
         onError: (err: any) => {
+          if (isDidSessionError(err)) {
+            console.warn("D-ID SessionError; attempting reconnect", err);
+            void reconnectLiveAvatar();
+            return;
+          }
           setAvatarStatus("error");
-          setAvatarError(err?.message ? String(err.message) : "Live Avatar error");
+          setAvatarError(formatDidError(err));
         },
       },
-      streamOptions: { compatibilityMode: "auto", streamWarmup: true },
+      streamOptions: { compatibilityMode: "auto", streamWarmup: true, sessionTimeout: 300 },
       } as any
     );
 
@@ -380,7 +471,7 @@ const startLiveAvatar = useCallback(async () => {
     setAvatarError(e?.message ? String(e.message) : "Failed to start Live Avatar");
     didAgentMgrRef.current = null;
   }
-}, [phase1AvatarMedia, avatarStatus]);
+}, [phase1AvatarMedia, avatarStatus, reconnectLiveAvatar]);
 
 useEffect(() => {
   // Stop when switching companions
@@ -427,17 +518,29 @@ const speakAssistantReply = useCallback(
     const audioUrl = await getTtsAudioUrl(clean, phase1AvatarMedia.elevenVoiceId);
     if (!audioUrl) return;
 
-    try {
-      await mgr.speak({
-        type: "audio",
-        audio_url: audioUrl,
-        audioType: "audio/mpeg",
-      } as any);
-    } catch (e) {
-      console.warn("D-ID speak failed:", e);
+    const speakPayload = {
+      type: "audio",
+      audio_url: audioUrl,
+      audioType: "audio/mpeg",
+    } as any;
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        await mgr.speak(speakPayload);
+        return;
+      } catch (e) {
+        if (attempt === 0 && isDidSessionError(e)) {
+          console.warn("D-ID session error during speak; reconnecting and retrying...", e);
+          await reconnectLiveAvatar();
+          continue;
+        }
+        console.warn("D-ID speak failed:", e);
+        setAvatarError(formatDidError(e));
+        return;
+      }
     }
   },
-  [avatarStatus, phase1AvatarMedia, getTtsAudioUrl]
+  [avatarStatus, phase1AvatarMedia, getTtsAudioUrl, reconnectLiveAvatar]
 );
 
   useEffect(() => {
@@ -857,7 +960,11 @@ const stateToSendWithCompanion: SessionState = {
   <section style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12, flexWrap: "wrap" }}>
     <button
       onClick={() => {
-        if (avatarStatus === "connected" || avatarStatus === "connecting") {
+        if (
+          avatarStatus === "connected" ||
+          avatarStatus === "connecting" ||
+          avatarStatus === "reconnecting"
+        ) {
           void stopLiveAvatar();
         } else {
           void startLiveAvatar();
@@ -873,7 +980,9 @@ const stateToSendWithCompanion: SessionState = {
         fontWeight: 700,
       }}
     >
-      {avatarStatus === "connected" || avatarStatus === "connecting"
+      {avatarStatus === "connected" ||
+      avatarStatus === "connecting" ||
+      avatarStatus === "reconnecting"
         ? "Stop Live Avatar"
         : "Start Live Avatar"}
     </button>
