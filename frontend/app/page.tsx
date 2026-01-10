@@ -279,6 +279,7 @@ export default function Page() {
 // Phase 1: Live Avatar (D-ID) + TTS (ElevenLabs -> Azure Blob)
 // ----------------------------
 const avatarVideoRef = useRef<HTMLVideoElement | null>(null);
+const didSrcObjectRef = useRef<any | null>(null);
 const didAgentMgrRef = useRef<any | null>(null);
 
 const [avatarStatus, setAvatarStatus] = useState<"idle" | "connecting" | "connected" | "error">(
@@ -329,26 +330,40 @@ const startLiveAvatar = useCallback(async () => {
   try {
     const { createAgentManager } = await import("@d-id/client-sdk");
     const mgr = await createAgentManager(phase1AvatarMedia.didAgentId, {
-      auth: { key: phase1AvatarMedia.didClientKey },
+      auth: { type: "key", clientKey: phase1AvatarMedia.didClientKey },
       callbacks: {
-        onConnectionStateChange: (state) => {
+        onConnectionStateChange: (state: any) => {
           if (state === "connected") setAvatarStatus("connected");
-          if (state === "disconnected") setAvatarStatus("idle");
+          if (state === "disconnected" || state === "closed") setAvatarStatus("idle");
         },
-        onVideoStateChange: (_state, stream) => {
-          if (!stream) return;
-          const vid = avatarVideoRef.current;
-          if (!vid) return;
 
-          vid.srcObject = stream;
-          vid.play().catch(() => {});
+        // Mandatory per D-ID docs: bind the streamed MediaStream to the <video>.
+        onSrcObjectReady: (value: any) => {
+          didSrcObjectRef.current = value;
+          const vid = avatarVideoRef.current;
+          if (vid) {
+            vid.srcObject = value;
+            vid.play().catch(() => {});
+          }
+          return value;
         },
-        onError: (err) => {
+
+        onVideoStateChange: (state: any) => {
+          if (state === "STOP") return;
+          const vid = avatarVideoRef.current;
+          const stream = didSrcObjectRef.current;
+          if (vid && stream) {
+            vid.srcObject = stream;
+            vid.play().catch(() => {});
+          }
+        },
+
+        onError: (err: any) => {
           setAvatarStatus("error");
           setAvatarError(err?.message ? String(err.message) : "Live Avatar error");
         },
       },
-      streamOptions: { compat: "auto" },
+      streamOptions: { compatibilityMode: "auto", streamWarmup: true },
     });
 
     didAgentMgrRef.current = mgr;
