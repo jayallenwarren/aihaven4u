@@ -536,7 +536,7 @@ const startLiveAvatar = useCallback(async () => {
           setAvatarError(formatDidError(err));
         },
       },
-      streamOptions: { compatibilityMode: "auto", streamWarmup: true, sessionTimeout: 300 },
+      streamOptions: { compatibilityMode: "auto", streamWarmup: true },
       } as any
     );
 
