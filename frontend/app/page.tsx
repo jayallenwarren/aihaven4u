@@ -2,7 +2,6 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import havenHeart from "../public/ai-haven-heart.png";
-import type { AgentManager } from "@d-id/client-sdk";
 
 type Role = "user" | "assistant";
 type Msg = { role: Role; content: string };
@@ -270,11 +269,17 @@ function normalizeMode(raw: any): Mode | null {
 export default function Page() {
   const sessionIdRef = useRef<string | null>(null);
 
+  // Companion identity (drives persona + Phase 1 live avatar mapping)
+  const [companionName, setCompanionName] = useState<string>(DEFAULT_COMPANION_NAME);
+  const [avatarSrc, setAvatarSrc] = useState<string>(DEFAULT_AVATAR);
+  const [companionKey, setCompanionKey] = useState<string>("");
+
+
 // ----------------------------
 // Phase 1: Live Avatar (D-ID) + TTS (ElevenLabs -> Azure Blob)
 // ----------------------------
 const avatarVideoRef = useRef<HTMLVideoElement | null>(null);
-const didAgentMgrRef = useRef<AgentManager | null>(null);
+const didAgentMgrRef = useRef<any | null>(null);
 
 const [avatarStatus, setAvatarStatus] = useState<"idle" | "connecting" | "connected" | "error">(
   "idle"
@@ -441,10 +446,6 @@ const speakAssistantReply = useCallback(
 
   const [planName, setPlanName] = useState<PlanName>(null);
   const [allowedModes, setAllowedModes] = useState<Mode[]>(["friend"]);
-
-  const [companionName, setCompanionName] = useState<string>(DEFAULT_COMPANION_NAME);
-  const [avatarSrc, setAvatarSrc] = useState<string>(DEFAULT_AVATAR);
-  const [companionKey, setCompanionKey] = useState<string>("");
 
   const modePills = useMemo(() => ["friend", "romantic", "intimate"] as const, []);
   const scrollRef = useRef<HTMLDivElement>(null);
