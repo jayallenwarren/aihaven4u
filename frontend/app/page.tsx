@@ -80,6 +80,46 @@ const PHASE1_AVATAR_MEDIA: Record<string, Phase1AvatarMedia> = {
   }
 } as any;
 
+const ELEVEN_VOICE_ID_BY_COMPANION: Record<string, string> = {
+  "Haven": "rJ9XoWu8gbUhVKZnKY8X",
+  "Jennifer": "19STyYD15bswVz51nqLf",
+  "Jason": "j0jBf06B5YHDbCWVmlmr",
+  "Tonya": "Hybl6rg76ZOcgqZqN5WN",
+  "Darnell": "gYr8yTP0q4RkX1HnzQfX",
+  "Michelle": "ui11Rd52NKH2DbWlcbvw",
+  "Daniel": "tcO8jJ1XXzdQ4pzViV9c",
+  "Veronica": "GDzHdQOi6jjf8zaXhCYD",
+  "Ricardo": "l1zE9xgNpUTaQCZzpNJa",
+  "Linda": "flHkNRp1BlvT73UL6gyz",
+  "Robert": "uA0L9FxeLpzlG615Ueay",
+  "Patricia": "zwbQ2XUiIlOKD6b3JWXd",
+  "Clarence": "CXAc4DNZL6wonQQNlNgZ",
+  "Mei": "bQQWtYx9EodAqMdkrNAc",
+  "Minh": "cALE2CwoMM2QxiEdDEhv",
+  "Maria": "WLjZnm4PkNmYtNCyiCq8",
+  "Jose": "IP2syKL31S2JthzSSfZH",
+  "Ashley": "GbDIo39THauInuigCmPM",
+  "Ryan": "qIT7IrVUa21IEiKE1lug",
+  "Latoya": "BZgkqPqms7Kj9ulSkVzn",
+  "Jamal": "3w1kUvxu1LioQcLgp1KY",
+  "Tiffany": "XeomjLZoU5rr4yNIg16w",
+  "Kevin": "69Na567Zr0bPvmBYuGdc",
+  "Adriana": "FGLJyeekUzxl8M3CTG9M",
+  "Miguel": "dlGxemPxFMTY7iXagmOj",
+} as any;
+
+function getElevenVoiceId(avatarName: string | null | undefined): string | null {
+  if (!avatarName) return null;
+
+  const direct = ELEVEN_VOICE_ID_BY_COMPANION[avatarName];
+  if (direct) return direct;
+
+  const key = Object.keys(ELEVEN_VOICE_ID_BY_COMPANION).find(
+    (k) => k.toLowerCase() === avatarName.toLowerCase()
+  );
+  return key ? ELEVEN_VOICE_ID_BY_COMPANION[key] : null;
+}
+
 function getPhase1AvatarMedia(avatarName: string | null | undefined): Phase1AvatarMedia | null {
   if (!avatarName) return null;
 
@@ -327,6 +367,10 @@ const didReconnectInFlightRef = useRef<boolean>(false);
 );
 const [avatarError, setAvatarError] = useState<string | null>(null);
 
+// Local (non-live-avatar) ElevenLabs audio playback
+const localTtsAudioRef = useRef<HTMLAudioElement | null>(null);
+const localTtsCleanupRef = useRef<(() => void) | null>(null);
+
 const phase1AvatarMedia = useMemo(() => getPhase1AvatarMedia(companionName), [companionName]);
 
   // UI layout
@@ -564,7 +608,7 @@ useEffect(() => {
   void stopLiveAvatar();
 }, [companionKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
-const getTtsAudioUrl = useCallback(async (text: string, voiceId: string): Promise<string | null> => {
+const getTtsAudioUrl = useCallback(async (text: string, voiceId: string, signal?: AbortSignal): Promise<string | null> => {
   try {
     const res = await fetch(`${API_BASE}/tts/audio-url`, {
       method: "POST",
@@ -598,6 +642,137 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string): Promis
     // Called when we cannot / did not speak via D-ID.
     onDidNotSpeak?: () => void;
   };
+
+  // Local TTS playback (used when Live Avatar is NOT connected, but STT is enabled)
+  const stopLocalTtsAudio = useCallback(() => {
+    try {
+      localTtsCleanupRef.current?.();
+    } catch {
+      // ignore
+    }
+    localTtsCleanupRef.current = null;
+
+    try {
+      const a = localTtsAudioRef.current;
+      if (a) {
+        a.pause();
+        a.src = "";
+        // Best-effort release
+        try {
+          (a as any).srcObject = null;
+        } catch {
+          // ignore
+        }
+        try {
+          (a as any).load?.();
+        } catch {
+          // ignore
+        }
+      }
+    } catch {
+      // ignore
+    }
+
+    localTtsAudioRef.current = null;
+  }, []);
+
+  const speakLocalTtsAudio = useCallback(
+    async (audioUrl: string | null, hooks?: SpeakAssistantHooks): Promise<void> => {
+      const url = (audioUrl || "").trim();
+      if (!url) {
+        try {
+          hooks?.onDidNotSpeak?.();
+        } catch {
+          // ignore
+        }
+        return;
+      }
+
+      // Stop any previous playback
+      stopLocalTtsAudio();
+
+      await new Promise<void>((resolve) => {
+        if (typeof Audio === "undefined") {
+          try {
+            hooks?.onDidNotSpeak?.();
+          } catch {
+            // ignore
+          }
+          return resolve();
+        }
+
+        const audio = new Audio(url);
+        audio.preload = "auto";
+        try {
+          (audio as any).crossOrigin = "anonymous";
+        } catch {
+          // ignore
+        }
+
+        localTtsAudioRef.current = audio;
+
+        let doneCalled = false;
+        let myCleanup: (() => void) | null = null;
+
+        const done = () => {
+          if (doneCalled) return;
+          doneCalled = true;
+
+          try {
+            audio.removeEventListener("ended", done);
+            audio.removeEventListener("error", done);
+          } catch {
+            // ignore
+          }
+
+          if (localTtsCleanupRef.current === myCleanup) {
+            localTtsCleanupRef.current = null;
+          }
+          if (localTtsAudioRef.current === audio) {
+            localTtsAudioRef.current = null;
+          }
+
+          resolve();
+        };
+
+        myCleanup = () => {
+          try {
+            audio.pause();
+          } catch {
+            // ignore
+          }
+          done();
+        };
+
+        // Allow stopConversation() to interrupt the current local playback and release the promise.
+        localTtsCleanupRef.current = myCleanup;
+
+        audio.addEventListener("ended", done);
+        audio.addEventListener("error", done);
+
+        // Start playback; only then signal onWillSpeak so the UI can delay the text until audio begins.
+        audio
+          .play()
+          .then(() => {
+            try {
+              hooks?.onWillSpeak?.();
+            } catch {
+              // ignore
+            }
+          })
+          .catch((e) => {
+            console.warn("Local TTS play() failed:", e);
+            try {
+              hooks?.onDidNotSpeak?.();
+            } catch {
+              // ignore
+            }
+            myCleanup?.();
+          });
+      });
+    },
+    [stopLocalTtsAudio]
+  );
 
 const speakAssistantReply = useCallback(
     async (replyText: string, hooks?: SpeakAssistantHooks, audioUrlOverride?: string | null) => {
@@ -976,16 +1151,18 @@ const stateToSendWithCompanion: SessionState = {
 };
 
     // Backend-side optimization:
-    // If Live Avatar is connected and this companion is in Phase 1, ask /chat to also generate TTS
-    // and return audio_url in the same response (skips an extra /tts/audio-url round-trip).
+    // Request audio_url from the backend whenever:
+    // - Live Avatar is connected (so we can lip-sync), OR
+    // - Hands-free STT is enabled (so we can play voice-only TTS even without Live Avatar)
     const voice_id =
-      avatarStatus === "connected" && phase1AvatarMedia?.elevenVoiceId
-        ? phase1AvatarMedia.elevenVoiceId
+      avatarStatus === "connected" || sttEnabledRef.current
+        ? getElevenVoiceId(companionName) || undefined
         : undefined;
 
     const res = await fetch(`${API_BASE}/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      signal,
       body: JSON.stringify({
         session_id,
         wants_explicit,
@@ -1193,26 +1370,53 @@ const stateToSendWithCompanion: SessionState = {
       };
       const estimatedSpeechMs = estimateSpeechMs(replyText);
 
-      const speakPromise = Promise.resolve(
-        speakAssistantReply(replyText, {
-          onWillSpeak: () => {
-            // STT ducking window (only when we are actually about to speak)
-            sttIgnoreUntilRef.current = Math.max(
-              sttIgnoreUntilRef.current,
-              Date.now() + estimatedSpeechMs + 1_200
-            );
-            commitAssistantMessage();
-          },
-          onDidNotSpeak: () => {
-            commitAssistantMessage();
-          },
-        }, audioUrlFromChat)
-      ).catch(() => {
-        // Safety: ensure the message appears even if speech throws before hooks are called.
-        commitAssistantMessage();
-      });
+            const voiceIdForTts = getElevenVoiceId(companionName);
+            const wantsVoiceOnly = resumeSttAfter && avatarStatus !== "connected";
 
-      // If STT is enabled, resume listening only after the avatar finishes speaking.
+            const speakHooks: SpeakAssistantHooks = {
+              onWillSpeak: () => {
+                // STT ducking window (only when we are actually about to speak)
+                sttIgnoreUntilRef.current = Math.max(
+                  sttIgnoreUntilRef.current,
+                  Date.now() + estimatedSpeechMs + 1200
+                );
+
+                // Commit assistant text only once and only when we are about to speak (so UI syncs)
+                commitAssistantMessage();
+              },
+              onDidNotSpeak: () => {
+                commitAssistantMessage();
+              },
+            };
+
+            let speakPromise: Promise<void>;
+
+            if (avatarStatus === "connected") {
+              speakPromise = Promise.resolve(
+                speakAssistantReply(replyText, speakHooks, audioUrlFromChat)
+              ).catch(() => {
+                // Safety: ensure the message appears even if speech throws before hooks are called.
+                commitAssistantMessage();
+              });
+            } else if (wantsVoiceOnly && voiceIdForTts) {
+              // Voice-only TTS (no Live Avatar). Prefer /chat-provided audio_url; fallback to /tts/audio-url.
+              let audioUrlForLocal: string | null = audioUrlFromChat;
+              if (!audioUrlForLocal) {
+                audioUrlForLocal = await getTtsAudioUrl(replyText, voiceIdForTts, controller?.signal);
+              }
+
+              speakPromise = Promise.resolve(
+                speakLocalTtsAudio(audioUrlForLocal, speakHooks)
+              ).catch(() => {
+                commitAssistantMessage();
+              });
+            } else {
+              // No speech; show the assistant message immediately.
+              commitAssistantMessage();
+              speakPromise = Promise.resolve();
+            }
+
+// If STT is enabled, resume listening only after the avatar finishes speaking.
       if (resumeSttAfter) {
         resumeScheduled = true;
         speakPromise.finally(() => {
@@ -1530,6 +1734,9 @@ const stateToSendWithCompanion: SessionState = {
     // Stop hands-free STT immediately
     stopSpeechToText();
 
+    // Stop any local (non-live-avatar) audio playback
+    stopLocalTtsAudio();
+
     // Clear any in-progress transcript/input to avoid accidental re-sends
     try {
       sttFinalRef.current = "";
@@ -1555,7 +1762,7 @@ const stateToSendWithCompanion: SessionState = {
     } catch (e) {
       console.warn("Stop conversation: unable to interrupt/disconnect D-ID agent:", e);
     }
-  }, [stopSpeechToText]);
+  }, [stopSpeechToText, stopLocalTtsAudio]);
 
   // Dedicated stop button (stops conversation, not just mic)
   const stopHandsFreeSTT = useCallback(() => {
