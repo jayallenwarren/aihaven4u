@@ -81,7 +81,6 @@ const PHASE1_AVATAR_MEDIA: Record<string, Phase1AvatarMedia> = {
 } as any;
 
 const ELEVEN_VOICE_ID_BY_COMPANION: Record<string, string> = {
-  "Haven": "rJ9XoWu8gbUhVKZnKY8X",
   "Jennifer": "19STyYD15bswVz51nqLf",
   "Jason": "j0jBf06B5YHDbCWVmlmr",
   "Tonya": "Hybl6rg76ZOcgqZqN5WN",
@@ -106,70 +105,7 @@ const ELEVEN_VOICE_ID_BY_COMPANION: Record<string, string> = {
   "Kevin": "69Na567Zr0bPvmBYuGdc",
   "Adriana": "FGLJyeekUzxl8M3CTG9M",
   "Miguel": "dlGxemPxFMTY7iXagmOj",
-} as any;
-
-function getElevenVoiceId(avatarName: string | null | undefined): string | null {
-  if (!avatarName) return null;
-
-  const direct = ELEVEN_VOICE_ID_BY_COMPANION[avatarName];
-  if (direct) return direct;
-
-  const key = Object.keys(ELEVEN_VOICE_ID_BY_COMPANION).find(
-    (k) => k.toLowerCase() === avatarName.toLowerCase()
-  );
-  return key ? ELEVEN_VOICE_ID_BY_COMPANION[key] : null;
-}
-
-function getPhase1AvatarMedia(avatarName: string | null | undefined): Phase1AvatarMedia | null {
-  if (!avatarName) return null;
-
-  const direct = PHASE1_AVATAR_MEDIA[avatarName];
-  if (direct) return direct;
-
-  const key = Object.keys(PHASE1_AVATAR_MEDIA).find(
-    (k) => k.toLowerCase() === avatarName.toLowerCase()
-  );
-  return key ? PHASE1_AVATAR_MEDIA[key] : null;
-}
-
-function isDidSessionError(err: any): boolean {
-  const kind = typeof err?.kind === "string" ? err.kind : "";
-  const description = typeof err?.description === "string" ? err.description : "";
-  const message = typeof err?.message === "string" ? err.message : "";
-
-  // The SDK sometimes uses { kind, description } and sometimes uses message strings.
-  return (
-    kind === "SessionError" ||
-    description.toLowerCase().includes("session_id") ||
-    message.toLowerCase().includes("session_id")
-  );
-}
-
-function formatDidError(err: any): string {
-  if (!err) return "Unknown error";
-  if (typeof err === "string") return err;
-  if (typeof err?.message === "string") return err.message;
-
-  const kind = typeof err?.kind === "string" ? err.kind : undefined;
-  const description = typeof err?.description === "string" ? err.description : undefined;
-
-  if (kind || description) {
-    return JSON.stringify({ kind, description });
-  }
-
-  try {
-    return JSON.stringify(err);
-  } catch {
-    return String(err);
-  }
-}
-
-const UPGRADE_URL = "https://www.aihaven4u.com/pricing-plans/list";
-
-const MODE_LABELS: Record<Mode, string> = {
-  friend: "Friend",
-  romantic: "Romantic",
-  intimate: "Intimate (18+)",
+  "Haven": "rJ9XoWu8gbUhVKZnKY8X",
 };
 
 const ROMANTIC_ALLOWED_PLANS: PlanName[] = [
