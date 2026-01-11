@@ -1220,7 +1220,7 @@ const stateToSendWithCompanion: SessionState = {
       sttInterimRef.current = "";
 
       void sendRef.current(text);
-    }, 2000);
+    }, 1500);
   }, [getCurrentSttText, pauseSpeechToText]);
 
   const requestMicPermission = useCallback(async () => {
