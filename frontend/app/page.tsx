@@ -569,6 +569,7 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string): Promis
     const res = await fetch(`${API_BASE}/tts/audio-url`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      signal,
       body: JSON.stringify({
         session_id: sessionIdRef.current || "anon",
         voice_id: voiceId,
@@ -813,6 +814,10 @@ const speakAssistantReply = useCallback(
   const sttInterimRef = useRef<string>("");
   const sttIgnoreUntilRef = useRef<number>(0); // suppress STT while avatar is speaking (prevents feedback loop)
 
+  // Stop/cancel coordination (Stop button can abort in-flight /chat and interrupt avatar speech)
+  const stopSeqRef = useRef<number>(0);
+  const chatAbortRef = useRef<AbortController | null>(null);
+
   const [sttEnabled, setSttEnabled] = useState(false);
   const [sttRunning, setSttRunning] = useState(false);
   const [sttError, setSttError] = useState<string | null>(null);
@@ -945,7 +950,7 @@ useEffect(() => {
     return () => window.removeEventListener("message", onMessage);
   }, []);
 
-  async function callChat(nextMessages: Msg[], stateToSend: SessionState): Promise<ChatApiResponse> {
+  async function callChat(nextMessages: Msg[], stateToSend: SessionState, signal?: AbortSignal): Promise<ChatApiResponse> {
     if (!API_BASE) throw new Error("NEXT_PUBLIC_API_BASE_URL is not set");
 
     const session_id =
@@ -1088,9 +1093,20 @@ const stateToSendWithCompanion: SessionState = {
     setInput("");
     setLoading(true);
 
+    const myStopSeq = stopSeqRef.current;
+    let controller: AbortController | null = null;
+
     try {
       const sendState: SessionState = { ...nextState, ...(stateOverride || {}) };
-      const data = await callChat(nextMessages, sendState);
+      controller = new AbortController();
+      chatAbortRef.current = controller;
+
+      const data = await callChat(nextMessages, sendState, controller.signal);
+
+      // If Stop was clicked while request was in flight, ignore this response.
+      if (myStopSeq !== stopSeqRef.current) {
+        return;
+      }
 
       // status from backend (safe/explicit_blocked/explicit_allowed)
       if (data.mode === "safe" || data.mode === "explicit_blocked" || data.mode === "explicit_allowed") {
@@ -1204,11 +1220,24 @@ const stateToSendWithCompanion: SessionState = {
         });
       }
     } catch (err: any) {
-      setMessages((prev) => [
-        ...prev,
-        { role: "assistant", content: `Error: ${err?.message ?? "Unknown error"}` },
-      ]);
+      // If Stop was clicked (or the request was aborted), swallow the error to avoid a confusing "Error: aborted" bubble.
+      const aborted =
+        controller?.signal?.aborted ||
+        err?.name === "AbortError" ||
+        String(err?.message || "").toLowerCase().includes("aborted");
+
+      if (aborted || myStopSeq !== stopSeqRef.current) {
+        // no-op (intentional)
+      } else {
+        setMessages((prev) => [
+          ...prev,
+          { role: "assistant", content: `Error: ${err?.message ?? "Unknown error"}` },
+        ]);
+      }
     } finally {
+      // Clear the active abort controller (if it is still ours)
+      if (chatAbortRef.current === controller) chatAbortRef.current = null;
+
       setLoading(false);
       if (resumeSttAfter && !resumeScheduled) {
         // No speech was triggered (e.g., request failed). Resume immediately.
@@ -1485,10 +1514,53 @@ const stateToSendWithCompanion: SessionState = {
     await startSpeechToText();
   }, [startSpeechToText, stopSpeechToText]);
 
-  // Dedicated stop button for STT (so the user can stop listening even when Live Avatar isn't used)
-  const stopHandsFreeSTT = useCallback(() => {
+  // Stop conversation: abort in-flight /chat, stop hands-free STT, and interrupt the Live Avatar if it's speaking.
+  const stopConversation = useCallback(async () => {
+    // Bump stop sequence so in-flight async work can self-cancel
+    stopSeqRef.current += 1;
+
+    // Abort any in-flight chat request
+    try {
+      chatAbortRef.current?.abort();
+    } catch {
+      // ignore
+    }
+    chatAbortRef.current = null;
+
+    // Stop hands-free STT immediately
     stopSpeechToText();
+
+    // Clear any in-progress transcript/input to avoid accidental re-sends
+    try {
+      sttFinalRef.current = "";
+      sttInterimRef.current = "";
+    } catch {
+      // ignore
+    }
+    setInput("");
+
+    // If Live Avatar is connected, attempt to interrupt speech (Premium+ Fluent).
+    // If interrupt isn't supported, disconnect as a safe fallback to stop audio/video.
+    try {
+      const mgr: any = didAgentMgrRef.current;
+      if (mgr) {
+        if (typeof mgr.interrupt === "function") {
+          await mgr.interrupt({ type: "click" });
+        } else if (typeof mgr.disconnect === "function") {
+          await mgr.disconnect();
+          didAgentMgrRef.current = null;
+          setAvatarStatus("idle");
+        }
+      }
+    } catch (e) {
+      console.warn("Stop conversation: unable to interrupt/disconnect D-ID agent:", e);
+    }
   }, [stopSpeechToText]);
+
+  // Dedicated stop button (stops conversation, not just mic)
+  const stopHandsFreeSTT = useCallback(() => {
+    void stopConversation();
+  }, [stopConversation]);
 
   // Cleanup
   useEffect(() => {
@@ -1731,7 +1803,7 @@ const stateToSendWithCompanion: SessionState = {
               <button
                 type="button"
                 onClick={stopHandsFreeSTT}
-                title="Stop listening"
+                title="Stop conversation"
                 style={{
                   width: 44,
                   minWidth: 44,
