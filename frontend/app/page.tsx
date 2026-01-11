@@ -664,12 +664,23 @@ const speakAssistantReply = useCallback(
     el.scrollTop = el.scrollHeight;
   }, [messages, loading]);
 
-  // Speech-to-text (Web Speech API)
+  // Speech-to-text (Web Speech API): "hands-free" mode
+  // - User clicks mic once to start/stop
+  // - Auto-sends after 2s of silence
+  // - Automatically restarts recognition when it stops (browser behavior)
   const sttRecRef = useRef<any>(null);
   const sttSilenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const sttTranscriptRef = useRef<string>("");
-  const [sttListening, setSttListening] = useState(false);
+  const sttRestartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const sttFinalRef = useRef<string>("");
+  const sttInterimRef = useRef<string>("");
+
+  const [sttEnabled, setSttEnabled] = useState(false);
+  const [sttRunning, setSttRunning] = useState(false);
   const [sttError, setSttError] = useState<string | null>(null);
+
+  const sttEnabledRef = useRef<boolean>(false);
+  const sttPausedRef = useRef<boolean>(false);
 
   const getEmbedHint = useCallback(() => {
     if (typeof window === "undefined") return "";
@@ -680,16 +691,6 @@ const speakAssistantReply = useCallback(
     } catch {
       return hint;
     }
-  }, []);
-
-  const requestMicPermission = useCallback(async () => {
-    if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
-      throw new Error("Microphone access is not available in this browser.");
-    }
-
-    // Trigger the browser mic permission prompt explicitly.
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    stream.getTracks().forEach((t) => t.stop());
   }, []);
 
 
@@ -924,6 +925,18 @@ const stateToSendWithCompanion: SessionState = {
     const userMsg: Msg = { role: "user", content: outgoingText };
     const nextMessages: Msg[] = [...messages, userMsg];
 
+    // If speech-to-text "hands-free" mode is enabled, pause recognition while we send
+    // and while the avatar speaks. We'll auto-resume after speaking finishes.
+    const resumeSttAfter = sttEnabledRef.current;
+    let resumeScheduled = false;
+    if (resumeSttAfter) {
+      pauseSpeechToText();
+
+      // Defensive: clear any in-progress transcript to avoid accidental duplicate sends.
+      sttFinalRef.current = "";
+      sttInterimRef.current = "";
+    }
+
     setMessages(nextMessages);
     setInput("");
     setLoading(true);
@@ -994,7 +1007,16 @@ const stateToSendWithCompanion: SessionState = {
       setMessages((prev) => [...prev, { role: "assistant", content: data.reply }]);
 
       // Phase 1: Speak the assistant reply (if Live Avatar is connected)
-      void speakAssistantReply(String(data.reply || ""));
+      const replyText = String(data.reply || "");
+      const speakPromise = Promise.resolve(speakAssistantReply(replyText)).catch(() => {});
+
+      // If STT is enabled, resume listening only after the avatar finishes speaking.
+      if (resumeSttAfter) {
+        resumeScheduled = true;
+        speakPromise.finally(() => {
+          if (sttEnabledRef.current) resumeSpeechToText();
+        });
+      }
     } catch (err: any) {
       setMessages((prev) => [
         ...prev,
@@ -1002,8 +1024,18 @@ const stateToSendWithCompanion: SessionState = {
       ]);
     } finally {
       setLoading(false);
+      if (resumeSttAfter && !resumeScheduled) {
+        // No speech was triggered (e.g., request failed). Resume immediately.
+        if (sttEnabledRef.current) resumeSpeechToText();
+      }
     }
   }
+
+  // Keep a ref to the latest send() callback so STT handlers don't close over stale state.
+  const sendRef = useRef(send);
+  useEffect(() => {
+    sendRef.current = send;
+  }, [send]);
 
   function clearSttSilenceTimer() {
     if (sttSilenceTimerRef.current) {
@@ -1014,123 +1046,265 @@ const stateToSendWithCompanion: SessionState = {
     }
   }
 
-  function scheduleSttAutoSend() {
-    clearSttSilenceTimer();
+  function clearSttRestartTimer() {
+    if (sttRestartTimerRef.current) {
+      try {
+        clearTimeout(sttRestartTimerRef.current);
+      } catch {}
+      sttRestartTimerRef.current = null;
+    }
+  }
 
-    // If the user is silent for 2 seconds, treat it as the end of the utterance.
+  const getCurrentSttText = useCallback(() => {
+    const finalText = sttFinalRef.current.trim();
+    const interimText = sttInterimRef.current.trim();
+    return `${finalText} ${interimText}`.trim();
+  }, []);
+
+  const pauseSpeechToText = useCallback(() => {
+    if (!sttEnabledRef.current) return;
+    sttPausedRef.current = true;
+    clearSttSilenceTimer();
+    clearSttRestartTimer();
+    try {
+      const rec = sttRecRef.current;
+      if (rec?.stop) rec.stop();
+    } catch {}
+  }, []);
+
+  const resumeSpeechToText = useCallback(() => {
+    if (!sttEnabledRef.current) return;
+    sttPausedRef.current = false;
+    clearSttRestartTimer();
+    try {
+      const rec = sttRecRef.current;
+      if (!rec?.start) return;
+      rec.start();
+    } catch {
+      // Ignore InvalidStateError if already started.
+    }
+  }, []);
+
+  const scheduleSttAutoSend = useCallback(() => {
+    if (!sttEnabledRef.current) return;
+
+    clearSttSilenceTimer();
     sttSilenceTimerRef.current = setTimeout(() => {
-      const text = sttTranscriptRef.current.trim();
+      const text = getCurrentSttText();
       if (!text) return;
 
-      // Stop STT before sending so we don't pick up the avatar's audio.
-      try {
-        sttRecRef.current?.stop?.();
-      } catch {}
+    // If speech-to-text "hands-free" mode is enabled, pause recognition while we send
+    // and while the avatar speaks. We'll auto-resume after speaking finishes.
+    const resumeSttAfter = sttEnabledRef.current;
+    let resumeScheduled = false;
+    if (resumeSttAfter) {
+      pauseSpeechToText();
 
-      setSttListening(false);
-      sttSilenceTimerRef.current = null;
-      sttTranscriptRef.current = "";
-
-      void send(text);
-    }, 2000);
-  }
-
-  function stopSpeechToText() {
-    clearSttSilenceTimer();
-    sttTranscriptRef.current = "";
-    try {
-      sttRecRef.current?.stop?.();
-    } catch {}
-    setSttListening(false);
-  }
-
-  async function toggleSpeechToText() {
-    setSttError(null);
-
-    // Stop if already listening
-    if (sttListening) {
-      stopSpeechToText();
-      return;
+      // Defensive: clear any in-progress transcript to avoid accidental duplicate sends.
+      sttFinalRef.current = "";
+      sttInterimRef.current = "";
     }
 
-    if (typeof window === "undefined") return;
+      // Stop listening while we send + while the avatar speaks, but keep STT enabled.
+      pauseSpeechToText();
 
-    const SpeechRecognition =
+      // Clear current transcript so the next turn starts clean.
+      sttFinalRef.current = "";
+      sttInterimRef.current = "";
+
+      void sendRef.current(text);
+    }, 2000);
+  }, [getCurrentSttText, pauseSpeechToText]);
+
+  const requestMicPermission = useCallback(async () => {
+    // IMPORTANT:
+    // - Must be triggered by a user gesture (e.g., mic button click), or browsers may block it.
+    // - If embedded, the embedding iframe must include: allow="microphone"
+    if (typeof window === "undefined" || !navigator?.mediaDevices?.getUserMedia) return false;
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // Immediately stop tracks. We only need to trigger the permission prompt / verify access.
+      for (const track of stream.getTracks()) {
+        try {
+          track.stop();
+        } catch {}
+      }
+      return true;
+    } catch (e: any) {
+      const msg = String(e?.name || e?.message || "");
+      if (msg.toLowerCase().includes("notallowed") || msg.toLowerCase().includes("permission")) {
+        setSttError(getEmbedHint());
+      } else {
+        setSttError(`Speech-to-text error: ${msg || "microphone not available"}`);
+      }
+      return false;
+    }
+  }, [getEmbedHint]);
+
+  const ensureSpeechRecognition = useCallback(() => {
+    if (typeof window === "undefined") return null;
+
+    const SpeechRecognitionCtor =
       (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
 
-    if (!SpeechRecognition) {
+    if (!SpeechRecognitionCtor) return null;
+
+    if (sttRecRef.current) return sttRecRef.current;
+
+    const rec = new SpeechRecognitionCtor();
+    rec.lang = "en-US";
+    rec.continuous = true;
+    rec.interimResults = true;
+
+    rec.onstart = () => {
+      setSttRunning(true);
+    };
+
+    rec.onend = () => {
+      setSttRunning(false);
+
+      // Browsers often end recognition automatically (silence, time limits, etc).
+      // If STT is enabled and not intentionally paused, restart.
+      if (sttEnabledRef.current && !sttPausedRef.current) {
+        clearSttRestartTimer();
+        sttRestartTimerRef.current = setTimeout(() => {
+          try {
+            rec.start();
+          } catch {}
+        }, 250);
+      }
+    };
+
+    rec.onerror = (event: any) => {
+      const code = String(event?.error || "");
+      if (code === "not-allowed" || code === "service-not-allowed") {
+        // Hard block — stop "hands-free" mode until user explicitly starts again.
+        sttEnabledRef.current = false;
+        sttPausedRef.current = false;
+        setSttEnabled(false);
+        setSttRunning(false);
+        clearSttSilenceTimer();
+        clearSttRestartTimer();
+        setSttError(getEmbedHint());
+        return;
+      }
+
+      if (code === "audio-capture") {
+        setSttError("Speech-to-text error: audio-capture (no microphone found).");
+        return;
+      }
+
+      // Other errors are often transient (no-speech, aborted, network). Let onend handle restart.
+    };
+
+    rec.onresult = (event: any) => {
+      try {
+        const results = event?.results;
+        if (!results) return;
+
+        let finalText = "";
+        let interimText = "";
+
+        for (let i = 0; i < results.length; i++) {
+          const res = results[i];
+          const t = String(res?.[0]?.transcript || "");
+          if (res?.isFinal) finalText += t;
+          else interimText += t;
+        }
+
+        sttFinalRef.current = finalText.trim();
+        sttInterimRef.current = interimText.trim();
+
+        const combined = getCurrentSttText();
+        if (combined) setInput(combined);
+
+        scheduleSttAutoSend();
+      } catch {}
+    };
+
+    sttRecRef.current = rec;
+    return rec;
+  }, [getCurrentSttText, scheduleSttAutoSend, getEmbedHint]);
+
+  const startSpeechToText = useCallback(async () => {
+    setSttError(null);
+
+    // 1) Ask for mic permission (or validate it)
+    const ok = await requestMicPermission();
+    if (!ok) return;
+
+    // 2) Ensure SpeechRecognition exists
+    const rec = ensureSpeechRecognition();
+    if (!rec) {
       setSttError("Speech-to-text is not supported in this browser.");
       return;
     }
 
-    // Request mic permission in a user gesture (this click handler) before starting STT.
-    try {
-      await requestMicPermission();
-    } catch {
-      setSttListening(false);
-      clearSttSilenceTimer();
-      sttTranscriptRef.current = "";
-      setSttError(`Speech-to-text blocked: please allow microphone access in your browser${getEmbedHint()}`);
-      return;
-    }
-
-    // Always create a fresh recognition instance to avoid stale handlers.
-    const rec = new SpeechRecognition();
-    sttRecRef.current = rec;
-    sttTranscriptRef.current = "";
-    clearSttSilenceTimer();
-
-    rec.continuous = true;
-    rec.interimResults = true;
-    rec.lang = "en-US";
-    rec.maxAlternatives = 1;
-
-    rec.onstart = () => setSttListening(true);
-    rec.onend = () => setSttListening(false);
-    rec.onerror = (e: any) => {
-      setSttListening(false);
-      clearSttSilenceTimer();
-      sttTranscriptRef.current = "";
-      const code = String(e?.error ?? "");
-      if (code === "not-allowed" || code === "service-not-allowed") {
-        setSttError(`Speech-to-text blocked: please allow microphone access in your browser${getEmbedHint()}`);
-      } else {
-        setSttError(code ? `Speech-to-text error: ${code}` : "Speech-to-text error");
-      }
-    };
-    rec.onresult = (event: any) => {
-      let transcript = "";
-      const results = event?.results;
-      if (results) {
-        for (let i = 0; i < results.length; i++) transcript += results[i][0].transcript;
-      }
-      transcript = String(transcript).trim();
-      if (!transcript) return;
-
-      sttTranscriptRef.current = transcript;
-      setInput(transcript);
-      scheduleSttAutoSend();
-    };
+    // 3) Enable hands-free mode and start listening
+    sttEnabledRef.current = true;
+    sttPausedRef.current = false;
+    setSttEnabled(true);
 
     try {
       rec.start();
     } catch {
-      setSttListening(false);
-      sttRecRef.current = null;
-      setSttError(`Speech-to-text could not start (microphone permission?)${getEmbedHint()}`);
+      // ignore InvalidStateError if already started
     }
-  }
+  }, [ensureSpeechRecognition, requestMicPermission]);
 
+  const stopSpeechToText = useCallback(() => {
+    sttEnabledRef.current = false;
+    sttPausedRef.current = false;
+    setSttEnabled(false);
+    setSttRunning(false);
+    clearSttSilenceTimer();
+    clearSttRestartTimer();
+
+    sttFinalRef.current = "";
+    sttInterimRef.current = "";
+
+    try {
+      const rec = sttRecRef.current;
+      if (rec?.stop) rec.stop();
+    } catch {}
+  }, []);
+
+  const toggleSpeechToText = useCallback(async () => {
+    if (sttEnabledRef.current) {
+      stopSpeechToText();
+      return;
+    }
+    await startSpeechToText();
+  }, [startSpeechToText, stopSpeechToText]);
+
+  // Cleanup
   useEffect(() => {
     return () => {
-      clearSttSilenceTimer();
       try {
-        sttRecRef.current?.abort?.();
+        sttEnabledRef.current = false;
+        sttPausedRef.current = false;
+        clearSttSilenceTimer();
+        clearSttRestartTimer();
+        const rec = sttRecRef.current;
+        if (rec) {
+          try {
+            rec.onstart = null;
+            rec.onend = null;
+            rec.onresult = null;
+            rec.onerror = null;
+          } catch {}
+          try {
+            rec.abort?.();
+          } catch {
+            try {
+              rec.stop?.();
+            } catch {}
+          }
+        }
       } catch {}
     };
   }, []);
-
-
   return (
     <main style={{ maxWidth: 880, margin: "24px auto", padding: "0 16px", fontFamily: "system-ui" }}>
       <header style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 10 }}>
@@ -1326,14 +1500,14 @@ const stateToSendWithCompanion: SessionState = {
               type="button"
               onClick={toggleSpeechToText}
               disabled={loading}
-              title={sttListening ? "Stop speech-to-text" : "Start speech-to-text"}
+              title={sttEnabled ? "Stop speech-to-text" : "Start speech-to-text"}
               style={{
                 width: 44,
                 minWidth: 44,
                 borderRadius: 10,
                 border: "1px solid #111",
-                background: sttListening ? "#b00020" : "#fff",
-                color: sttListening ? "#fff" : "#111",
+                background: sttEnabled ? "#b00020" : "#fff",
+                color: sttEnabled ? "#fff" : "#111",
                 cursor: "pointer",
                 fontWeight: 700,
               }}
@@ -1350,7 +1524,7 @@ const stateToSendWithCompanion: SessionState = {
                   send();
                 }
               }}
-              placeholder={sttListening ? "Listening…" : "Type a message…"}
+              placeholder={sttEnabled ? "Listening…" : "Type a message…"}
               style={{
                 flex: 1,
                 padding: "10px 12px",
