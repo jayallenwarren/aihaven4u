@@ -1,34 +1,26 @@
 from __future__ import annotations
 
 import os
-import re
 import time
+import re
+import uuid
+import hashlib
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 
-# --- Phase 1 TTS (ElevenLabs) + Azure Blob (for D-ID audio_url) ---
-import base64
-import hashlib
-from datetime import datetime, timedelta
-
-import requests
-from starlette.concurrency import run_in_threadpool
-
-from azure.core.exceptions import ResourceExistsError
-from azure.storage.blob import (
-    BlobServiceClient,
-    ContentSettings,
-    BlobSasPermissions,
-    generate_blob_sas,
-)
+# Threadpool helper (prevents blocking the event loop on requests/azure upload)
+from starlette.concurrency import run_in_threadpool  # type: ignore
 
 from .settings import settings
-from .models import ChatResponse
+from .models import ChatResponse  # kept for compatibility with existing codebase
 
-# If you still want the consent router, keep it BUT don't let it break boot.
-# (Boot failures are what cause "CORS missing" + 503.)
+
+# ----------------------------
+# Optional consent router
+# ----------------------------
 try:
     from .consent_routes import router as consent_router  # type: ignore
 except Exception:
@@ -152,7 +144,6 @@ def _detect_mode_switch_from_text(text: str) -> Optional[str]:
     return None
 
 
-
 def _looks_intimate(text: str) -> bool:
     t = (text or "").lower()
     return any(
@@ -204,7 +195,14 @@ def _build_persona_system_prompt(session_state: dict, *, mode: str, intimate_all
     return " ".join(lines)
 
 
-def _to_openai_messages(messages: List[Dict[str, str]], session_state: dict, *, mode: str, intimate_allowed: bool, debug: bool):
+def _to_openai_messages(
+    messages: List[Dict[str, str]],
+    session_state: dict,
+    *,
+    mode: str,
+    intimate_allowed: bool,
+    debug: bool
+):
     sys = _build_persona_system_prompt(session_state, mode=mode, intimate_allowed=intimate_allowed)
     _dbg(debug, "SYSTEM PROMPT:", sys)
 
@@ -215,7 +213,7 @@ def _to_openai_messages(messages: List[Dict[str, str]], session_state: dict, *, 
     return out
 
 
-def _call_gpt4o(messages):
+def _call_gpt4o(messages: List[Dict[str, str]]) -> str:
     from openai import OpenAI
 
     api_key = os.getenv("OPENAI_API_KEY")
@@ -224,9 +222,9 @@ def _call_gpt4o(messages):
 
     client = OpenAI(api_key=api_key)
     resp = client.chat.completions.create(
-        model="gpt-4o",
+        model=os.getenv("OPENAI_MODEL", "gpt-4o"),
         messages=messages,
-        temperature=0.8,
+        temperature=float(os.getenv("OPENAI_TEMPERATURE", "0.8")),
     )
     return (resp.choices[0].message.content or "").strip()
 
@@ -247,15 +245,162 @@ def _normalize_payload(raw: Dict[str, Any]) -> Tuple[str, List[Dict[str, str]], 
     return sid, msgs, state, wants
 
 
+def _extract_voice_id(raw: Dict[str, Any]) -> str:
+    """
+    Supports both snake_case and camelCase for frontend convenience.
+    """
+    return (
+        (raw.get("voice_id") or raw.get("voiceId") or raw.get("eleven_voice_id") or raw.get("elevenVoiceId") or "")
+    ).strip()
+
+
 # ----------------------------
-# CHAT
+# TTS Helpers (ElevenLabs -> Azure Blob SAS)
 # ----------------------------
-@app.post("/chat", response_model=ChatResponse)
+_TTS_CONTAINER = os.getenv("AZURE_TTS_CONTAINER", os.getenv("AZURE_STORAGE_CONTAINER", "tts")) or "tts"
+_TTS_BLOB_PREFIX = os.getenv("TTS_BLOB_PREFIX", "audio") or "audio"
+_TTS_SAS_MINUTES = int(os.getenv("TTS_SAS_MINUTES", os.getenv("AZURE_BLOB_SAS_EXPIRY_MINUTES", "30")) or "30")
+
+
+def _tts_blob_name(session_id: str, voice_id: str, text: str) -> str:
+    safe_session = re.sub(r"[^A-Za-z0-9_-]", "_", (session_id or "session"))[:64]
+    safe_voice = re.sub(r"[^A-Za-z0-9_-]", "_", (voice_id or "voice"))[:48]
+    h = hashlib.sha1((safe_voice + "|" + (text or "")).encode("utf-8")).hexdigest()[:16]
+    ts_ms = int(time.time() * 1000)
+    # include hash for debugging/caching, but still unique by timestamp
+    return f"{_TTS_BLOB_PREFIX}/{safe_session}/{ts_ms}-{h}-{uuid.uuid4().hex}.mp3"
+
+
+def _elevenlabs_tts_mp3_bytes(voice_id: str, text: str) -> bytes:
+    import requests  # type: ignore
+
+    xi_api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
+    if not xi_api_key:
+        raise RuntimeError("ELEVENLABS_API_KEY is not configured")
+
+    model_id = os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2").strip() or "eleven_multilingual_v2"
+    output_format = os.getenv("ELEVENLABS_OUTPUT_FORMAT", "mp3_44100_128").strip() or "mp3_44100_128"
+
+    # Using /stream tends to be lower latency on ElevenLabs.
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream?output_format={output_format}"
+    headers = {
+        "xi-api-key": xi_api_key,
+        "Content-Type": "application/json",
+        "Accept": "audio/mpeg",
+    }
+    body = {"text": text, "model_id": model_id}
+
+    r = requests.post(url, headers=headers, json=body, timeout=60)
+    if r.status_code >= 400:
+        raise RuntimeError(f"ElevenLabs error {r.status_code}: {(r.text or '')[:400]}")
+    if not r.content:
+        raise RuntimeError("ElevenLabs returned empty audio")
+    return r.content
+
+
+def _azure_upload_mp3_and_get_sas_url(blob_name: str, mp3_bytes: bytes) -> str:
+    from azure.storage.blob import BlobServiceClient, ContentSettings  # type: ignore
+    from azure.storage.blob import BlobSasPermissions, generate_blob_sas  # type: ignore
+
+    storage_conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "").strip()
+    if not storage_conn_str:
+        raise RuntimeError("AZURE_STORAGE_CONNECTION_STRING is not configured")
+
+    blob_service = BlobServiceClient.from_connection_string(storage_conn_str)
+    container_client = blob_service.get_container_client(_TTS_CONTAINER)
+
+    # Ensure container exists (safe)
+    try:
+        container_client.get_container_properties()
+    except Exception:
+        try:
+            container_client.create_container()
+        except Exception:
+            pass
+
+    blob_client = container_client.get_blob_client(blob_name)
+    blob_client.upload_blob(
+        mp3_bytes,
+        overwrite=True,
+        content_settings=ContentSettings(content_type="audio/mpeg"),
+    )
+
+    # Parse AccountName/AccountKey from connection string for SAS
+    parts: Dict[str, str] = {}
+    for seg in storage_conn_str.split(";"):
+        if "=" in seg:
+            k, v = seg.split("=", 1)
+            parts[k] = v
+    account_name = parts.get("AccountName") or getattr(blob_service, "account_name", None)
+    account_key = parts.get("AccountKey")
+    if not account_name or not account_key:
+        raise RuntimeError("Could not parse AccountName/AccountKey from AZURE_STORAGE_CONNECTION_STRING")
+
+    expiry = datetime.utcnow() + timedelta(minutes=max(5, min(_TTS_SAS_MINUTES, 24 * 60)))
+    sas = generate_blob_sas(
+        account_name=account_name,
+        container_name=_TTS_CONTAINER,
+        blob_name=blob_name,
+        account_key=account_key,
+        permission=BlobSasPermissions(read=True),
+        expiry=expiry,
+    )
+    return f"{blob_client.url}?{sas}"
+
+
+def _tts_audio_url_sync(session_id: str, voice_id: str, text: str) -> str:
+    text = (text or "").strip()
+    if not text:
+        raise RuntimeError("TTS text is empty")
+    blob_name = _tts_blob_name(session_id=session_id, voice_id=voice_id, text=text)
+    mp3_bytes = _elevenlabs_tts_mp3_bytes(voice_id=voice_id, text=text)
+    return _azure_upload_mp3_and_get_sas_url(blob_name=blob_name, mp3_bytes=mp3_bytes)
+
+
+# ----------------------------
+# CHAT (Optimized: optional audio_url in same response)
+# ----------------------------
+@app.post("/chat", response_model=None)
 async def chat(request: Request):
+    """
+    Backward-compatible /chat endpoint.
+
+    Optimization:
+      If the request includes `voice_id` (or `voiceId`), the API will ALSO generate
+      an ElevenLabs MP3, upload it to Azure Blob, and return `audio_url` in the same
+      /chat response — avoiding a second round-trip to /tts/audio-url.
+
+    Request (existing fields):
+      { session_id, messages, session_state, wants_explicit }
+
+    Additional optional fields:
+      { voice_id: "<elevenlabs_voice_id>" }   or  { voiceId: "<...>" }
+    """
     debug = bool(getattr(settings, "DEBUG", False))
 
     raw = await request.json()
     session_id, messages, session_state, wants_explicit = _normalize_payload(raw)
+    voice_id = _extract_voice_id(raw)
+
+    # Helper to build responses consistently and optionally include audio_url.
+    async def _respond(reply: str, status_mode: str, state_out: Dict[str, Any]) -> Dict[str, Any]:
+        audio_url: Optional[str] = None
+        if voice_id and (reply or "").strip():
+            try:
+                audio_url = await run_in_threadpool(_tts_audio_url_sync, session_id, voice_id, reply)
+            except Exception as e:
+                # Fail-open: never break chat because TTS failed
+                _dbg(debug, "TTS generation failed:", repr(e))
+                state_out = dict(state_out)
+                state_out["tts_error"] = f"{type(e).__name__}: {e}"
+
+        return {
+            "session_id": session_id,
+            "mode": status_mode,          # safe/explicit_blocked/explicit_allowed
+            "reply": reply,
+            "session_state": state_out,
+            "audio_url": audio_url,       # NEW (optional)
+        }
 
     # last user message
     last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
@@ -302,11 +447,10 @@ async def chat(request: Request):
     if pending == "intimate" and not intimate_allowed:
         if normalized_text in CONSENT_YES:
             session_state_out = _grant_intimate(session_state)
-            return ChatResponse(
-                session_id=session_id,
-                mode=STATUS_ALLOWED,
-                reply="Thank you — Intimate (18+) mode is enabled. What would you like to explore together?",
-                session_state=session_state_out,
+            return await _respond(
+                "Thank you — Intimate (18+) mode is enabled. What would you like to explore together?",
+                STATUS_ALLOWED,
+                session_state_out,
             )
 
         if normalized_text in CONSENT_NO:
@@ -314,22 +458,20 @@ async def chat(request: Request):
             session_state_out["pending_consent"] = None
             session_state_out["explicit_consented"] = False
             session_state_out["mode"] = "friend"
-            return ChatResponse(
-                session_id=session_id,
-                mode=STATUS_SAFE,
-                reply="No problem — we’ll keep things in Friend mode.",
-                session_state=session_state_out,
+            return await _respond(
+                "No problem — we’ll keep things in Friend mode.",
+                STATUS_SAFE,
+                session_state_out,
             )
 
         # still pending; remind
         session_state_out = dict(session_state)
         session_state_out["pending_consent"] = "intimate"
         session_state_out["mode"] = "intimate"  # keep pill highlighted
-        return ChatResponse(
-            session_id=session_id,
-            mode=STATUS_BLOCKED,
-            reply="Please reply with 'yes' or 'no' to continue.",
-            session_state=session_state_out,
+        return await _respond(
+            "Please reply with 'yes' or 'no' to continue.",
+            STATUS_BLOCKED,
+            session_state_out,
         )
 
     # Start consent if intimate requested but not allowed
@@ -338,11 +480,10 @@ async def chat(request: Request):
         session_state_out = dict(session_state)
         session_state_out["pending_consent"] = "intimate"
         session_state_out["mode"] = "intimate"
-        return ChatResponse(
-            session_id=session_id,
-            mode=STATUS_BLOCKED,
-            reply="Before we continue, please confirm you are 18+ and consent to Intimate (18+) conversation. Reply 'yes' to continue.",
-            session_state=session_state_out,
+        return await _respond(
+            "Before we continue, please confirm you are 18+ and consent to Intimate (18+) conversation. Reply 'yes' to continue.",
+            STATUS_BLOCKED,
+            session_state_out,
         )
 
     # Effective mode for the model (never intimate unless allowed)
@@ -353,7 +494,7 @@ async def chat(request: Request):
     _dbg(
         debug,
         f"/chat session={session_id} requested_mode={requested_mode} effective_mode={effective_mode} "
-        f"user_requesting_intimate={user_requesting_intimate} intimate_allowed={intimate_allowed} pending={pending}",
+        f"user_requesting_intimate={user_requesting_intimate} intimate_allowed={intimate_allowed} pending={pending} voice_id={'yes' if voice_id else 'no'}",
     )
 
     # call model
@@ -381,148 +522,49 @@ async def chat(request: Request):
         or session_state_out.get("companion_name")
     )
 
-    return ChatResponse(
-        session_id=session_id,
-        mode=STATUS_ALLOWED if intimate_allowed else STATUS_SAFE,
-        reply=assistant_reply,
-        session_state=session_state_out,
+    return await _respond(
+        assistant_reply,
+        STATUS_ALLOWED if intimate_allowed else STATUS_SAFE,
+        session_state_out,
     )
+
 
 # ----------------------------
-# Phase 1: ElevenLabs TTS -> Azure Blob -> return public (SAS) audio_url
+# BACKWARD-COMPAT TTS ENDPOINT (still supported)
 # ----------------------------
-
-_BLOB_SERVICE: Optional[BlobServiceClient] = None
-_BLOB_ACCOUNT_NAME: Optional[str] = None
-_BLOB_ACCOUNT_KEY: Optional[str] = None
-
-
-def _parse_azure_conn_str(conn_str: str) -> Dict[str, str]:
-    parts: Dict[str, str] = {}
-    for chunk in conn_str.split(";"):
-        chunk = chunk.strip()
-        if not chunk or "=" not in chunk:
-            continue
-        k, v = chunk.split("=", 1)
-        parts[k.strip()] = v.strip()
-    return parts
-
-
-def _get_blob_service() -> Tuple[BlobServiceClient, str, str, str]:
-    """Return (service, account_name, account_key, container_name)."""
-    global _BLOB_SERVICE, _BLOB_ACCOUNT_NAME, _BLOB_ACCOUNT_KEY
-
-    conn_str = (os.getenv("AZURE_STORAGE_CONNECTION_STRING") or "").strip()
-    if not conn_str:
-        raise RuntimeError("Missing AZURE_STORAGE_CONNECTION_STRING")
-
-    container_name = (os.getenv("AZURE_STORAGE_CONTAINER_NAME") or "tts").strip() or "tts"
-
-    if _BLOB_SERVICE is None:
-        parts = _parse_azure_conn_str(conn_str)
-        acct_name = (os.getenv("AZURE_STORAGE_ACCOUNT_NAME") or parts.get("AccountName") or "").strip()
-        acct_key = (parts.get("AccountKey") or "").strip()
-
-        if not acct_name:
-            raise RuntimeError("Could not determine Azure Storage account name")
-        if not acct_key:
-            # Without an account key, we can't generate SAS (unless container is public).
-            raise RuntimeError("Could not determine Azure Storage account key (needed for SAS URLs)")
-
-        _BLOB_SERVICE = BlobServiceClient.from_connection_string(conn_str)
-        _BLOB_ACCOUNT_NAME = acct_name
-        _BLOB_ACCOUNT_KEY = acct_key
-
-        # Ensure container exists
-        try:
-            _BLOB_SERVICE.create_container(container_name)
-        except ResourceExistsError:
-            pass
-
-    assert _BLOB_SERVICE is not None
-    assert _BLOB_ACCOUNT_NAME is not None
-    assert _BLOB_ACCOUNT_KEY is not None
-    return _BLOB_SERVICE, _BLOB_ACCOUNT_NAME, _BLOB_ACCOUNT_KEY, container_name
-
-
-def _make_blob_name(session_id: str, voice_id: str, text: str) -> str:
-    sid = re.sub(r"[^a-zA-Z0-9_-]+", "_", session_id or "anon")[:48]
-    vid = re.sub(r"[^a-zA-Z0-9_-]+", "_", voice_id or "voice")[:48]
-    digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
-    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    return f"{sid}/{vid}/{ts}_{digest}.mp3"
-
-
-def _elevenlabs_tts_bytes(voice_id: str, text: str) -> bytes:
-    api_key = (os.getenv("ELEVENLABS_API_KEY") or "").strip()
-    if not api_key:
-        raise RuntimeError("Missing ELEVENLABS_API_KEY")
-
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
-    headers = {
-        "xi-api-key": api_key,
-        "Accept": "audio/mpeg",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "text": text,
-        # Model is optional; ElevenLabs defaults vary by account. If you want to pin:
-        # "model_id": "eleven_multilingual_v2",
-    }
-    r = requests.post(url, headers=headers, json=payload, timeout=60)
-    if r.status_code >= 400:
-        raise RuntimeError(f"ElevenLabs TTS failed: {r.status_code} {r.text[:500]}")
-    return r.content
-
-
-def _upload_mp3_and_get_sas_url(blob_name: str, audio_bytes: bytes) -> str:
-    service, account_name, account_key, container_name = _get_blob_service()
-
-    blob_client = service.get_blob_client(container=container_name, blob=blob_name)
-    blob_client.upload_blob(
-        audio_bytes,
-        overwrite=True,
-        content_settings=ContentSettings(content_type="audio/mpeg"),
-    )
-
-    sas = generate_blob_sas(
-        account_name=account_name,
-        container_name=container_name,
-        blob_name=blob_name,
-        account_key=account_key,
-        permission=BlobSasPermissions(read=True),
-        expiry=datetime.utcnow() + timedelta(hours=6),
-    )
-
-    return f"https://{account_name}.blob.core.windows.net/{container_name}/{blob_name}?{sas}"
-
-
 @app.post("/tts/audio-url")
-async def tts_audio_url(request: Request):
+async def tts_audio_url(request: Request) -> Dict[str, Any]:
     """
-    Request JSON: {"session_id":"...", "voice_id":"ElevenLabsVoiceId", "text":"..."}
-    Response JSON: {"audio_url":"https://..."}
+    Backward compatible endpoint.
+
+    Request JSON:
+      {
+        "session_id": "...",
+        "voice_id": "<ElevenLabsVoiceId>",
+        "text": "..."
+      }
+
+    Response JSON:
+      { "audio_url": "https://...sas..." }
     """
     try:
         body = await request.json()
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
+        body = {}
 
-    session_id = str(body.get("session_id") or "anon")
-    voice_id = str(body.get("voice_id") or "").strip()
-    text = str(body.get("text") or "").strip()
+    session_id = (body.get("session_id") or body.get("sid") or "").strip()
+    if not session_id:
+        raise HTTPException(status_code=422, detail="session_id required")
 
-    if not voice_id:
-        raise HTTPException(status_code=400, detail="Missing voice_id")
-    if not text:
-        raise HTTPException(status_code=400, detail="Missing text")
+    voice_id = ((body.get("voice_id") or body.get("voiceId") or "")).strip()
+    text = (body.get("text") or "").strip()
+
+    if not voice_id or not text:
+        raise HTTPException(status_code=422, detail="voice_id and text are required")
 
     try:
-        audio_bytes = await run_in_threadpool(_elevenlabs_tts_bytes, voice_id, text)
-        blob_name = _make_blob_name(session_id=session_id, voice_id=voice_id, text=text)
-        audio_url = await run_in_threadpool(_upload_mp3_and_get_sas_url, blob_name, audio_bytes)
-        return {"audio_url": audio_url}
-    except HTTPException:
-        raise
+        audio_url = await run_in_threadpool(_tts_audio_url_sync, session_id, voice_id, text)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"TTS/audio-url error: {e}")
+        raise HTTPException(status_code=502, detail=f"TTS failed: {type(e).__name__}: {e}")
+
+    return {"audio_url": audio_url}

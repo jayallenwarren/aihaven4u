@@ -24,6 +24,11 @@ type ChatApiResponse = {
   reply: string;
   mode?: ChatStatus; // IMPORTANT: this is STATUS, not the UI pill mode
   session_state?: Partial<SessionState>;
+
+  // Optional optimization: backend may return a ready-to-play ElevenLabs->Blob URL
+  // so the frontend can skip a second /tts/audio-url round trip.
+  audio_url?: string;
+  audioUrl?: string;
 };
 
 type PlanName =
@@ -585,20 +590,68 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string): Promis
   }
 }, []);
 
+  type SpeakAssistantHooks = {
+    // Called right before we ask D-ID to speak.
+    // Used to delay the assistant text until the avatar begins speaking.
+    onWillSpeak?: () => void;
+    // Called when we cannot / did not speak via D-ID.
+    onDidNotSpeak?: () => void;
+  };
+
 const speakAssistantReply = useCallback(
-  async (replyText: string) => {
+    async (replyText: string, hooks?: SpeakAssistantHooks, audioUrlOverride?: string | null) => {
     // NOTE: We intentionally keep STT paused while the avatar is speaking.
     // The D-ID SDK's speak() promise can resolve before audio playback finishes,
     // so we add a best-effort duration wait to prevent STT feedback (avatar "talking to itself").
     const clean = (replyText || "").trim();
-    if (!clean) return;
-    if (clean.startsWith("Error:")) return;
 
-    if (avatarStatus !== "connected") return;
-    if (!phase1AvatarMedia) return;
+    const callDidNotSpeak = () => {
+      try {
+        hooks?.onDidNotSpeak?.();
+      } catch {
+        // ignore
+      }
+    };
 
-    const audioUrl = await getTtsAudioUrl(clean, phase1AvatarMedia.elevenVoiceId);
-    if (!audioUrl) return;
+    let willSpeakCalled = false;
+    const callWillSpeakOnce = () => {
+      if (willSpeakCalled) return;
+      willSpeakCalled = true;
+      try {
+        hooks?.onWillSpeak?.();
+      } catch {
+        // ignore
+      }
+    };
+
+    if (!clean) {
+      callDidNotSpeak();
+      return;
+    }
+    if (clean.startsWith("Error:")) {
+      callDidNotSpeak();
+      return;
+    }
+
+    if (avatarStatus !== "connected") {
+      callDidNotSpeak();
+      return;
+    }
+    if (!phase1AvatarMedia) {
+      callDidNotSpeak();
+      return;
+    }
+
+    const overrideUrl =
+      typeof audioUrlOverride === "string" ? audioUrlOverride.trim() : "";
+    const audioUrl = overrideUrl
+      ? overrideUrl
+      : await getTtsAudioUrl(clean, phase1AvatarMedia.elevenVoiceId);
+
+    if (!audioUrl) {
+      callDidNotSpeak();
+      return;
+    }
 
     // Estimate duration (fallback) based on text length.
     const estimateSpeechMs = (text: string) => {
@@ -672,9 +725,13 @@ const speakAssistantReply = useCallback(
 
     for (let attempt = 0; attempt < 2; attempt++) {
       const mgr = didAgentMgrRef.current;
-      if (!mgr) return;
+      if (!mgr) {
+        callDidNotSpeak();
+        return;
+      }
 
       try {
+        callWillSpeakOnce();
         await mgr.speak(speakPayload);
         spoke = true;
         break;
@@ -686,11 +743,15 @@ const speakAssistantReply = useCallback(
         }
         console.warn("D-ID speak failed:", e);
         setAvatarError(formatDidError(e));
+        callDidNotSpeak();
         return;
       }
     }
 
-    if (!spoke) return;
+    if (!spoke) {
+      callDidNotSpeak();
+      return;
+    }
 
     // Wait for audio playback to finish (plus buffer) before allowing STT to resume.
     const durationMs = await durationMsPromise;
@@ -909,12 +970,21 @@ const stateToSendWithCompanion: SessionState = {
   companion_name: companionForBackend,
 };
 
+    // Backend-side optimization:
+    // If Live Avatar is connected and this companion is in Phase 1, ask /chat to also generate TTS
+    // and return audio_url in the same response (skips an extra /tts/audio-url round-trip).
+    const voice_id =
+      avatarStatus === "connected" && phase1AvatarMedia?.elevenVoiceId
+        ? phase1AvatarMedia.elevenVoiceId
+        : undefined;
+
     const res = await fetch(`${API_BASE}/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         session_id,
         wants_explicit,
+        voice_id,
         session_state: stateToSendWithCompanion,
         messages: nextMessages.map((m) => ({ role: m.role, content: m.content })),
       }),
@@ -1081,10 +1151,20 @@ const stateToSendWithCompanion: SessionState = {
         }
       }
 
-      setMessages((prev) => [...prev, { role: "assistant", content: data.reply }]);
-
-      // Phase 1: Speak the assistant reply (if Live Avatar is connected)
+      // Phase 1: Speak the assistant reply (if Live Avatar is connected).
+      // When Live Avatar is active, we delay the assistant's text from appearing until
+      // we are about to trigger the avatar speech.
       const replyText = String(data.reply || "");
+
+      // Backend optimization: if /chat already returned a ready-to-play TTS Blob URL, reuse it.
+      const audioUrlFromChat: string | null =
+        ((data as any).audio_url ?? (data as any).audioUrl ?? null) as any;
+      let assistantCommitted = false;
+      const commitAssistantMessage = () => {
+        if (assistantCommitted) return;
+        assistantCommitted = true;
+        setMessages((prev) => [...prev, { role: "assistant", content: replyText }]);
+      };
 
       // Guard against STT feedback: ignore any recognition results until after the avatar finishes speaking.
       // (We also keep STT paused during speak; this is an extra safety net.)
@@ -1095,9 +1175,26 @@ const stateToSendWithCompanion: SessionState = {
         const punctPausesMs = (text.match(/[.!?]/g) || []).length * 250;
         return Math.min(60_000, Math.max(1_200, Math.round(baseMs + punctPausesMs)));
       };
-      sttIgnoreUntilRef.current = Math.max(sttIgnoreUntilRef.current, Date.now() + estimateSpeechMs(replyText) + 1_200);
+      const estimatedSpeechMs = estimateSpeechMs(replyText);
 
-      const speakPromise = Promise.resolve(speakAssistantReply(replyText)).catch(() => {});
+      const speakPromise = Promise.resolve(
+        speakAssistantReply(replyText, {
+          onWillSpeak: () => {
+            // STT ducking window (only when we are actually about to speak)
+            sttIgnoreUntilRef.current = Math.max(
+              sttIgnoreUntilRef.current,
+              Date.now() + estimatedSpeechMs + 1_200
+            );
+            commitAssistantMessage();
+          },
+          onDidNotSpeak: () => {
+            commitAssistantMessage();
+          },
+        }, audioUrlFromChat)
+      ).catch(() => {
+        // Safety: ensure the message appears even if speech throws before hooks are called.
+        commitAssistantMessage();
+      });
 
       // If STT is enabled, resume listening only after the avatar finishes speaking.
       if (resumeSttAfter) {
@@ -1220,7 +1317,7 @@ const stateToSendWithCompanion: SessionState = {
       sttInterimRef.current = "";
 
       void sendRef.current(text);
-    }, 1500);
+    }, 2000);
   }, [getCurrentSttText, pauseSpeechToText]);
 
   const requestMicPermission = useCallback(async () => {
