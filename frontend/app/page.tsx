@@ -587,17 +587,80 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string): Promis
 
 const speakAssistantReply = useCallback(
   async (replyText: string) => {
-    const mgr = didAgentMgrRef.current;
-    if (!mgr) return;
-    if (avatarStatus !== "connected") return;
-    if (!phase1AvatarMedia) return;
-
+    // NOTE: We intentionally keep STT paused while the avatar is speaking.
+    // The D-ID SDK's speak() promise can resolve before audio playback finishes,
+    // so we add a best-effort duration wait to prevent STT feedback (avatar "talking to itself").
     const clean = (replyText || "").trim();
     if (!clean) return;
     if (clean.startsWith("Error:")) return;
 
+    if (avatarStatus !== "connected") return;
+    if (!phase1AvatarMedia) return;
+
     const audioUrl = await getTtsAudioUrl(clean, phase1AvatarMedia.elevenVoiceId);
     if (!audioUrl) return;
+
+    // Estimate duration (fallback) based on text length.
+    const estimateSpeechMs = (text: string) => {
+      const words = text.trim().split(/\s+/).filter(Boolean).length;
+      // Typical conversational pace ~160-175 WPM. Use a slightly slower rate to be safe.
+      const wpm = 160;
+      const baseMs = (words / wpm) * 60_000;
+      const punctPausesMs = (text.match(/[.!?]/g) || []).length * 250;
+      return Math.min(60_000, Math.max(1_200, Math.round(baseMs + punctPausesMs)));
+    };
+
+    const fallbackMs = estimateSpeechMs(clean);
+
+    // Best-effort: read actual audio duration from the blob URL (if metadata is accessible).
+    const probeAudioDurationMs = (url: string, fallback: number) =>
+      new Promise<number>((resolve) => {
+        if (typeof Audio === "undefined") return resolve(fallback);
+        const a = new Audio();
+        a.preload = "metadata";
+        // Some CDNs require this for cross-origin metadata access (best-effort).
+        try {
+          (a as any).crossOrigin = "anonymous";
+        } catch {
+          // ignore
+        }
+
+        let doneCalled = false;
+        const done = (ms: number) => {
+          if (doneCalled) return;
+          doneCalled = true;
+          try {
+            a.onloadedmetadata = null as any;
+            a.onerror = null as any;
+          } catch {
+            // ignore
+          }
+          // release resource
+          try {
+            a.src = "";
+          } catch {
+            // ignore
+          }
+          resolve(ms);
+        };
+
+        const t = window.setTimeout(() => done(fallback), 2500);
+
+        a.onloadedmetadata = () => {
+          window.clearTimeout(t);
+          const d = a.duration;
+          if (typeof d === "number" && isFinite(d) && d > 0) return done(Math.round(d * 1000));
+          return done(fallback);
+        };
+        a.onerror = () => {
+          window.clearTimeout(t);
+          return done(fallback);
+        };
+
+        a.src = url;
+      });
+
+    const durationMsPromise = probeAudioDurationMs(audioUrl, fallbackMs);
 
     const speakPayload = {
       type: "audio",
@@ -605,10 +668,16 @@ const speakAssistantReply = useCallback(
       audioType: "audio/mpeg",
     } as any;
 
+    let spoke = false;
+
     for (let attempt = 0; attempt < 2; attempt++) {
+      const mgr = didAgentMgrRef.current;
+      if (!mgr) return;
+
       try {
         await mgr.speak(speakPayload);
-        return;
+        spoke = true;
+        break;
       } catch (e) {
         if (attempt === 0 && isDidSessionError(e)) {
           console.warn("D-ID session error during speak; reconnecting and retrying...", e);
@@ -620,6 +689,13 @@ const speakAssistantReply = useCallback(
         return;
       }
     }
+
+    if (!spoke) return;
+
+    // Wait for audio playback to finish (plus buffer) before allowing STT to resume.
+    const durationMs = await durationMsPromise;
+    const waitMs = Math.min(90_000, Math.max(fallbackMs, durationMs) + 900);
+    await new Promise((r) => window.setTimeout(r, waitMs));
   },
   [avatarStatus, phase1AvatarMedia, getTtsAudioUrl, reconnectLiveAvatar]
 );
@@ -674,6 +750,7 @@ const speakAssistantReply = useCallback(
 
   const sttFinalRef = useRef<string>("");
   const sttInterimRef = useRef<string>("");
+  const sttIgnoreUntilRef = useRef<number>(0); // suppress STT while avatar is speaking (prevents feedback loop)
 
   const [sttEnabled, setSttEnabled] = useState(false);
   const [sttRunning, setSttRunning] = useState(false);
@@ -1008,6 +1085,18 @@ const stateToSendWithCompanion: SessionState = {
 
       // Phase 1: Speak the assistant reply (if Live Avatar is connected)
       const replyText = String(data.reply || "");
+
+      // Guard against STT feedback: ignore any recognition results until after the avatar finishes speaking.
+      // (We also keep STT paused during speak; this is an extra safety net.)
+      const estimateSpeechMs = (text: string) => {
+        const words = text.trim().split(/\s+/).filter(Boolean).length;
+        const wpm = 160;
+        const baseMs = (words / wpm) * 60_000;
+        const punctPausesMs = (text.match(/[.!?]/g) || []).length * 250;
+        return Math.min(60_000, Math.max(1_200, Math.round(baseMs + punctPausesMs)));
+      };
+      sttIgnoreUntilRef.current = Math.max(sttIgnoreUntilRef.current, Date.now() + estimateSpeechMs(replyText) + 1_200);
+
       const speakPromise = Promise.resolve(speakAssistantReply(replyText)).catch(() => {});
 
       // If STT is enabled, resume listening only after the avatar finishes speaking.
@@ -1076,6 +1165,24 @@ const stateToSendWithCompanion: SessionState = {
     if (!sttEnabledRef.current) return;
     sttPausedRef.current = false;
     clearSttRestartTimer();
+
+    const delayMs = Math.max(0, sttIgnoreUntilRef.current - Date.now());
+    if (delayMs > 0) {
+      // Delay restart until after our ignore window (prevents picking up the avatar's audio tail).
+      sttRestartTimerRef.current = setTimeout(() => {
+        if (!sttEnabledRef.current) return;
+        if (sttPausedRef.current) return;
+        try {
+          const rec = sttRecRef.current;
+          if (!rec?.start) return;
+          rec.start();
+        } catch {
+          // Ignore InvalidStateError if already started.
+        }
+      }, delayMs);
+      return;
+    }
+
     try {
       const rec = sttRecRef.current;
       if (!rec?.start) return;
@@ -1202,6 +1309,9 @@ const stateToSendWithCompanion: SessionState = {
       try {
         const results = event?.results;
         if (!results) return;
+        if (!sttEnabledRef.current) return;
+        if (sttPausedRef.current) return;
+        if (Date.now() < sttIgnoreUntilRef.current) return;
 
         let finalText = "";
         let interimText = "";
@@ -1277,6 +1387,11 @@ const stateToSendWithCompanion: SessionState = {
     }
     await startSpeechToText();
   }, [startSpeechToText, stopSpeechToText]);
+
+  // Dedicated stop button for STT (so the user can stop listening even when Live Avatar isn't used)
+  const stopHandsFreeSTT = useCallback(() => {
+    stopSpeechToText();
+  }, [stopSpeechToText]);
 
   // Cleanup
   useEffect(() => {
@@ -1499,7 +1614,7 @@ const stateToSendWithCompanion: SessionState = {
             <button
               type="button"
               onClick={toggleSpeechToText}
-              disabled={loading}
+              disabled={!sttEnabled && loading}
               title={sttEnabled ? "Stop speech-to-text" : "Start speech-to-text"}
               style={{
                 width: 44,
@@ -1514,6 +1629,26 @@ const stateToSendWithCompanion: SessionState = {
             >
               🎤
             </button>
+
+            {sttEnabled ? (
+              <button
+                type="button"
+                onClick={stopHandsFreeSTT}
+                title="Stop listening"
+                style={{
+                  width: 44,
+                  minWidth: 44,
+                  borderRadius: 10,
+                  border: "1px solid #111",
+                  background: "#fff",
+                  color: "#111",
+                  cursor: "pointer",
+                  fontWeight: 700,
+                }}
+              >
+                ■
+              </button>
+            ) : null}
 
             <input
               value={input}
