@@ -81,95 +81,31 @@ const PHASE1_AVATAR_MEDIA: Record<string, Phase1AvatarMedia> = {
 } as any;
 
 const ELEVEN_VOICE_ID_BY_COMPANION: Record<string, string> = {
-  "Haven": "rJ9XoWu8gbUhVKZnKY8X",
-  "Jennifer": "19STyYD15bswVz51nqLf",
-  "Jason": "j0jBf06B5YHDbCWVmlmr",
-  "Tonya": "Hybl6rg76ZOcgqZqN5WN",
-  "Darnell": "gYr8yTP0q4RkX1HnzQfX",
-  "Michelle": "ui11Rd52NKH2DbWlcbvw",
-  "Daniel": "tcO8jJ1XXzdQ4pzViV9c",
-  "Veronica": "GDzHdQOi6jjf8zaXhCYD",
-  "Ricardo": "l1zE9xgNpUTaQCZzpNJa",
-  "Linda": "flHkNRp1BlvT73UL6gyz",
-  "Robert": "uA0L9FxeLpzlG615Ueay",
-  "Patricia": "zwbQ2XUiIlOKD6b3JWXd",
-  "Clarence": "CXAc4DNZL6wonQQNlNgZ",
-  "Mei": "bQQWtYx9EodAqMdkrNAc",
-  "Minh": "cALE2CwoMM2QxiEdDEhv",
-  "Maria": "WLjZnm4PkNmYtNCyiCq8",
-  "Jose": "IP2syKL31S2JthzSSfZH",
-  "Ashley": "GbDIo39THauInuigCmPM",
-  "Ryan": "qIT7IrVUa21IEiKE1lug",
-  "Latoya": "BZgkqPqms7Kj9ulSkVzn",
-  "Jamal": "3w1kUvxu1LioQcLgp1KY",
-  "Tiffany": "XeomjLZoU5rr4yNIg16w",
-  "Kevin": "69Na567Zr0bPvmBYuGdc",
-  "Adriana": "FGLJyeekUzxl8M3CTG9M",
-  "Miguel": "dlGxemPxFMTY7iXagmOj",
-} as any;
-
-function getElevenVoiceId(avatarName: string | null | undefined): string | null {
-  if (!avatarName) return null;
-
-  const direct = ELEVEN_VOICE_ID_BY_COMPANION[avatarName];
-  if (direct) return direct;
-
-  const key = Object.keys(ELEVEN_VOICE_ID_BY_COMPANION).find(
-    (k) => k.toLowerCase() === avatarName.toLowerCase()
-  );
-  return key ? ELEVEN_VOICE_ID_BY_COMPANION[key] : null;
-}
-
-function getPhase1AvatarMedia(avatarName: string | null | undefined): Phase1AvatarMedia | null {
-  if (!avatarName) return null;
-
-  const direct = PHASE1_AVATAR_MEDIA[avatarName];
-  if (direct) return direct;
-
-  const key = Object.keys(PHASE1_AVATAR_MEDIA).find(
-    (k) => k.toLowerCase() === avatarName.toLowerCase()
-  );
-  return key ? PHASE1_AVATAR_MEDIA[key] : null;
-}
-
-function isDidSessionError(err: any): boolean {
-  const kind = typeof err?.kind === "string" ? err.kind : "";
-  const description = typeof err?.description === "string" ? err.description : "";
-  const message = typeof err?.message === "string" ? err.message : "";
-
-  // The SDK sometimes uses { kind, description } and sometimes uses message strings.
-  return (
-    kind === "SessionError" ||
-    description.toLowerCase().includes("session_id") ||
-    message.toLowerCase().includes("session_id")
-  );
-}
-
-function formatDidError(err: any): string {
-  if (!err) return "Unknown error";
-  if (typeof err === "string") return err;
-  if (typeof err?.message === "string") return err.message;
-
-  const kind = typeof err?.kind === "string" ? err.kind : undefined;
-  const description = typeof err?.description === "string" ? err.description : undefined;
-
-  if (kind || description) {
-    return JSON.stringify({ kind, description });
-  }
-
-  try {
-    return JSON.stringify(err);
-  } catch {
-    return String(err);
-  }
-}
-
-const UPGRADE_URL = "https://www.aihaven4u.com/pricing-plans/list";
-
-const MODE_LABELS: Record<Mode, string> = {
-  friend: "Friend",
-  romantic: "Romantic",
-  intimate: "Intimate (18+)",
+  "adriana": "FGLJyeekUzxl8M3CTG9M",
+  "ashley": "GbDIo39THauInuigCmPM",
+  "clarence": "CXAc4DNZL6wonQQNlNgZ",
+  "daniel": "tcO8jJ1XXzdQ4pzViV9c",
+  "darnell": "gYr8yTP0q4RkX1HnzQfX",
+  "haven": "rJ9XoWu8gbUhVKZnKY8X",
+  "jamal": "3w1kUvxu1LioQcLgp1KY",
+  "jason": "j0jBf06B5YHDbCWVmlmr",
+  "jennifer": "19STyYD15bswVz51nqLf",
+  "jose": "IP2syKL31S2JthzSSfZH",
+  "kevin": "69Na567Zr0bPvmBYuGdc",
+  "latoya": "BZgkqPqms7Kj9ulSkVzn",
+  "linda": "flHkNRp1BlvT73UL6gyz",
+  "maria": "WLjZnm4PkNmYtNCyiCq8",
+  "mei": "bQQWtYx9EodAqMdkrNAc",
+  "michelle": "ui11Rd52NKH2DbWlcbvw",
+  "miguel": "dlGxemPxFMTY7iXagmOj",
+  "minh": "cALE2CwoMM2QxiEdDEhv",
+  "patricia": "zwbQ2XUiIlOKD6b3JWXd",
+  "ricardo": "l1zE9xgNpUTaQCZzpNJa",
+  "robert": "uA0L9FxeLpzlG615Ueay",
+  "ryan": "qIT7IrVUa21IEiKE1lug",
+  "tiffany": "XeomjLZoU5rr4yNIg16w",
+  "tonya": "Hybl6rg76ZOcgqZqN5WN",
+  "veronica": "GDzHdQOi6jjf8zaXhCYD",
 };
 
 const ROMANTIC_ALLOWED_PLANS: PlanName[] = [
@@ -370,58 +306,6 @@ const [avatarError, setAvatarError] = useState<string | null>(null);
 // Local (non-live-avatar) ElevenLabs audio playback
 const localTtsAudioRef = useRef<HTMLAudioElement | null>(null);
 const localTtsCleanupRef = useRef<(() => void) | null>(null);
-
-// Some browsers (especially when embedded) will block programmatic audio playback unless the
-// page "unlocks" audio via a user gesture. We do this on mic-button press so voice-only
-// TTS can play without an extra "tap to play".
-const audioUnlockedRef = useRef<boolean>(false);
-const unlockAudioPlayback = useCallback(async () => {
-  if (audioUnlockedRef.current) return;
-  audioUnlockedRef.current = true;
-
-  // 1) Try WebAudio unlock
-  try {
-    const AudioCtx = (window as any).AudioContext || (window as any).webkitAudioContext;
-    if (AudioCtx) {
-      const ctx = new AudioCtx();
-      try {
-        await ctx.resume?.();
-      } catch {
-        // ignore
-      }
-      try {
-        const buffer = ctx.createBuffer(1, 1, 22050);
-        const source = ctx.createBufferSource();
-        source.buffer = buffer;
-        source.connect(ctx.destination);
-        source.start(0);
-        source.stop(0);
-      } catch {
-        // ignore
-      }
-      try {
-        await ctx.close?.();
-      } catch {
-        // ignore
-      }
-      return;
-    }
-  } catch {
-    // ignore
-  }
-
-  // 2) Fallback: play a silent WAV once
-  try {
-    const silent =
-      "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQAAAAA=";
-    const a = new Audio(silent);
-    a.volume = 0;
-    await a.play();
-    a.pause();
-  } catch {
-    // ignore
-  }
-}, []);
 
 const phase1AvatarMedia = useMemo(() => getPhase1AvatarMedia(companionName), [companionName]);
 
@@ -728,13 +612,6 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string, signal?
     localTtsAudioRef.current = null;
   }, []);
 
-  
-  // Voice-only audio playback (ElevenLabs -> Azure Blob URL). This is used when:
-  // - STT is enabled, AND
-  // - Live Avatar is NOT connected (or not available)
-  //
-  // IMPORTANT: We must pause STT *before* audio starts playing, otherwise the microphone
-  // can pick up the avatar's own voice and the agent will "talk to itself".
   const speakLocalTtsAudio = useCallback(
     async (audioUrl: string | null, hooks?: SpeakAssistantHooks): Promise<void> => {
       const url = (audioUrl || "").trim();
@@ -751,78 +628,16 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string, signal?
       stopLocalTtsAudio();
 
       await new Promise<void>((resolve) => {
-        let finished = false;
-        let audio: HTMLAudioElement | null = null;
-        let myCleanup: (() => void) | null = null;
-
-        const finish = (kind: "spoken" | "not_spoken") => {
-          if (finished) return;
-          finished = true;
-
-          // Clear refs if they still point to this playback
-          if (localTtsCleanupRef.current === myCleanup) localTtsCleanupRef.current = null;
-          if (localTtsAudioRef.current === audio) localTtsAudioRef.current = null;
-
+        if (typeof Audio === "undefined") {
           try {
-            if (kind === "spoken") hooks?.onDidSpeak?.();
-            else hooks?.onDidNotSpeak?.();
+            hooks?.onDidNotSpeak?.();
           } catch {
             // ignore
           }
+          return resolve();
+        }
 
-          resolve();
-        };
-
-        const safeCleanup = () => {
-          if (!audio) return;
-          try {
-            audio.removeEventListener("ended", onEnded);
-            audio.removeEventListener("error", onError);
-            audio.removeEventListener("pause", onPause);
-          } catch {
-            // ignore
-          }
-          try {
-            audio.pause();
-          } catch {
-            // ignore
-          }
-          try {
-            audio.currentTime = 0;
-          } catch {
-            // ignore
-          }
-        };
-
-        let willSpeakCalled = false;
-        const callWillSpeakOnce = () => {
-          if (willSpeakCalled) return;
-          willSpeakCalled = true;
-          try {
-            hooks?.onWillSpeak?.();
-          } catch {
-            // ignore
-          }
-        };
-
-        const onEnded = () => {
-          safeCleanup();
-          finish("spoken");
-        };
-
-        const onError = () => {
-          safeCleanup();
-          finish("not_spoken");
-        };
-
-        const onPause = () => {
-          // If it ended naturally, 'ended' will fire.
-          if ((audio as any)?.ended) return;
-          safeCleanup();
-          finish("not_spoken");
-        };
-
-        audio = new Audio(url);
+        const audio = new Audio(url);
         audio.preload = "auto";
         try {
           (audio as any).crossOrigin = "anonymous";
@@ -832,24 +647,64 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string, signal?
 
         localTtsAudioRef.current = audio;
 
-        myCleanup = () => {
-          safeCleanup();
-          finish("not_spoken");
+        let doneCalled = false;
+        let myCleanup: (() => void) | null = null;
+
+        const done = () => {
+          if (doneCalled) return;
+          doneCalled = true;
+
+          try {
+            audio.removeEventListener("ended", done);
+            audio.removeEventListener("error", done);
+          } catch {
+            // ignore
+          }
+
+          if (localTtsCleanupRef.current === myCleanup) {
+            localTtsCleanupRef.current = null;
+          }
+          if (localTtsAudioRef.current === audio) {
+            localTtsAudioRef.current = null;
+          }
+
+          resolve();
         };
+
+        myCleanup = () => {
+          try {
+            audio.pause();
+          } catch {
+            // ignore
+          }
+          done();
+        };
+
+        // Allow stopConversation() to interrupt the current local playback and release the promise.
         localTtsCleanupRef.current = myCleanup;
 
-        audio.addEventListener("ended", onEnded);
-        audio.addEventListener("error", onError);
-        audio.addEventListener("pause", onPause);
+        audio.addEventListener("ended", done);
+        audio.addEventListener("error", done);
 
-        // Pause STT BEFORE audio starts
-        callWillSpeakOnce();
-
-        audio.play().catch((e) => {
-          console.warn("Local TTS play() failed:", e);
-          safeCleanup();
-          finish("not_spoken");
-        });
+        // Start playback; only then signal onWillSpeak so the UI can delay the text until audio begins.
+        audio
+          .play()
+          .then(() => {
+            try {
+              hooks?.onWillSpeak?.();
+            } catch {
+              // ignore
+            }
+          })
+          .catch((e) => {
+            console.warn("Local TTS play() failed:", e);
+            try {
+              hooks?.onDidNotSpeak?.();
+            } catch {
+              // ignore
+            }
+            myCleanup?.();
+          });
       });
     },
     [stopLocalTtsAudio]
@@ -1796,14 +1651,8 @@ const stateToSendWithCompanion: SessionState = {
       stopSpeechToText();
       return;
     }
-    // Mic button is a user gesture — use it to unlock audio so voice-only TTS can autoplay.
-    try {
-      await unlockAudioPlayback();
-    } catch {
-      // ignore
-    }
     await startSpeechToText();
-  }, [startSpeechToText, stopSpeechToText, unlockAudioPlayback]);
+  }, [startSpeechToText, stopSpeechToText]);
 
   // Stop conversation: abort in-flight /chat, stop hands-free STT, and interrupt the Live Avatar if it's speaking.
   const stopConversation = useCallback(async () => {
