@@ -346,6 +346,18 @@ function normalizeMode(raw: any): Mode | null {
 export default function Page() {
   const sessionIdRef = useRef<string | null>(null);
 
+  // iOS/iPadOS detection (Safari has stricter audio-unlock behavior and can play WebRTC audio quietly)
+  const isIOS = useMemo(() => {
+    if (typeof navigator === "undefined") return false;
+    const ua = navigator.userAgent || "";
+    const isIPhoneIPadIPod = /iPad|iPhone|iPod/i.test(ua);
+    // iPadOS 13+ reports as Mac; detect via touch points
+    const isIPadOS =
+      !isIPhoneIPadIPod && /Macintosh/i.test(ua) && (navigator as any).maxTouchPoints > 1;
+    return isIPhoneIPadIPod || isIPadOS;
+  }, []);
+
+
   // Companion identity (drives persona + Phase 1 live avatar mapping)
   const [companionName, setCompanionName] = useState<string>(DEFAULT_COMPANION_NAME);
   const [avatarSrc, setAvatarSrc] = useState<string>(DEFAULT_AVATAR);
@@ -410,14 +422,38 @@ const unlockAudioPlayback = useCallback(async () => {
     // ignore
   }
 
-  // 2) Fallback: play a silent WAV once
+  // 2) Fallback: play a silent WAV once USING the same <audio> element we later reuse.
+  // iOS Safari is much more reliable when you unlock the exact element you will use for subsequent playback.
   try {
     const silent =
       "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQAAAAA=";
-    const a = new Audio(silent);
+
+    const a = localTtsAudioRef.current ?? new Audio();
+    localTtsAudioRef.current = a;
+
+    try {
+      (a as any).playsInline = true;
+      (a as any).setAttribute?.("playsinline", "true");
+    } catch {
+      // ignore
+    }
+
+    a.src = silent;
+    a.muted = true;
     a.volume = 0;
+
     await a.play();
     a.pause();
+
+    try {
+      a.currentTime = 0;
+    } catch {
+      // ignore
+    }
+
+    // Restore defaults for real playback
+    a.muted = false;
+    a.volume = 1;
     audioUnlockedRef.current = true;
   } catch {
     // ignore
@@ -826,10 +862,35 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string, signal?
           finish("not_spoken");
         };
 
-        audio = new Audio(url);
+        // Reuse a single <audio> element (critical for iOS Safari playback reliability)
+        audio = localTtsAudioRef.current ?? new Audio();
+        localTtsAudioRef.current = audio;
+
+        // IMPORTANT: do NOT set crossOrigin here (Azure Blob SAS URLs typically won't send ACAO for media).
+        audio.src = url;
         audio.preload = "auto";
 
-        localTtsAudioRef.current = audio;
+        try {
+          (audio as any).playsInline = true;
+          (audio as any).setAttribute?.("playsinline", "true");
+        } catch {
+          // ignore
+        }
+
+        // Ensure audible defaults (some iOS states can get "stuck" muted after unlock attempts)
+        try {
+          audio.muted = false;
+          audio.volume = 1;
+        } catch {
+          // ignore
+        }
+
+        // Force reload in Safari after changing src
+        try {
+          (audio as any).load?.();
+        } catch {
+          // ignore
+        }
 
         myCleanup = () => {
           safeCleanup();
@@ -842,7 +903,13 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string, signal?
         audio.addEventListener("pause", onPause);
 
         // Pause STT BEFORE audio starts
-        callWillSpeakOnce();
+        await callWillSpeakOnce();
+
+        // iOS/iPadOS: give Safari a moment to fully leave "record/voice" audio-session
+        // after we stop STT, otherwise playback can be extremely quiet or routed incorrectly.
+        if (isIOS) {
+          await new Promise((r) => setTimeout(r, 150));
+        }
 
         audio.play().catch((e) => {
           console.warn("Local TTS play() failed:", e);
@@ -863,7 +930,7 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string, signal?
         });
       });
     },
-    [stopLocalTtsAudio, unlockAudioPlayback]
+    [stopLocalTtsAudio, unlockAudioPlayback, isIOS]
   );
 
 const speakAssistantReply = useCallback(
@@ -1484,12 +1551,64 @@ const stateToSendWithCompanion: SessionState = {
             let speakPromise: Promise<void>;
 
             if (avatarStatus === "connected") {
-              speakPromise = Promise.resolve(
-                speakAssistantReply(replyText, speakHooks, audioUrlFromChat)
-              ).catch(() => {
-                // Safety: ensure the message appears even if speech throws before hooks are called.
-                commitAssistantMessage();
-              });
+              // Mobile Safari can play D‑ID (WebRTC) audio very quietly. When STT is enabled on iOS/iPadOS,
+              // we prefer to play the exact same ElevenLabs audio locally (louder + more reliable),
+              // while still sending it to D‑ID for lip-sync.
+              let audioUrlForSpeech: string | null = audioUrlFromChat;
+
+              // If backend didn't return audio_url, generate one so D-ID still has something to speak.
+              if (!audioUrlForSpeech && voiceIdForTts) {
+                audioUrlForSpeech = await getTtsAudioUrl(replyText, voiceIdForTts, controller?.signal);
+              }
+
+              // iOS "boost": mute the video element (avoid double-audio) and mirror audio locally.
+              const shouldMirrorLocalAudio = Boolean(isIOS && wantsVoiceOnly && audioUrlForSpeech && audioUnlockedRef.current);
+
+              if (shouldMirrorLocalAudio) {
+                try {
+                  const v = avatarVideoRef.current;
+                  if (v) {
+                    v.muted = true;
+                    v.volume = 0;
+                  }
+                } catch {
+                  // ignore
+                }
+
+                speakPromise = Promise.all([
+                  Promise.resolve(
+                    speakAssistantReply(replyText, speakHooks, audioUrlForSpeech)
+                  ).catch(() => {
+                    // Safety: ensure the message appears even if speech throws before hooks are called.
+                    commitAssistantMessage();
+                  }),
+                  Promise.resolve(
+                    speakLocalTtsAudio(audioUrlForSpeech!, speakHooks)
+                  ).catch(() => {
+                    // Safety: ensure the message appears even if local speech throws before hooks are called.
+                    commitAssistantMessage();
+                  }),
+                ]).then(() => undefined);
+              } else {
+                // Default behavior: let D-ID stream audio as usual
+                speakPromise = Promise.resolve(
+                  speakAssistantReply(replyText, speakHooks, audioUrlForSpeech)
+                ).catch(() => {
+                  // Safety: ensure the message appears even if speech throws before hooks are called.
+                  commitAssistantMessage();
+                });
+
+                // Ensure the video is not muted in this mode
+                try {
+                  const v = avatarVideoRef.current;
+                  if (v) {
+                    v.muted = false;
+                    v.volume = 1;
+                  }
+                } catch {
+                  // ignore
+                }
+              }
             } else if (wantsVoiceOnly && voiceIdForTts) {
               // Voice-only TTS (no Live Avatar). Prefer /chat-provided audio_url; fallback to /tts/audio-url.
               let audioUrlForLocal: string | null = audioUrlFromChat;
@@ -1579,6 +1698,9 @@ const stateToSendWithCompanion: SessionState = {
     clearSttRestartTimer();
     try {
       const rec = sttRecRef.current;
+      // On some mobile Safari builds, abort() releases the mic/audio-session more immediately than stop()
+      // (helps prevent low/earpiece-volume playback while TTS is speaking).
+      if (rec?.abort) rec.abort();
       if (rec?.stop) rec.stop();
     } catch {}
   }, []);
