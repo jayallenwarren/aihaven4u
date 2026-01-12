@@ -346,21 +346,22 @@ function normalizeMode(raw: any): Mode | null {
 export default function Page() {
   const sessionIdRef = useRef<string | null>(null);
 
+  // iOS/iPadOS detection (Safari has stricter audio-unlock behavior and can play WebRTC audio quietly)
+  const isIOS = useMemo(() => {
+    if (typeof navigator === "undefined") return false;
+    const ua = navigator.userAgent || "";
+    const isIPhoneIPadIPod = /iPad|iPhone|iPod/i.test(ua);
+    // iPadOS 13+ reports as Mac; detect via touch points
+    const isIPadOS =
+      !isIPhoneIPadIPod && /Macintosh/i.test(ua) && (navigator as any).maxTouchPoints > 1;
+    return isIPhoneIPadIPod || isIPadOS;
+  }, []);
+
+
   // Companion identity (drives persona + Phase 1 live avatar mapping)
   const [companionName, setCompanionName] = useState<string>(DEFAULT_COMPANION_NAME);
   const [avatarSrc, setAvatarSrc] = useState<string>(DEFAULT_AVATAR);
   const [companionKey, setCompanionKey] = useState<string>("");
-
-  // Mobile detection (iOS Safari has stricter autoplay + audio routing behavior)
-  const isIOS = useMemo(() => {
-    if (typeof navigator === "undefined") return false;
-    const ua = navigator.userAgent || "";
-    const iOSDevice = /iPad|iPhone|iPod/.test(ua);
-    const iPadOS13Plus =
-      navigator.platform === "MacIntel" && (navigator as any).maxTouchPoints > 1;
-    return iOSDevice || iPadOS13Plus;
-  }, []);
-
 
 
 // ----------------------------
@@ -385,59 +386,77 @@ const localTtsCleanupRef = useRef<(() => void) | null>(null);
 // Some browsers (especially when embedded) will block programmatic audio playback unless the
 // page "unlocks" audio via a user gesture. We do this on mic-button press so voice-only
 // TTS can play without an extra "tap to play".
-const htmlAudioUnlockedRef = useRef<boolean>(false);
-const webAudioUnlockedRef = useRef<boolean>(false);
-const webAudioCtxRef = useRef<any | null>(null);
-
-// Used to amplify Live Avatar audio on iOS (MediaStream -> WebAudio GainNode)
-const liveBoostSrcRef = useRef<any | null>(null);
-const liveBoostGainRef = useRef<any | null>(null);
-
+const audioUnlockedRef = useRef<boolean>(false);
 const unlockAudioPlayback = useCallback(async () => {
-  // IMPORTANT: this must run inside a user gesture (tap/click) to be effective on iOS.
-  // 1) Unlock HTMLAudioElement playback (needed for mic-only ElevenLabs TTS)
-  if (!htmlAudioUnlockedRef.current) {
-    try {
-      const silent =
-        "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA=";
-      const a = new Audio(silent);
-      a.volume = 0;
-      // Some iOS builds are picky unless the element is actually played once
-      await a.play();
-      a.pause();
-      a.currentTime = 0;
-      htmlAudioUnlockedRef.current = true;
-    } catch {
-      // ignore
+  if (audioUnlockedRef.current) return;
+
+  // 1) Try WebAudio unlock
+  try {
+    const AudioCtx = (window as any).AudioContext || (window as any).webkitAudioContext;
+    if (AudioCtx) {
+      const ctx = new AudioCtx();
+      try {
+        await ctx.resume?.();
+      } catch {
+        // ignore
+      }
+      try {
+        const buffer = ctx.createBuffer(1, 1, 22050);
+        const source = ctx.createBufferSource();
+        source.buffer = buffer;
+        source.connect(ctx.destination);
+        source.start(0);
+        source.stop(0);
+        audioUnlockedRef.current = true;
+      } catch {
+        // ignore
+      }
+      try {
+        await ctx.close?.();
+      } catch {
+        // ignore
+      }
+      if (audioUnlockedRef.current) return;
     }
+  } catch {
+    // ignore
   }
 
-  // 2) Unlock (and keep) a WebAudio context (used for Live Avatar audio boost on iOS)
-  if (!webAudioUnlockedRef.current) {
+  // 2) Fallback: play a silent WAV once USING the same <audio> element we later reuse.
+  // iOS Safari is much more reliable when you unlock the exact element you will use for subsequent playback.
+  try {
+    const silent =
+      "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQAAAAA=";
+
+    const a = localTtsAudioRef.current ?? new Audio();
+    localTtsAudioRef.current = a;
+
     try {
-      const AudioCtx = (window as any).AudioContext || (window as any).webkitAudioContext;
-      if (AudioCtx) {
-        const ctx = webAudioCtxRef.current ?? new AudioCtx();
-        webAudioCtxRef.current = ctx;
-
-        // A short silent buffer played inside a user gesture often unlocks WebAudio on iOS/Safari
-        try {
-          const buf = ctx.createBuffer(1, 1, 22050);
-          const src = ctx.createBufferSource();
-          src.buffer = buf;
-          src.connect(ctx.destination);
-          src.start(0);
-        } catch {
-          // ignore
-        }
-
-        await ctx.resume?.();
-        await new Promise((r) => setTimeout(r, 10));
-        webAudioUnlockedRef.current = true;
-      }
+      (a as any).playsInline = true;
+      (a as any).setAttribute?.("playsinline", "true");
     } catch {
       // ignore
     }
+
+    a.src = silent;
+    a.muted = true;
+    a.volume = 0;
+
+    await a.play();
+    a.pause();
+
+    try {
+      a.currentTime = 0;
+    } catch {
+      // ignore
+    }
+
+    // Restore defaults for real playback
+    a.muted = false;
+    a.volume = 1;
+    audioUnlockedRef.current = true;
+  } catch {
+    // ignore
   }
 }, []);
 
@@ -492,24 +511,6 @@ const stopLiveAvatar = useCallback(async () => {
   } finally {
     setAvatarStatus("idle");
     setAvatarError(null);
-    // Cleanup any boosted audio route (used on iOS to increase Live Avatar volume)
-    try {
-      liveBoostSrcRef.current?.disconnect?.();
-    } catch {}
-    try {
-      liveBoostGainRef.current?.disconnect?.();
-    } catch {}
-    liveBoostSrcRef.current = null;
-    liveBoostGainRef.current = null;
-    // Ensure the video element isn't left muted by the boost path
-    try {
-      const vid = avatarVideoRef.current;
-      if (vid) {
-        vid.muted = false;
-        vid.volume = 1;
-      }
-    } catch {}
-
   }
 }, []);
 
@@ -539,73 +540,8 @@ const reconnectLiveAvatar = useCallback(async () => {
   }
 }, []);
 
-
-const applyLiveAvatarAudioBoost = useCallback(
-  async (stream: MediaStream | null) => {
-    if (!isIOS) return;
-    if (!stream) return;
-
-    try {
-      const AudioCtx = (window as any).AudioContext || (window as any).webkitAudioContext;
-      if (!AudioCtx) return;
-
-      const ctx = webAudioCtxRef.current ?? new AudioCtx();
-      webAudioCtxRef.current = ctx;
-
-      await ctx.resume?.();
-
-      // Tear down any existing route
-      try {
-        liveBoostSrcRef.current?.disconnect?.();
-      } catch {}
-      try {
-        liveBoostGainRef.current?.disconnect?.();
-      } catch {}
-      liveBoostSrcRef.current = null;
-      liveBoostGainRef.current = null;
-
-      const src = ctx.createMediaStreamSource(stream);
-      const gain = ctx.createGain();
-
-      // Boost a bit on iOS (helps when Safari puts the device in a low-volume "communications" path)
-      gain.gain.value = 2.0;
-
-      src.connect(gain);
-      gain.connect(ctx.destination);
-
-      liveBoostSrcRef.current = src;
-      liveBoostGainRef.current = gain;
-
-      // Mute the <video> element's built-in audio so we don't double-play
-      const vid = avatarVideoRef.current;
-      if (vid) {
-        vid.muted = true;
-        vid.volume = 1;
-      }
-    } catch (e) {
-      console.warn("Live avatar audio boost failed:", e);
-      // If boost fails, keep video audio (do NOT force mute)
-      try {
-        const vid = avatarVideoRef.current;
-        if (vid) {
-          vid.muted = false;
-          vid.volume = 1;
-        }
-      } catch {}
-    }
-  },
-  [isIOS]
-);
-
 const startLiveAvatar = useCallback(async () => {
   setAvatarError(null);
-
-  // Start Live Avatar is a user gesture — also unlock audio (important for iOS/Safari)
-  try {
-    await unlockAudioPlayback();
-  } catch {
-    // ignore
-  }
 
   if (!phase1AvatarMedia) {
     setAvatarStatus("error");
@@ -683,23 +619,9 @@ const startLiveAvatar = useCallback(async () => {
               // ignore
             }
             vid.loop = false;
-            try {
-              vid.muted = false;
-              vid.volume = 1;
-            } catch {
-              // ignore
-            }
             vid.srcObject = value;
             vid.play().catch(() => {});
           }
-
-          // iOS: boost Live Avatar audio output (helps when output is very quiet on iPad/iPhone)
-          try {
-            void applyLiveAvatarAudioBoost(value as any);
-          } catch {
-            // ignore
-          }
-
           return value;
         },
 
@@ -768,7 +690,7 @@ const startLiveAvatar = useCallback(async () => {
     setAvatarError(e?.message ? String(e.message) : "Failed to start Live Avatar");
     didAgentMgrRef.current = null;
   }
-}, [phase1AvatarMedia, avatarStatus, reconnectLiveAvatar, unlockAudioPlayback, applyLiveAvatarAudioBoost]);
+}, [phase1AvatarMedia, avatarStatus, reconnectLiveAvatar]);
 
 useEffect(() => {
   // Stop when switching companions
@@ -868,7 +790,7 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string, signal?
       // Stop any previous playback
       stopLocalTtsAudio();
 
-      await new Promise<void>((resolve) => {
+      await new Promise<void>(async (resolve) => {
         let finished = false;
         let audio: HTMLAudioElement | null = null;
         let myCleanup: (() => void) | null = null;
@@ -940,10 +862,35 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string, signal?
           finish("not_spoken");
         };
 
-        audio = new Audio(url);
+        // Reuse a single <audio> element (critical for iOS Safari playback reliability)
+        audio = localTtsAudioRef.current ?? new Audio();
+        localTtsAudioRef.current = audio;
+
+        // IMPORTANT: do NOT set crossOrigin here (Azure Blob SAS URLs typically won't send ACAO for media).
+        audio.src = url;
         audio.preload = "auto";
 
-        localTtsAudioRef.current = audio;
+        try {
+          (audio as any).playsInline = true;
+          (audio as any).setAttribute?.("playsinline", "true");
+        } catch {
+          // ignore
+        }
+
+        // Ensure audible defaults (some iOS states can get "stuck" muted after unlock attempts)
+        try {
+          audio.muted = false;
+          audio.volume = 1;
+        } catch {
+          // ignore
+        }
+
+        // Force reload in Safari after changing src
+        try {
+          (audio as any).load?.();
+        } catch {
+          // ignore
+        }
 
         myCleanup = () => {
           safeCleanup();
@@ -956,7 +903,13 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string, signal?
         audio.addEventListener("pause", onPause);
 
         // Pause STT BEFORE audio starts
-        callWillSpeakOnce();
+        await callWillSpeakOnce();
+
+        // iOS/iPadOS: give Safari a moment to fully leave "record/voice" audio-session
+        // after we stop STT, otherwise playback can be extremely quiet or routed incorrectly.
+        if (isIOS) {
+          await new Promise((r) => setTimeout(r, 150));
+        }
 
         audio.play().catch((e) => {
           console.warn("Local TTS play() failed:", e);
@@ -964,7 +917,7 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string, signal?
           // Retry once after attempting to unlock audio (autoplay policies / iframes).
           (async () => {
             try {
-              htmlAudioUnlockedRef.current = false;
+              audioUnlockedRef.current = false;
               await unlockAudioPlayback();
               await audio!.play();
               return;
@@ -977,7 +930,7 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string, signal?
         });
       });
     },
-    [stopLocalTtsAudio, unlockAudioPlayback]
+    [stopLocalTtsAudio, unlockAudioPlayback, isIOS]
   );
 
 const speakAssistantReply = useCallback(
@@ -1053,13 +1006,7 @@ const speakAssistantReply = useCallback(
         if (typeof Audio === "undefined") return resolve(fallback);
         const a = new Audio();
         a.preload = "metadata";
-        // Some CDNs require this for cross-origin metadata access (best-effort).
-        try {
-          (a as any).crossOrigin = "anonymous";
-        } catch {
-          // ignore
-        }
-
+        // NOTE: do NOT set crossOrigin here; Azure Blob SAS URLs may not send CORS headers, which can break metadata loading in browsers.
         let doneCalled = false;
         const done = (ms: number) => {
           if (doneCalled) return;
@@ -1598,12 +1545,64 @@ const stateToSendWithCompanion: SessionState = {
             let speakPromise: Promise<void>;
 
             if (avatarStatus === "connected") {
-              speakPromise = Promise.resolve(
-                speakAssistantReply(replyText, speakHooks, audioUrlFromChat)
-              ).catch(() => {
-                // Safety: ensure the message appears even if speech throws before hooks are called.
-                commitAssistantMessage();
-              });
+              // Mobile Safari can play D‑ID (WebRTC) audio very quietly. When STT is enabled on iOS/iPadOS,
+              // we prefer to play the exact same ElevenLabs audio locally (louder + more reliable),
+              // while still sending it to D‑ID for lip-sync.
+              let audioUrlForSpeech: string | null = audioUrlFromChat;
+
+              // If backend didn't return audio_url, generate one so D-ID still has something to speak.
+              if (!audioUrlForSpeech && voiceIdForTts) {
+                audioUrlForSpeech = await getTtsAudioUrl(replyText, voiceIdForTts, controller?.signal);
+              }
+
+              // iOS "boost": mute the video element (avoid double-audio) and mirror audio locally.
+              const shouldMirrorLocalAudio = Boolean(isIOS && wantsVoiceOnly && audioUrlForSpeech && audioUnlockedRef.current);
+
+              if (shouldMirrorLocalAudio) {
+                try {
+                  const v = avatarVideoRef.current;
+                  if (v) {
+                    v.muted = true;
+                    v.volume = 0;
+                  }
+                } catch {
+                  // ignore
+                }
+
+                speakPromise = Promise.all([
+                  Promise.resolve(
+                    speakAssistantReply(replyText, speakHooks, audioUrlForSpeech)
+                  ).catch(() => {
+                    // Safety: ensure the message appears even if speech throws before hooks are called.
+                    commitAssistantMessage();
+                  }),
+                  Promise.resolve(
+                    speakLocalTtsAudio(audioUrlForSpeech!, speakHooks)
+                  ).catch(() => {
+                    // Safety: ensure the message appears even if local speech throws before hooks are called.
+                    commitAssistantMessage();
+                  }),
+                ]).then(() => undefined);
+              } else {
+                // Default behavior: let D-ID stream audio as usual
+                speakPromise = Promise.resolve(
+                  speakAssistantReply(replyText, speakHooks, audioUrlForSpeech)
+                ).catch(() => {
+                  // Safety: ensure the message appears even if speech throws before hooks are called.
+                  commitAssistantMessage();
+                });
+
+                // Ensure the video is not muted in this mode
+                try {
+                  const v = avatarVideoRef.current;
+                  if (v) {
+                    v.muted = false;
+                    v.volume = 1;
+                  }
+                } catch {
+                  // ignore
+                }
+              }
             } else if (wantsVoiceOnly && voiceIdForTts) {
               // Voice-only TTS (no Live Avatar). Prefer /chat-provided audio_url; fallback to /tts/audio-url.
               let audioUrlForLocal: string | null = audioUrlFromChat;
@@ -1693,6 +1692,9 @@ const stateToSendWithCompanion: SessionState = {
     clearSttRestartTimer();
     try {
       const rec = sttRecRef.current;
+      // On some mobile Safari builds, abort() releases the mic/audio-session more immediately than stop()
+      // (helps prevent low/earpiece-volume playback while TTS is speaking).
+      if (rec?.abort) rec.abort();
       if (rec?.stop) rec.stop();
     } catch {}
   }, []);
