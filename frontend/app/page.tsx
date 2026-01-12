@@ -386,77 +386,100 @@ const localTtsCleanupRef = useRef<(() => void) | null>(null);
 // Some browsers (especially when embedded) will block programmatic audio playback unless the
 // page "unlocks" audio via a user gesture. We do this on mic-button press so voice-only
 // TTS can play without an extra "tap to play".
-const audioUnlockedRef = useRef<boolean>(false);
-const unlockAudioPlayback = useCallback(async () => {
-  if (audioUnlockedRef.current) return;
+//
+// IMPORTANT: iOS Safari often treats WebAudio "unlocked" differently than HTMLAudio. We therefore
+// unlock HTMLAudio on the *exact* <audio> element we later reuse for TTS playback.
+const audioUnlockedRef = useRef<boolean>(false); // HTMLAudio unlocked
+const webAudioUnlockedRef = useRef<boolean>(false); // WebAudio unlocked (best-effort)
 
-  // 1) Try WebAudio unlock
-  try {
-    const AudioCtx = (window as any).AudioContext || (window as any).webkitAudioContext;
-    if (AudioCtx) {
-      const ctx = new AudioCtx();
+const unlockAudioPlayback = useCallback(async () => {
+  // If both are already unlocked, nothing to do.
+  if (audioUnlockedRef.current && webAudioUnlockedRef.current) return;
+
+  // 1) Unlock HTMLAudio on the exact element we reuse later (most reliable on iOS Safari)
+  if (!audioUnlockedRef.current) {
+    try {
+      const silent =
+        "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQAAAAA=";
+
+      const a = localTtsAudioRef.current ?? new Audio();
+      localTtsAudioRef.current = a;
+
       try {
-        await ctx.resume?.();
+        (a as any).playsInline = true;
+        (a as any).setAttribute?.("playsinline", "true");
       } catch {
         // ignore
       }
+
+      // Some iOS versions are picky if the element is already pointing at another URL.
       try {
-        const buffer = ctx.createBuffer(1, 1, 22050);
-        const source = ctx.createBufferSource();
-        source.buffer = buffer;
-        source.connect(ctx.destination);
-        source.start(0);
-        source.stop(0);
-        audioUnlockedRef.current = true;
+        a.pause();
       } catch {
         // ignore
       }
+
+      a.src = silent;
+      a.muted = true;
+      a.volume = 0;
+      a.preload = "auto";
+
       try {
-        await ctx.close?.();
+        (a as any).load?.();
       } catch {
         // ignore
       }
-      if (audioUnlockedRef.current) return;
+
+      await a.play();
+      a.pause();
+
+      try {
+        a.currentTime = 0;
+      } catch {
+        // ignore
+      }
+
+      // Restore defaults for real playback
+      a.muted = false;
+      a.volume = 1;
+
+      audioUnlockedRef.current = true;
+    } catch {
+      // ignore
     }
-  } catch {
-    // ignore
   }
 
-  // 2) Fallback: play a silent WAV once USING the same <audio> element we later reuse.
-  // iOS Safari is much more reliable when you unlock the exact element you will use for subsequent playback.
-  try {
-    const silent =
-      "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQAAAAA=";
-
-    const a = localTtsAudioRef.current ?? new Audio();
-    localTtsAudioRef.current = a;
-
+  // 2) Best-effort WebAudio unlock (do NOT treat this as unlocking HTMLAudio)
+  if (!webAudioUnlockedRef.current) {
     try {
-      (a as any).playsInline = true;
-      (a as any).setAttribute?.("playsinline", "true");
+      const AudioCtx = (window as any).AudioContext || (window as any).webkitAudioContext;
+      if (AudioCtx) {
+        const ctx = new AudioCtx();
+        try {
+          await ctx.resume?.();
+        } catch {
+          // ignore
+        }
+        try {
+          const buffer = ctx.createBuffer(1, 1, 22050);
+          const source = ctx.createBufferSource();
+          source.buffer = buffer;
+          source.connect(ctx.destination);
+          source.start(0);
+          source.stop(0);
+          webAudioUnlockedRef.current = true;
+        } catch {
+          // ignore
+        }
+        try {
+          await ctx.close?.();
+        } catch {
+          // ignore
+        }
+      }
     } catch {
       // ignore
     }
-
-    a.src = silent;
-    a.muted = true;
-    a.volume = 0;
-
-    await a.play();
-    a.pause();
-
-    try {
-      a.currentTime = 0;
-    } catch {
-      // ignore
-    }
-
-    // Restore defaults for real playback
-    a.muted = false;
-    a.volume = 1;
-    audioUnlockedRef.current = true;
-  } catch {
-    // ignore
   }
 }, []);
 
@@ -557,6 +580,14 @@ const startLiveAvatar = useCallback(async () => {
     return;
 
   setAvatarStatus("connecting");
+
+  // Use the Start Live Avatar click as a user gesture to unlock HTMLAudio (important on iOS Safari).
+  // This enables reliable + louder local playback when we mirror ElevenLabs audio.
+  try {
+    await unlockAudioPlayback();
+  } catch {
+    // ignore
+  }
 
   try {
     // Defensive: if something is lingering from a prior attempt, disconnect & clear.
@@ -690,7 +721,7 @@ const startLiveAvatar = useCallback(async () => {
     setAvatarError(e?.message ? String(e.message) : "Failed to start Live Avatar");
     didAgentMgrRef.current = null;
   }
-}, [phase1AvatarMedia, avatarStatus, reconnectLiveAvatar]);
+}, [phase1AvatarMedia, avatarStatus, reconnectLiveAvatar, unlockAudioPlayback]);
 
 useEffect(() => {
   // Stop when switching companions
@@ -1556,7 +1587,7 @@ const stateToSendWithCompanion: SessionState = {
               }
 
               // iOS "boost": mute the video element (avoid double-audio) and mirror audio locally.
-              const shouldMirrorLocalAudio = Boolean(isIOS && wantsVoiceOnly && audioUrlForSpeech && audioUnlockedRef.current);
+              const shouldMirrorLocalAudio = Boolean(isIOS && audioUrlForSpeech && audioUnlockedRef.current);
 
               if (shouldMirrorLocalAudio) {
                 try {
