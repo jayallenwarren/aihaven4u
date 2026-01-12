@@ -1485,7 +1485,7 @@ const stateToSendWithCompanion: SessionState = {
         onWillSpeak: () => {
           // We'll treat "speaking" the same whether it's Live Avatar or local audio-only.
           if (!assistantCommitted) {
-            commitAssistantMessage(replyText);
+            commitAssistantMessage();
             assistantCommitted = true;
           }
 
@@ -1499,7 +1499,7 @@ const stateToSendWithCompanion: SessionState = {
         onDidNotSpeak: () => {
           // If we can't speak, still show the assistant message immediately.
           if (!assistantCommitted) {
-            commitAssistantMessage(replyText);
+            commitAssistantMessage();
             assistantCommitted = true;
           }
         },
