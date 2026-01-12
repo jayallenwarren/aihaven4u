@@ -377,7 +377,6 @@ const localTtsCleanupRef = useRef<(() => void) | null>(null);
 const audioUnlockedRef = useRef<boolean>(false);
 const unlockAudioPlayback = useCallback(async () => {
   if (audioUnlockedRef.current) return;
-  audioUnlockedRef.current = true;
 
   // 1) Try WebAudio unlock
   try {
@@ -396,6 +395,7 @@ const unlockAudioPlayback = useCallback(async () => {
         source.connect(ctx.destination);
         source.start(0);
         source.stop(0);
+        audioUnlockedRef.current = true;
       } catch {
         // ignore
       }
@@ -404,7 +404,7 @@ const unlockAudioPlayback = useCallback(async () => {
       } catch {
         // ignore
       }
-      return;
+      if (audioUnlockedRef.current) return;
     }
   } catch {
     // ignore
@@ -418,6 +418,7 @@ const unlockAudioPlayback = useCallback(async () => {
     a.volume = 0;
     await a.play();
     a.pause();
+    audioUnlockedRef.current = true;
   } catch {
     // ignore
   }
@@ -827,11 +828,6 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string, signal?
 
         audio = new Audio(url);
         audio.preload = "auto";
-        try {
-          (audio as any).crossOrigin = "anonymous";
-        } catch {
-          // ignore
-        }
 
         localTtsAudioRef.current = audio;
 
@@ -850,12 +846,24 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string, signal?
 
         audio.play().catch((e) => {
           console.warn("Local TTS play() failed:", e);
-          safeCleanup();
-          finish("not_spoken");
+
+          // Retry once after attempting to unlock audio (autoplay policies / iframes).
+          (async () => {
+            try {
+              audioUnlockedRef.current = false;
+              await unlockAudioPlayback();
+              await audio!.play();
+              return;
+            } catch (e2) {
+              console.warn("Local TTS retry play() failed:", e2);
+              safeCleanup();
+              finish("not_spoken");
+            }
+          })();
         });
       });
     },
-    [stopLocalTtsAudio]
+    [stopLocalTtsAudio, unlockAudioPlayback]
   );
 
 const speakAssistantReply = useCallback(
