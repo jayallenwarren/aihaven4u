@@ -322,15 +322,168 @@ const didReconnectInFlightRef = useRef<boolean>(false);
 );
 const [avatarError, setAvatarError] = useState<string | null>(null);
 
+// iPhone Safari can render the WebRTC audio from the D‑ID stream extremely quiet.
+// For iPhone only, we route the MediaStream audio through WebAudio with a GainNode boost.
+// This keeps lip‑sync (same stream) while making output louder.
+const isIPhoneDevice = useMemo(() => {
+  if (typeof navigator === "undefined") return false;
+  const ua = navigator.userAgent || "";
+  return /iPhone|iPod/i.test(ua);
+}, []);
+
+const iphoneAudioCtxRef = useRef<AudioContext | null>(null);
+const iphoneAudioSrcRef = useRef<MediaStreamAudioSourceNode | null>(null);
+const iphoneAudioGainRef = useRef<GainNode | null>(null);
+const iphoneAudioCompRef = useRef<DynamicsCompressorNode | null>(null);
+
 const phase1AvatarMedia = useMemo(() => getPhase1AvatarMedia(companionName), [companionName]);
 
   // UI layout
   const conversationHeight = 520;
   const showAvatarFrame = Boolean(phase1AvatarMedia) && avatarStatus !== "idle";
 
+const primeIPhoneLiveAudio = useCallback(() => {
+  if (!isIPhoneDevice) return;
+  try {
+    const Ctor = (window as any).AudioContext || (window as any).webkitAudioContext;
+    if (!Ctor) return;
+
+    let ctx = iphoneAudioCtxRef.current;
+    if (!ctx || ctx.state === "closed") {
+      ctx = new Ctor();
+      iphoneAudioCtxRef.current = ctx;
+    }
+
+    // Resume in response to a user gesture (Start Live Avatar button).
+    if (ctx.state === "suspended") {
+      ctx.resume().catch(() => {});
+    }
+
+    // "Tickle" the audio graph so iOS establishes an output route.
+    const osc = ctx.createOscillator();
+    const g = ctx.createGain();
+    g.gain.value = 0.00001;
+    osc.connect(g);
+    g.connect(ctx.destination);
+    osc.start();
+    osc.stop(ctx.currentTime + 0.02);
+  } catch {
+    // ignore
+  }
+}, [isIPhoneDevice]);
+
+const disableIPhoneLiveAudioBoost = useCallback(() => {
+  if (!isIPhoneDevice) return;
+
+  try {
+    iphoneAudioSrcRef.current?.disconnect();
+  } catch {}
+  try {
+    iphoneAudioGainRef.current?.disconnect();
+  } catch {}
+  try {
+    iphoneAudioCompRef.current?.disconnect();
+  } catch {}
+
+  iphoneAudioSrcRef.current = null;
+  iphoneAudioGainRef.current = null;
+  iphoneAudioCompRef.current = null;
+
+  try {
+    const ctx = iphoneAudioCtxRef.current;
+    if (ctx && ctx.state !== "closed") {
+      ctx.close().catch(() => {});
+    }
+  } catch {
+    // ignore
+  }
+  iphoneAudioCtxRef.current = null;
+
+  const vid = avatarVideoRef.current;
+  if (vid) {
+    vid.muted = false;
+    vid.volume = 1;
+  }
+}, [isIPhoneDevice]);
+
+const enableIPhoneLiveAudioBoost = useCallback(
+  (stream: any) => {
+    if (!isIPhoneDevice) return;
+
+    try {
+      const Ctor = (window as any).AudioContext || (window as any).webkitAudioContext;
+      if (!Ctor) return;
+
+      const mediaStream = stream as MediaStream;
+      if (!mediaStream || typeof (mediaStream as any).getAudioTracks !== "function") return;
+
+      const tracks = (mediaStream as any).getAudioTracks?.() || [];
+      if (!tracks || tracks.length === 0) return;
+
+      let ctx = iphoneAudioCtxRef.current;
+      if (!ctx || ctx.state === "closed") {
+        ctx = new Ctor();
+        iphoneAudioCtxRef.current = ctx;
+      }
+
+      if (ctx.state === "suspended") {
+        ctx.resume().catch(() => {});
+      }
+
+      // Remove previous graph
+      try {
+        iphoneAudioSrcRef.current?.disconnect();
+      } catch {}
+      try {
+        iphoneAudioGainRef.current?.disconnect();
+      } catch {}
+      try {
+        iphoneAudioCompRef.current?.disconnect();
+      } catch {}
+
+      const src = ctx.createMediaStreamSource(mediaStream);
+      const gain = ctx.createGain();
+
+      // Conservative boost; avoids clipping but helps iPhone speaker output.
+      gain.gain.value = 2.6;
+
+      const comp = ctx.createDynamicsCompressor();
+      // Gentle compression to prevent clipping with boosted gain
+      comp.threshold.value = -20;
+      comp.knee.value = 25;
+      comp.ratio.value = 10;
+      comp.attack.value = 0.003;
+      comp.release.value = 0.25;
+
+      src.connect(gain);
+      gain.connect(comp);
+      comp.connect(ctx.destination);
+
+      iphoneAudioSrcRef.current = src;
+      iphoneAudioGainRef.current = gain;
+      iphoneAudioCompRef.current = comp;
+
+      const vid = avatarVideoRef.current;
+      if (vid) {
+        // Avoid doubled audio: let WebAudio handle playback.
+        vid.muted = true;
+        vid.volume = 1;
+      }
+    } catch (e) {
+      console.warn("iPhone live audio boost failed:", e);
+      const vid = avatarVideoRef.current;
+      if (vid) {
+        vid.muted = false;
+        vid.volume = 1;
+      }
+    }
+  },
+  [isIPhoneDevice]
+);
 
 const stopLiveAvatar = useCallback(async () => {
   try {
+    disableIPhoneLiveAudioBoost();
     const mgr = didAgentMgrRef.current;
     didAgentMgrRef.current = null;
 
@@ -421,6 +574,7 @@ const startLiveAvatar = useCallback(async () => {
   setAvatarStatus("connecting");
 
   try {
+    primeIPhoneLiveAudio();
     // Defensive: if something is lingering from a prior attempt, disconnect & clear.
     try {
       if (didAgentMgrRef.current) {
@@ -482,7 +636,10 @@ const startLiveAvatar = useCallback(async () => {
             }
             vid.loop = false;
             vid.srcObject = value;
+            vid.muted = false;
+            vid.volume = 1;
             vid.play().catch(() => {});
+            enableIPhoneLiveAudioBoost(value);
           }
           return value;
         },
@@ -524,7 +681,10 @@ const startLiveAvatar = useCallback(async () => {
               }
               vid.loop = false;
               vid.srcObject = stream;
+              vid.muted = false;
+              vid.volume = 1;
               vid.play().catch(() => {});
+              enableIPhoneLiveAudioBoost(stream);
             } catch {
               // ignore
             }
@@ -552,7 +712,7 @@ const startLiveAvatar = useCallback(async () => {
     setAvatarError(e?.message ? String(e.message) : "Failed to start Live Avatar");
     didAgentMgrRef.current = null;
   }
-}, [phase1AvatarMedia, avatarStatus, reconnectLiveAvatar]);
+}, [phase1AvatarMedia, avatarStatus, reconnectLiveAvatar, primeIPhoneLiveAudio, enableIPhoneLiveAudioBoost]);
 
 useEffect(() => {
   // Stop when switching companions
