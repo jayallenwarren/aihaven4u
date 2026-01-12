@@ -333,6 +333,15 @@ function normalizeMode(raw: any): Mode | null {
 
 
 export default function Page() {
+  // iOS detection (includes iPadOS 13+ which reports itself as "Macintosh")
+  const isIOS = useMemo(() => {
+    if (typeof navigator === "undefined") return false;
+    const ua = navigator.userAgent || "";
+    const iOS = /iPad|iPhone|iPod/i.test(ua);
+    const iPadOS13 = /Macintosh/i.test(ua) && typeof document !== "undefined" && "ontouchend" in document;
+    return iOS || iPadOS13;
+  }, []);
+
   const isIphone = useMemo(() => {
     if (typeof navigator === "undefined") return false;
     return /iPhone|iPod/i.test(navigator.userAgent || "");
@@ -787,8 +796,11 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string): Promis
     }
 
     // Must be triggered from a user gesture (e.g., mic button click).
-    a.muted = true;
-    a.volume = 0;
+    // IMPORTANT for iOS Safari: unlocking should be an *unmuted* play() (muted playback can
+    // "succeed" but still leave later unmuted TTS blocked). We keep volume near-zero so it
+    // stays inaudible.
+    a.muted = false;
+    a.volume = 0.001;
     a.src = PRIME_SILENT_WAV;
 
     const p = a.play?.();
@@ -861,16 +873,68 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string): Promis
       a.muted = false;
       a.volume = 1;
       a.src = audioUrl;
+      a.preload = "auto";
+      try {
+        a.load?.();
+      } catch {
+        // ignore
+      }
 
-      // iPhone Safari: after stopping mic/recording, give the audio session a moment to settle.
-      if (isIphone) {
-        await new Promise((r) => setTimeout(r, 180));
+      // iOS Safari: after stopping mic/recording, ensure the mic session is fully released
+      // before starting playback (otherwise audio can be inaudible or stop after the first turn).
+      if (isIOS) {
+        try {
+          const rec = sttRecRef.current;
+          if (rec && typeof rec.stop === "function") {
+            await new Promise<void>((resolve) => {
+              let settled = false;
+              const prevOnEnd = rec.onend;
+              const finish = () => {
+                if (settled) return;
+                settled = true;
+                try {
+                  rec.onend = prevOnEnd;
+                } catch {
+                  // ignore
+                }
+                resolve();
+              };
+
+              try {
+                rec.onend = (...args: any[]) => {
+                  try {
+                    prevOnEnd?.apply(rec, args as any);
+                  } catch {
+                    // ignore
+                  }
+                  finish();
+                };
+              } catch {
+                // ignore
+              }
+
+              try {
+                rec.stop();
+              } catch {
+                finish();
+              }
+
+              setTimeout(finish, 650);
+            });
+          }
+        } catch {
+          // ignore
+        }
+
+        // Give iOS a beat to switch audio route back to playback.
+        await new Promise((r) => setTimeout(r, isIphone ? 220 : 150));
       }
 
       hooks?.onWillSpeak?.();
 
       try {
         await a.play();
+        localTtsUnlockedRef.current = true;
       } catch (err) {
         console.warn("Local TTS playback failed:", err);
         hooks?.onDidNotSpeak?.();
@@ -897,7 +961,7 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string): Promis
         setTimeout(finish, 90_000);
       });
     },
-    [isIphone]
+    [isIOS, isIphone]
   );
 
   const speakLocalTtsReply = useCallback(
