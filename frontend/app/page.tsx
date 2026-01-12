@@ -1484,9 +1484,9 @@ const stateToSendWithCompanion: SessionState = {
       const hooks: SpeakAssistantHooks = {
         onWillSpeak: () => {
           // We'll treat "speaking" the same whether it's Live Avatar or local audio-only.
-          if (!assistantCommittedRef.current) {
+          if (!assistantCommitted) {
             commitAssistantMessage(replyText);
-            assistantCommittedRef.current = true;
+            assistantCommitted = true;
           }
 
           // Block STT from capturing the assistant speech.
@@ -1498,9 +1498,9 @@ const stateToSendWithCompanion: SessionState = {
         },
         onDidNotSpeak: () => {
           // If we can't speak, still show the assistant message immediately.
-          if (!assistantCommittedRef.current) {
+          if (!assistantCommitted) {
             commitAssistantMessage(replyText);
-            assistantCommittedRef.current = true;
+            assistantCommitted = true;
           }
         },
       };
