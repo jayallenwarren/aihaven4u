@@ -24,11 +24,6 @@ type ChatApiResponse = {
   reply: string;
   mode?: ChatStatus; // IMPORTANT: this is STATUS, not the UI pill mode
   session_state?: Partial<SessionState>;
-
-  // Optional optimization: backend may return a ready-to-play ElevenLabs->Blob URL
-  // so the frontend can skip a second /tts/audio-url round trip.
-  audio_url?: string;
-  audioUrl?: string;
 };
 
 type PlanName =
@@ -79,46 +74,6 @@ const PHASE1_AVATAR_MEDIA: Record<string, Phase1AvatarMedia> = {
     "elevenVoiceId": "Hybl6rg76ZOcgqZqN5WN"
   }
 } as any;
-
-const ELEVEN_VOICE_ID_BY_COMPANION: Record<string, string> = {
-  "Haven": "rJ9XoWu8gbUhVKZnKY8X",
-  "Jennifer": "19STyYD15bswVz51nqLf",
-  "Jason": "j0jBf06B5YHDbCWVmlmr",
-  "Tonya": "Hybl6rg76ZOcgqZqN5WN",
-  "Darnell": "gYr8yTP0q4RkX1HnzQfX",
-  "Michelle": "ui11Rd52NKH2DbWlcbvw",
-  "Daniel": "tcO8jJ1XXzdQ4pzViV9c",
-  "Veronica": "GDzHdQOi6jjf8zaXhCYD",
-  "Ricardo": "l1zE9xgNpUTaQCZzpNJa",
-  "Linda": "flHkNRp1BlvT73UL6gyz",
-  "Robert": "uA0L9FxeLpzlG615Ueay",
-  "Patricia": "zwbQ2XUiIlOKD6b3JWXd",
-  "Clarence": "CXAc4DNZL6wonQQNlNgZ",
-  "Mei": "bQQWtYx9EodAqMdkrNAc",
-  "Minh": "cALE2CwoMM2QxiEdDEhv",
-  "Maria": "WLjZnm4PkNmYtNCyiCq8",
-  "Jose": "IP2syKL31S2JthzSSfZH",
-  "Ashley": "GbDIo39THauInuigCmPM",
-  "Ryan": "qIT7IrVUa21IEiKE1lug",
-  "Latoya": "BZgkqPqms7Kj9ulSkVzn",
-  "Jamal": "3w1kUvxu1LioQcLgp1KY",
-  "Tiffany": "XeomjLZoU5rr4yNIg16w",
-  "Kevin": "69Na567Zr0bPvmBYuGdc",
-  "Adriana": "FGLJyeekUzxl8M3CTG9M",
-  "Miguel": "dlGxemPxFMTY7iXagmOj",
-} as any;
-
-function getElevenVoiceId(avatarName: string | null | undefined): string | null {
-  if (!avatarName) return null;
-
-  const direct = ELEVEN_VOICE_ID_BY_COMPANION[avatarName];
-  if (direct) return direct;
-
-  const key = Object.keys(ELEVEN_VOICE_ID_BY_COMPANION).find(
-    (k) => k.toLowerCase() === avatarName.toLowerCase()
-  );
-  return key ? ELEVEN_VOICE_ID_BY_COMPANION[key] : null;
-}
 
 function getPhase1AvatarMedia(avatarName: string | null | undefined): Phase1AvatarMedia | null {
   if (!avatarName) return null;
@@ -346,18 +301,6 @@ function normalizeMode(raw: any): Mode | null {
 export default function Page() {
   const sessionIdRef = useRef<string | null>(null);
 
-  // iOS/iPadOS detection (Safari has stricter audio-unlock behavior and can play WebRTC audio quietly)
-  const isIOS = useMemo(() => {
-    if (typeof navigator === "undefined") return false;
-    const ua = navigator.userAgent || "";
-    const isIPhoneIPadIPod = /iPad|iPhone|iPod/i.test(ua);
-    // iPadOS 13+ reports as Mac; detect via touch points
-    const isIPadOS =
-      !isIPhoneIPadIPod && /Macintosh/i.test(ua) && (navigator as any).maxTouchPoints > 1;
-    return isIPhoneIPadIPod || isIPadOS;
-  }, []);
-
-
   // Companion identity (drives persona + Phase 1 live avatar mapping)
   const [companionName, setCompanionName] = useState<string>(DEFAULT_COMPANION_NAME);
   const [avatarSrc, setAvatarSrc] = useState<string>(DEFAULT_AVATAR);
@@ -378,110 +321,6 @@ const didReconnectInFlightRef = useRef<boolean>(false);
   "idle"
 );
 const [avatarError, setAvatarError] = useState<string | null>(null);
-
-// Local (non-live-avatar) ElevenLabs audio playback
-const localTtsAudioRef = useRef<HTMLAudioElement | null>(null);
-const localTtsCleanupRef = useRef<(() => void) | null>(null);
-
-// Some browsers (especially when embedded) will block programmatic audio playback unless the
-// page "unlocks" audio via a user gesture. We do this on mic-button press so voice-only
-// TTS can play without an extra "tap to play".
-//
-// IMPORTANT: iOS Safari often treats WebAudio "unlocked" differently than HTMLAudio. We therefore
-// unlock HTMLAudio on the *exact* <audio> element we later reuse for TTS playback.
-const audioUnlockedRef = useRef<boolean>(false); // HTMLAudio unlocked
-const webAudioUnlockedRef = useRef<boolean>(false); // WebAudio unlocked (best-effort)
-
-const unlockAudioPlayback = useCallback(async () => {
-  // If both are already unlocked, nothing to do.
-  if (audioUnlockedRef.current && webAudioUnlockedRef.current) return;
-
-  // 1) Unlock HTMLAudio on the exact element we reuse later (most reliable on iOS Safari)
-  if (!audioUnlockedRef.current) {
-    try {
-      const silent =
-        "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQAAAAA=";
-
-      const a = localTtsAudioRef.current ?? new Audio();
-      localTtsAudioRef.current = a;
-
-      try {
-        (a as any).playsInline = true;
-        (a as any).setAttribute?.("playsinline", "true");
-      } catch {
-        // ignore
-      }
-
-      // Some iOS versions are picky if the element is already pointing at another URL.
-      try {
-        a.pause();
-      } catch {
-        // ignore
-      }
-
-      a.src = silent;
-      a.muted = true;
-      a.volume = 0;
-      a.preload = "auto";
-
-      try {
-        (a as any).load?.();
-      } catch {
-        // ignore
-      }
-
-      await a.play();
-      a.pause();
-
-      try {
-        a.currentTime = 0;
-      } catch {
-        // ignore
-      }
-
-      // Restore defaults for real playback
-      a.muted = false;
-      a.volume = 1;
-
-      audioUnlockedRef.current = true;
-    } catch {
-      // ignore
-    }
-  }
-
-  // 2) Best-effort WebAudio unlock (do NOT treat this as unlocking HTMLAudio)
-  if (!webAudioUnlockedRef.current) {
-    try {
-      const AudioCtx = (window as any).AudioContext || (window as any).webkitAudioContext;
-      if (AudioCtx) {
-        const ctx = new AudioCtx();
-        try {
-          await ctx.resume?.();
-        } catch {
-          // ignore
-        }
-        try {
-          const buffer = ctx.createBuffer(1, 1, 22050);
-          const source = ctx.createBufferSource();
-          source.buffer = buffer;
-          source.connect(ctx.destination);
-          source.start(0);
-          source.stop(0);
-          webAudioUnlockedRef.current = true;
-        } catch {
-          // ignore
-        }
-        try {
-          await ctx.close?.();
-        } catch {
-          // ignore
-        }
-      }
-    } catch {
-      // ignore
-    }
-  }
-}, []);
 
 const phase1AvatarMedia = useMemo(() => getPhase1AvatarMedia(companionName), [companionName]);
 
@@ -580,14 +419,6 @@ const startLiveAvatar = useCallback(async () => {
     return;
 
   setAvatarStatus("connecting");
-
-  // Use the Start Live Avatar click as a user gesture to unlock HTMLAudio (important on iOS Safari).
-  // This enables reliable + louder local playback when we mirror ElevenLabs audio.
-  try {
-    await unlockAudioPlayback();
-  } catch {
-    // ignore
-  }
 
   try {
     // Defensive: if something is lingering from a prior attempt, disconnect & clear.
@@ -721,19 +552,18 @@ const startLiveAvatar = useCallback(async () => {
     setAvatarError(e?.message ? String(e.message) : "Failed to start Live Avatar");
     didAgentMgrRef.current = null;
   }
-}, [phase1AvatarMedia, avatarStatus, reconnectLiveAvatar, unlockAudioPlayback]);
+}, [phase1AvatarMedia, avatarStatus, reconnectLiveAvatar]);
 
 useEffect(() => {
   // Stop when switching companions
   void stopLiveAvatar();
 }, [companionKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
-const getTtsAudioUrl = useCallback(async (text: string, voiceId: string, signal?: AbortSignal): Promise<string | null> => {
+const getTtsAudioUrl = useCallback(async (text: string, voiceId: string): Promise<string | null> => {
   try {
     const res = await fetch(`${API_BASE}/tts/audio-url`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      signal,
       body: JSON.stringify({
         session_id: sessionIdRef.current || "anon",
         voice_id: voiceId,
@@ -759,213 +589,12 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string, signal?
     // Called right before we ask D-ID to speak.
     // Used to delay the assistant text until the avatar begins speaking.
     onWillSpeak?: () => void;
-    // Called after D-ID speak is triggered (we fire this immediately before calling mgr.speak()).
-    // Useful to align the chat transcript with the moment speech begins.
-    onDidSpeak?: () => void;
     // Called when we cannot / did not speak via D-ID.
     onDidNotSpeak?: () => void;
   };
 
-  // Local TTS playback (used when Live Avatar is NOT connected, but STT is enabled)
-  const stopLocalTtsAudio = useCallback(() => {
-    try {
-      localTtsCleanupRef.current?.();
-    } catch {
-      // ignore
-    }
-    localTtsCleanupRef.current = null;
-
-    try {
-      const a = localTtsAudioRef.current;
-      if (a) {
-        a.pause();
-        a.src = "";
-        // Best-effort release
-        try {
-          (a as any).srcObject = null;
-        } catch {
-          // ignore
-        }
-        try {
-          (a as any).load?.();
-        } catch {
-          // ignore
-        }
-      }
-    } catch {
-      // ignore
-    }
-
-    localTtsAudioRef.current = null;
-  }, []);
-
-  
-  // Voice-only audio playback (ElevenLabs -> Azure Blob URL). This is used when:
-  // - STT is enabled, AND
-  // - Live Avatar is NOT connected (or not available)
-  //
-  // IMPORTANT: We must pause STT *before* audio starts playing, otherwise the microphone
-  // can pick up the avatar's own voice and the agent will "talk to itself".
-  const speakLocalTtsAudio = useCallback(
-    async (audioUrl: string | null, hooks?: SpeakAssistantHooks): Promise<void> => {
-      const url = (audioUrl || "").trim();
-      if (!url) {
-        try {
-          hooks?.onDidNotSpeak?.();
-        } catch {
-          // ignore
-        }
-        return;
-      }
-
-      // Stop any previous playback
-      stopLocalTtsAudio();
-
-      await new Promise<void>(async (resolve) => {
-        let finished = false;
-        let audio: HTMLAudioElement | null = null;
-        let myCleanup: (() => void) | null = null;
-
-        const finish = (kind: "spoken" | "not_spoken") => {
-          if (finished) return;
-          finished = true;
-
-          // Clear refs if they still point to this playback
-          if (localTtsCleanupRef.current === myCleanup) localTtsCleanupRef.current = null;
-          if (localTtsAudioRef.current === audio) localTtsAudioRef.current = null;
-
-          try {
-            if (kind === "spoken") hooks?.onDidSpeak?.();
-            else hooks?.onDidNotSpeak?.();
-          } catch {
-            // ignore
-          }
-
-          resolve();
-        };
-
-        const safeCleanup = () => {
-          if (!audio) return;
-          try {
-            audio.removeEventListener("ended", onEnded);
-            audio.removeEventListener("error", onError);
-            audio.removeEventListener("pause", onPause);
-          } catch {
-            // ignore
-          }
-          try {
-            audio.pause();
-          } catch {
-            // ignore
-          }
-          try {
-            audio.currentTime = 0;
-          } catch {
-            // ignore
-          }
-        };
-
-        let willSpeakCalled = false;
-        const callWillSpeakOnce = () => {
-          if (willSpeakCalled) return;
-          willSpeakCalled = true;
-          try {
-            hooks?.onWillSpeak?.();
-          } catch {
-            // ignore
-          }
-        };
-
-        const onEnded = () => {
-          safeCleanup();
-          finish("spoken");
-        };
-
-        const onError = () => {
-          safeCleanup();
-          finish("not_spoken");
-        };
-
-        const onPause = () => {
-          // If it ended naturally, 'ended' will fire.
-          if ((audio as any)?.ended) return;
-          safeCleanup();
-          finish("not_spoken");
-        };
-
-        // Reuse a single <audio> element (critical for iOS Safari playback reliability)
-        audio = localTtsAudioRef.current ?? new Audio();
-        localTtsAudioRef.current = audio;
-
-        // IMPORTANT: do NOT set crossOrigin here (Azure Blob SAS URLs typically won't send ACAO for media).
-        audio.src = url;
-        audio.preload = "auto";
-
-        try {
-          (audio as any).playsInline = true;
-          (audio as any).setAttribute?.("playsinline", "true");
-        } catch {
-          // ignore
-        }
-
-        // Ensure audible defaults (some iOS states can get "stuck" muted after unlock attempts)
-        try {
-          audio.muted = false;
-          audio.volume = 1;
-        } catch {
-          // ignore
-        }
-
-        // Force reload in Safari after changing src
-        try {
-          (audio as any).load?.();
-        } catch {
-          // ignore
-        }
-
-        myCleanup = () => {
-          safeCleanup();
-          finish("not_spoken");
-        };
-        localTtsCleanupRef.current = myCleanup;
-
-        audio.addEventListener("ended", onEnded);
-        audio.addEventListener("error", onError);
-        audio.addEventListener("pause", onPause);
-
-        // Pause STT BEFORE audio starts
-        await callWillSpeakOnce();
-
-        // iOS/iPadOS: give Safari a moment to fully leave "record/voice" audio-session
-        // after we stop STT, otherwise playback can be extremely quiet or routed incorrectly.
-        if (isIOS) {
-          await new Promise((r) => setTimeout(r, 150));
-        }
-
-        audio.play().catch((e) => {
-          console.warn("Local TTS play() failed:", e);
-
-          // Retry once after attempting to unlock audio (autoplay policies / iframes).
-          (async () => {
-            try {
-              audioUnlockedRef.current = false;
-              await unlockAudioPlayback();
-              await audio!.play();
-              return;
-            } catch (e2) {
-              console.warn("Local TTS retry play() failed:", e2);
-              safeCleanup();
-              finish("not_spoken");
-            }
-          })();
-        });
-      });
-    },
-    [stopLocalTtsAudio, unlockAudioPlayback, isIOS]
-  );
-
 const speakAssistantReply = useCallback(
-    async (replyText: string, hooks?: SpeakAssistantHooks, audioUrlOverride?: string | null) => {
+    async (replyText: string, hooks?: SpeakAssistantHooks) => {
     // NOTE: We intentionally keep STT paused while the avatar is speaking.
     // The D-ID SDK's speak() promise can resolve before audio playback finishes,
     // so we add a best-effort duration wait to prevent STT feedback (avatar "talking to itself").
@@ -1008,12 +637,7 @@ const speakAssistantReply = useCallback(
       return;
     }
 
-    const overrideUrl =
-      typeof audioUrlOverride === "string" ? audioUrlOverride.trim() : "";
-    const audioUrl = overrideUrl
-      ? overrideUrl
-      : await getTtsAudioUrl(clean, phase1AvatarMedia.elevenVoiceId);
-
+    const audioUrl = await getTtsAudioUrl(clean, phase1AvatarMedia.elevenVoiceId);
     if (!audioUrl) {
       callDidNotSpeak();
       return;
@@ -1037,7 +661,13 @@ const speakAssistantReply = useCallback(
         if (typeof Audio === "undefined") return resolve(fallback);
         const a = new Audio();
         a.preload = "metadata";
-        // NOTE: do NOT set crossOrigin here; Azure Blob SAS URLs may not send CORS headers, which can break metadata loading in browsers.
+        // Some CDNs require this for cross-origin metadata access (best-effort).
+        try {
+          (a as any).crossOrigin = "anonymous";
+        } catch {
+          // ignore
+        }
+
         let doneCalled = false;
         const done = (ms: number) => {
           if (doneCalled) return;
@@ -1173,10 +803,6 @@ const speakAssistantReply = useCallback(
   const sttInterimRef = useRef<string>("");
   const sttIgnoreUntilRef = useRef<number>(0); // suppress STT while avatar is speaking (prevents feedback loop)
 
-  // Stop/cancel coordination (Stop button can abort in-flight /chat and interrupt avatar speech)
-  const stopSeqRef = useRef<number>(0);
-  const chatAbortRef = useRef<AbortController | null>(null);
-
   const [sttEnabled, setSttEnabled] = useState(false);
   const [sttRunning, setSttRunning] = useState(false);
   const [sttError, setSttError] = useState<string | null>(null);
@@ -1309,7 +935,7 @@ useEffect(() => {
     return () => window.removeEventListener("message", onMessage);
   }, []);
 
-  async function callChat(nextMessages: Msg[], stateToSend: SessionState, signal?: AbortSignal): Promise<ChatApiResponse> {
+  async function callChat(nextMessages: Msg[], stateToSend: SessionState): Promise<ChatApiResponse> {
     if (!API_BASE) throw new Error("NEXT_PUBLIC_API_BASE_URL is not set");
 
     const session_id =
@@ -1334,23 +960,12 @@ const stateToSendWithCompanion: SessionState = {
   companion_name: companionForBackend,
 };
 
-    // Backend-side optimization:
-    // Request audio_url from the backend whenever:
-    // - Live Avatar is connected (so we can lip-sync), OR
-    // - Hands-free STT is enabled (so we can play voice-only TTS even without Live Avatar)
-    const voice_id =
-      avatarStatus === "connected" || sttEnabledRef.current
-        ? getElevenVoiceId(companionName) || undefined
-        : undefined;
-
     const res = await fetch(`${API_BASE}/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      signal,
       body: JSON.stringify({
         session_id,
         wants_explicit,
-        voice_id,
         session_state: stateToSendWithCompanion,
         messages: nextMessages.map((m) => ({ role: m.role, content: m.content })),
       }),
@@ -1454,20 +1069,9 @@ const stateToSendWithCompanion: SessionState = {
     setInput("");
     setLoading(true);
 
-    const myStopSeq = stopSeqRef.current;
-    let controller: AbortController | null = null;
-
     try {
       const sendState: SessionState = { ...nextState, ...(stateOverride || {}) };
-      controller = new AbortController();
-      chatAbortRef.current = controller;
-
-      const data = await callChat(nextMessages, sendState, controller.signal);
-
-      // If Stop was clicked while request was in flight, ignore this response.
-      if (myStopSeq !== stopSeqRef.current) {
-        return;
-      }
+      const data = await callChat(nextMessages, sendState);
 
       // status from backend (safe/explicit_blocked/explicit_allowed)
       if (data.mode === "safe" || data.mode === "explicit_blocked" || data.mode === "explicit_allowed") {
@@ -1532,10 +1136,6 @@ const stateToSendWithCompanion: SessionState = {
       // When Live Avatar is active, we delay the assistant's text from appearing until
       // we are about to trigger the avatar speech.
       const replyText = String(data.reply || "");
-
-      // Backend optimization: if /chat already returned a ready-to-play TTS Blob URL, reuse it.
-      const audioUrlFromChat: string | null =
-        ((data as any).audio_url ?? (data as any).audioUrl ?? null) as any;
       let assistantCommitted = false;
       const commitAssistantMessage = () => {
         if (assistantCommitted) return;
@@ -1554,105 +1154,26 @@ const stateToSendWithCompanion: SessionState = {
       };
       const estimatedSpeechMs = estimateSpeechMs(replyText);
 
-            const voiceIdForTts = getElevenVoiceId(companionName);
-            const wantsVoiceOnly = resumeSttAfter && avatarStatus !== "connected";
+      const speakPromise = Promise.resolve(
+        speakAssistantReply(replyText, {
+          onWillSpeak: () => {
+            // STT ducking window (only when we are actually about to speak)
+            sttIgnoreUntilRef.current = Math.max(
+              sttIgnoreUntilRef.current,
+              Date.now() + estimatedSpeechMs + 1_200
+            );
+            commitAssistantMessage();
+          },
+          onDidNotSpeak: () => {
+            commitAssistantMessage();
+          },
+        })
+      ).catch(() => {
+        // Safety: ensure the message appears even if speech throws before hooks are called.
+        commitAssistantMessage();
+      });
 
-            const speakHooks: SpeakAssistantHooks = {
-              onWillSpeak: () => {
-                // STT ducking window (only when we are actually about to speak)
-                sttIgnoreUntilRef.current = Math.max(
-                  sttIgnoreUntilRef.current,
-                  Date.now() + estimatedSpeechMs + 1200
-                );
-
-                // Commit assistant text only once and only when we are about to speak (so UI syncs)
-                commitAssistantMessage();
-              },
-              onDidNotSpeak: () => {
-                commitAssistantMessage();
-              },
-            };
-
-            let speakPromise: Promise<void>;
-
-            if (avatarStatus === "connected") {
-              // Mobile Safari can play D‑ID (WebRTC) audio very quietly. When STT is enabled on iOS/iPadOS,
-              // we prefer to play the exact same ElevenLabs audio locally (louder + more reliable),
-              // while still sending it to D‑ID for lip-sync.
-              let audioUrlForSpeech: string | null = audioUrlFromChat;
-
-              // If backend didn't return audio_url, generate one so D-ID still has something to speak.
-              if (!audioUrlForSpeech && voiceIdForTts) {
-                audioUrlForSpeech = await getTtsAudioUrl(replyText, voiceIdForTts, controller?.signal);
-              }
-
-              // iOS "boost": mute the video element (avoid double-audio) and mirror audio locally.
-              const shouldMirrorLocalAudio = Boolean(isIOS && audioUrlForSpeech && audioUnlockedRef.current);
-
-              if (shouldMirrorLocalAudio) {
-                try {
-                  const v = avatarVideoRef.current;
-                  if (v) {
-                    v.muted = true;
-                    v.volume = 0;
-                  }
-                } catch {
-                  // ignore
-                }
-
-                speakPromise = Promise.all([
-                  Promise.resolve(
-                    speakAssistantReply(replyText, speakHooks, audioUrlForSpeech)
-                  ).catch(() => {
-                    // Safety: ensure the message appears even if speech throws before hooks are called.
-                    commitAssistantMessage();
-                  }),
-                  Promise.resolve(
-                    speakLocalTtsAudio(audioUrlForSpeech!, speakHooks)
-                  ).catch(() => {
-                    // Safety: ensure the message appears even if local speech throws before hooks are called.
-                    commitAssistantMessage();
-                  }),
-                ]).then(() => undefined);
-              } else {
-                // Default behavior: let D-ID stream audio as usual
-                speakPromise = Promise.resolve(
-                  speakAssistantReply(replyText, speakHooks, audioUrlForSpeech)
-                ).catch(() => {
-                  // Safety: ensure the message appears even if speech throws before hooks are called.
-                  commitAssistantMessage();
-                });
-
-                // Ensure the video is not muted in this mode
-                try {
-                  const v = avatarVideoRef.current;
-                  if (v) {
-                    v.muted = false;
-                    v.volume = 1;
-                  }
-                } catch {
-                  // ignore
-                }
-              }
-            } else if (wantsVoiceOnly && voiceIdForTts) {
-              // Voice-only TTS (no Live Avatar). Prefer /chat-provided audio_url; fallback to /tts/audio-url.
-              let audioUrlForLocal: string | null = audioUrlFromChat;
-              if (!audioUrlForLocal) {
-                audioUrlForLocal = await getTtsAudioUrl(replyText, voiceIdForTts, controller?.signal);
-              }
-
-              speakPromise = Promise.resolve(
-                speakLocalTtsAudio(audioUrlForLocal, speakHooks)
-              ).catch(() => {
-                commitAssistantMessage();
-              });
-            } else {
-              // No speech; show the assistant message immediately.
-              commitAssistantMessage();
-              speakPromise = Promise.resolve();
-            }
-
-// If STT is enabled, resume listening only after the avatar finishes speaking.
+      // If STT is enabled, resume listening only after the avatar finishes speaking.
       if (resumeSttAfter) {
         resumeScheduled = true;
         speakPromise.finally(() => {
@@ -1660,24 +1181,11 @@ const stateToSendWithCompanion: SessionState = {
         });
       }
     } catch (err: any) {
-      // If Stop was clicked (or the request was aborted), swallow the error to avoid a confusing "Error: aborted" bubble.
-      const aborted =
-        controller?.signal?.aborted ||
-        err?.name === "AbortError" ||
-        String(err?.message || "").toLowerCase().includes("aborted");
-
-      if (aborted || myStopSeq !== stopSeqRef.current) {
-        // no-op (intentional)
-      } else {
-        setMessages((prev) => [
-          ...prev,
-          { role: "assistant", content: `Error: ${err?.message ?? "Unknown error"}` },
-        ]);
-      }
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: `Error: ${err?.message ?? "Unknown error"}` },
+      ]);
     } finally {
-      // Clear the active abort controller (if it is still ours)
-      if (chatAbortRef.current === controller) chatAbortRef.current = null;
-
       setLoading(false);
       if (resumeSttAfter && !resumeScheduled) {
         // No speech was triggered (e.g., request failed). Resume immediately.
@@ -1723,9 +1231,6 @@ const stateToSendWithCompanion: SessionState = {
     clearSttRestartTimer();
     try {
       const rec = sttRecRef.current;
-      // On some mobile Safari builds, abort() releases the mic/audio-session more immediately than stop()
-      // (helps prevent low/earpiece-volume playback while TTS is speaking).
-      if (rec?.abort) rec.abort();
       if (rec?.stop) rec.stop();
     } catch {}
   }, []);
@@ -1954,65 +1459,13 @@ const stateToSendWithCompanion: SessionState = {
       stopSpeechToText();
       return;
     }
-    // Mic button is a user gesture — use it to unlock audio so voice-only TTS can autoplay.
-    try {
-      await unlockAudioPlayback();
-    } catch {
-      // ignore
-    }
     await startSpeechToText();
-  }, [startSpeechToText, stopSpeechToText, unlockAudioPlayback]);
+  }, [startSpeechToText, stopSpeechToText]);
 
-  // Stop conversation: abort in-flight /chat, stop hands-free STT, and interrupt the Live Avatar if it's speaking.
-  const stopConversation = useCallback(async () => {
-    // Bump stop sequence so in-flight async work can self-cancel
-    stopSeqRef.current += 1;
-
-    // Abort any in-flight chat request
-    try {
-      chatAbortRef.current?.abort();
-    } catch {
-      // ignore
-    }
-    chatAbortRef.current = null;
-
-    // Stop hands-free STT immediately
-    stopSpeechToText();
-
-    // Stop any local (non-live-avatar) audio playback
-    stopLocalTtsAudio();
-
-    // Clear any in-progress transcript/input to avoid accidental re-sends
-    try {
-      sttFinalRef.current = "";
-      sttInterimRef.current = "";
-    } catch {
-      // ignore
-    }
-    setInput("");
-
-    // If Live Avatar is connected, attempt to interrupt speech (Premium+ Fluent).
-    // If interrupt isn't supported, disconnect as a safe fallback to stop audio/video.
-    try {
-      const mgr: any = didAgentMgrRef.current;
-      if (mgr) {
-        if (typeof mgr.interrupt === "function") {
-          await mgr.interrupt({ type: "click" });
-        } else if (typeof mgr.disconnect === "function") {
-          await mgr.disconnect();
-          didAgentMgrRef.current = null;
-          setAvatarStatus("idle");
-        }
-      }
-    } catch (e) {
-      console.warn("Stop conversation: unable to interrupt/disconnect D-ID agent:", e);
-    }
-  }, [stopSpeechToText, stopLocalTtsAudio]);
-
-  // Dedicated stop button (stops conversation, not just mic)
+  // Dedicated stop button for STT (so the user can stop listening even when Live Avatar isn't used)
   const stopHandsFreeSTT = useCallback(() => {
-    void stopConversation();
-  }, [stopConversation]);
+    stopSpeechToText();
+  }, [stopSpeechToText]);
 
   // Cleanup
   useEffect(() => {
@@ -2255,7 +1708,7 @@ const stateToSendWithCompanion: SessionState = {
               <button
                 type="button"
                 onClick={stopHandsFreeSTT}
-                title="Stop conversation"
+                title="Stop listening"
                 style={{
                   width: 44,
                   minWidth: 44,
