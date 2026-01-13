@@ -1702,17 +1702,19 @@ const stateToSendWithCompanion: SessionState = {
     return `${(sttFinalRef.current || "").trim()} ${(sttInterimRef.current || "").trim()}`.trim();
   }, []);
 
-    // ------------------------------------------------------------
-  // Backend STT (record + server-side transcription).
-  // iOS/iPadOS Web Speech STT can be unstable; this path is far more reliable.
-  // Requires backend endpoint: POST /stt/transcribe (raw audio Blob; Content-Type audio/webm|audio/mp4) -> { text }
+  // ------------------------------------------------------------
+  // Backend STT (record + server-side transcription) — FALLBACK ONLY.
+  // We only use this when the browser has NO Web Speech API support.
+  // (Live Avatar STT already uses Web Speech; we keep that path unchanged.)
   // ------------------------------------------------------------
   const liveAvatarActive =
     avatarStatus === "connecting" || avatarStatus === "connected" || avatarStatus === "reconnecting";
 
-  // Prefer backend STT for iOS **audio-only** mode (more stable than browser SpeechRecognition).
-  // Keep Live Avatar mode on browser STT (it is already stable across devices).
-  const useBackendStt = isIOS && backendSttAvailable && !liveAvatarActive;
+  const hasSpeechRecognition =
+    typeof window !== "undefined" &&
+    !!((window as any).SpeechRecognition || (window as any).webkitSpeechRecognition);
+
+  const useBackendStt = backendSttAvailable && !liveAvatarActive && !hasSpeechRecognition;
 
   const cleanupBackendSttResources = useCallback(() => {
     try {
@@ -2288,7 +2290,7 @@ const pauseSpeechToText = useCallback(() => {
 
     sttPausedRef.current = false;
 
-    // iOS/iPadOS: use backend STT recorder (more stable than Web Speech)
+    // If Web Speech is not available, fall back to backend STT recorder.
     if (useBackendStt) {
       kickBackendStt();
       return;
@@ -2351,7 +2353,7 @@ const pauseSpeechToText = useCallback(() => {
       return;
     }
 
-    // iOS/iPadOS: prefer backend STT recorder (more stable than Web Speech)
+    // If Web Speech is not available, fall back to backend STT recorder.
     if (useBackendStt) {
       kickBackendStt();
       return;
