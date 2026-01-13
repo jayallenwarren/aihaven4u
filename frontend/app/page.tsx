@@ -1748,35 +1748,101 @@ const stateToSendWithCompanion: SessionState = {
 
   const transcribeBackendStt = useCallback(
     async (blob: Blob): Promise<string> => {
+      if (!API_BASE) throw new Error("NEXT_PUBLIC_API_BASE_URL not set");
+
+      // Abort any in-flight STT request
+      try {
+        backendSttAbortRef.current?.abort();
+      } catch {
+        // ignore
+      }
       const controller = new AbortController();
       backendSttAbortRef.current = controller;
 
-      const fd = new FormData();
-      fd.append("audio", blob, blob.type.includes("mp4") ? "stt.mp4" : "stt.webm");
+      const url = `${API_BASE}/stt/transcribe`;
 
-      const res = await fetch(`${API_BASE}/stt/transcribe`, {
-        method: "POST",
-        body: fd,
-        signal: controller.signal,
-      });
+      // New backend (fixed40+): expects RAW audio bytes (request body = blob),
+      // with Content-Type: audio/* (or application/octet-stream) and returns { text }.
+      const tryRaw = async (): Promise<Response> => {
+        const contentType =
+          (blob && (blob.type || "")).trim() || "application/octet-stream";
+        return fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": contentType },
+          body: blob,
+          signal: controller.signal,
+        });
+      };
 
-      let data: any = null;
+      // Backward-compat: older backend variants accepted multipart/form-data
+      // with field name "audio".
+      const tryMultipart = async (): Promise<Response> => {
+        const fd = new FormData();
+        const t = (blob?.type || "").toLowerCase();
+        const inferredExt = t.includes("webm")
+          ? "webm"
+          : t.includes("ogg")
+          ? "ogg"
+          : t.includes("mp4")
+          ? "mp4"
+          : t.includes("m4a")
+          ? "m4a"
+          : t.includes("aac")
+          ? "aac"
+          : t.includes("wav")
+          ? "wav"
+          : "bin";
+        fd.append("audio", blob, `stt.${inferredExt}`);
+        return fetch(url, {
+          method: "POST",
+          body: fd,
+          signal: controller.signal,
+        });
+      };
+
+      let res: Response | null = null;
+
       try {
-        data = await res.json();
-      } catch {
-        data = null;
+        res = await tryRaw();
+
+        // If backend is still expecting multipart, it commonly responds 400/415.
+        if (!res.ok && (res.status === 400 || res.status === 415)) {
+          res = await tryMultipart();
+        }
+      } catch (e: any) {
+        // If the raw attempt failed for a non-abort reason, try multipart once.
+        if (e?.name !== "AbortError") {
+          res = await tryMultipart();
+        } else {
+          throw e;
+        }
       }
 
+      if (!res) throw new Error("STT request failed");
+
       if (!res.ok) {
-        const msg = (data && (data.error || data.message)) || `STT failed (${res.status})`;
+        let msg = `STT failed (${res.status})`;
+        try {
+          const data = await res.json();
+          msg =
+            (data && (data.error || data.message)) ||
+            `${msg}: ${JSON.stringify(data)}`;
+        } catch {
+          try {
+            const t = await res.text();
+            if (t) msg = `${msg}: ${t.slice(0, 300)}`;
+          } catch {
+            // ignore
+          }
+        }
         throw new Error(msg);
       }
 
+      const data = await res.json();
       return (data?.text ?? "").toString().trim();
     },
     [API_BASE]
   );
-
   const startBackendSttOnce = useCallback(async (): Promise<void> => {
     if (!useBackendStt) return;
     if (!sttEnabledRef.current || sttPausedRef.current) return;
