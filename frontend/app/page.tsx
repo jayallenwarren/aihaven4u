@@ -363,7 +363,6 @@ export default function Page() {
   // Local audio-only TTS element (used when Live Avatar is not active/available)
   const localTtsAudioRef = useRef<HTMLAudioElement | null>(null);
   const localTtsUnlockedRef = useRef(false);
-  const localTtsPrimeTokenRef = useRef(0); // prevents prime cleanup from interrupting real playback
 
 
   // Companion identity (drives persona + Phase 1 live avatar mapping)
@@ -799,91 +798,65 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string): Promis
     const a = localTtsAudioRef.current;
     if (!a) return;
 
-    // IMPORTANT (iOS/Safari):
-    // We use the mic-button gesture to "unlock" audio playback with a silent clip.
-    // A late-resolving promise from that silent clip must NOT be allowed to pause/clear
-    // the *real* TTS audio (first reply). We guard cleanup with a token/attribute.
-    const token = ++localTtsPrimeTokenRef.current;
+    try {
+      a.setAttribute("playsinline", "true");
+      (a as any).playsInline = true;
+    } catch {
+      // ignore
+    }
 
-    const cleanup = () => {
-      try {
-        if (a.getAttribute("data-tts-prime") !== String(token)) return;
-        a.removeAttribute("data-tts-prime");
-      } catch {
-        return;
-      }
+    // Must be triggered from a user gesture (e.g., mic button click).
+    // IMPORTANT for iOS Safari: unlocking should be an *unmuted* play() (muted playback can
+    // "succeed" but still leave later unmuted TTS blocked). We keep volume near-zero so it
+    // stays inaudible.
+    a.muted = false;
+    a.volume = 0.001;
+    a.src = PRIME_SILENT_WAV;
 
+    const p = a.play?.();
+    if (p && typeof (p as any).then === "function") {
+      (p as Promise<any>)
+        .then(() => {
+          try {
+            a.pause();
+            a.currentTime = 0;
+          } catch {
+            // ignore
+          }
+          localTtsUnlockedRef.current = true;
+        })
+        .catch(() => {
+          // If this fails, Safari may still allow playback after another gesture; we'll try again later.
+        })
+        .finally(() => {
+          try {
+            a.pause();
+            a.currentTime = 0;
+          } catch {
+            // ignore
+          }
+          a.muted = false;
+          a.volume = 1;
+          a.src = "";
+        });
+    } else {
+      // Non-promise play()
       try {
         a.pause();
         a.currentTime = 0;
       } catch {
         // ignore
       }
-
-      try {
-        a.src = "";
-      } catch {
-        // ignore
-      }
-
+      localTtsUnlockedRef.current = true;
       a.muted = false;
       a.volume = 1;
-    };
-
-    try {
-      a.setAttribute("playsinline", "");
-      a.setAttribute("webkit-playsinline", "");
-    } catch {
-      // ignore
-    }
-
-    try {
-      a.muted = false;
-      a.volume = 0.001;
-      a.src = PRIME_SILENT_WAV;
-
-      // Mark this element as being in "prime" mode for this token.
-      a.setAttribute("data-tts-prime", String(token));
-
-      const p = a.play?.();
-
-      // Fallback cleanup in case the promise is slow/never resolves on some Safari builds.
-      setTimeout(cleanup, 800);
-
-      if (p && typeof (p as any).then === "function") {
-        (p as Promise<void>)
-          .then(() => {
-            localTtsUnlockedRef.current = true;
-          })
-          .catch(() => {
-            // ignore; we'll retry unlock on next gesture
-          })
-          .finally(() => {
-            cleanup();
-          });
-      } else {
-        localTtsUnlockedRef.current = true;
-        cleanup();
-      }
-    } catch {
-      // ignore
+      a.src = "";
     }
   }, []);
 
   const playLocalTtsUrl = useCallback(
     async (audioUrl: string, hooks?: SpeakAssistantHooks) => {
       const a = localTtsAudioRef.current;
-
-      // If a previous prime attempt is still resolving, make sure its cleanup can't
-      // interrupt the real TTS playback.
-      if (a) {
-        try {
-          a.removeAttribute("data-tts-prime");
-        } catch {
-          // ignore
-        }
-      }
-
       if (!a) {
         hooks?.onDidNotSpeak?.();
         return;
@@ -990,18 +963,6 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string): Promis
           } catch {
             // ignore
           }
-
-          // Release the audio element's source so iOS/Safari can reliably return the audio-session
-          // to input mode for the next STT turn.
-          try {
-            a.pause();
-            a.currentTime = 0;
-            a.removeAttribute("src");
-            a.load();
-          } catch {
-            // ignore
-          }
-
           resolve();
         };
         a.onended = finish;
@@ -1665,13 +1626,7 @@ const stateToSendWithCompanion: SessionState = {
       if (resumeSttAfter) {
         resumeScheduled = true;
         speakPromise.finally(() => {
-          if (!sttEnabledRef.current) return;
-
-          // iOS Safari can fail to re-acquire the mic if we restart STT immediately after
-          // assistant audio-only playback. Use a delayed restart for local TTS so follow-on
-          // STT remains reliable.
-          if (shouldUseLocalTts) resumeSpeechToTextAfterLocalTts();
-          else resumeSpeechToText();
+          if (sttEnabledRef.current) resumeSpeechToText();
         });
       }
     } catch (err: any) {
@@ -1757,8 +1712,7 @@ const stateToSendWithCompanion: SessionState = {
 
   // Prefer backend STT for iOS **audio-only** mode (more stable than browser SpeechRecognition).
   // Keep Live Avatar mode on browser STT (it is already stable across devices).
-  const useBackendStt = isIOS && backendSttAvailable && !liveAvatarActive; // allow in embeds (Wix) now that mic permission works
-
+  const useBackendStt = isIOS && backendSttAvailable && !liveAvatarActive && !isEmbedded;
 
   const cleanupBackendSttResources = useCallback(() => {
     try {
@@ -2084,44 +2038,16 @@ const pauseSpeechToText = useCallback(() => {
     // Backend STT: abort any in-flight record/transcribe
     abortBackendStt();
 
-    // Browser STT:
-    // iOS Safari (especially when embedded in Wix) can get stuck after stop() and fail to restart
-    // reliably on the next turn. For Audio STT/TTS (non-Live-Avatar), we fully dispose the
-    // recognition instance so resumeSpeechToText() recreates a fresh one.
-    const shouldHardResetBrowserStt = isIOS && isEmbedded && !liveAvatarActive;
-
-    const rec: any = sttRecRef.current;
+    // Browser STT: stop recognition if it exists
+    const rec = sttRecRef.current;
     try {
-      if (rec) {
-        if (shouldHardResetBrowserStt) {
-          try {
-            rec.onresult = null;
-            rec.onerror = null;
-            rec.onend = null;
-          } catch {
-            // ignore
-          }
-          try {
-            rec.abort?.();
-          } catch {
-            // ignore
-          }
-          try {
-            rec.stop?.();
-          } catch {
-            // ignore
-          }
-          sttRecRef.current = null;
-        } else {
-          rec.stop?.();
-        }
-      }
+      rec?.stop?.();
     } catch {
       // ignore
     }
 
     setSttRunning(false);
-  }, [abortBackendStt, clearSttSilenceTimer, isIOS, isEmbedded, liveAvatarActive]);
+  }, [abortBackendStt, clearSttSilenceTimer]);
 
   const scheduleSttAutoSend = useCallback(() => {
     if (!sttEnabledRef.current) return;
@@ -2386,59 +2312,6 @@ const pauseSpeechToText = useCallback(() => {
       // ignore; will restart on onend if needed
     }
   }, [ensureSpeechRecognition, kickBackendStt, useBackendStt]);
-
-  const resumeSpeechToTextAfterLocalTts = useCallback(() => {
-    if (!sttEnabledRef.current) return;
-
-    // Bring STT out of a "paused for send/playback" state
-    sttPausedRef.current = false;
-    setSttError(null);
-    setSttRunning(true);
-    setSttInterim("");
-    setSttFinal("");
-    sttFinalRef.current = "";
-    sttInterimRef.current = "";
-
-    // Backend STT doesn't depend on browser SpeechRecognition.
-    if (useBackendStt) {
-      kickBackendStt();
-      return;
-    }
-
-    // IMPORTANT (iOS): after we play assistant audio, Safari can get into an "audio-capture"
-    // failure mode if SpeechRecognition is restarted immediately. Hard-reset the SR instance
-    // and wait a beat before starting.
-    if (isIOS) {
-      resetSpeechRecognition();
-    }
-
-    const startOnce = () => {
-      if (!sttEnabledRef.current || sttPausedRef.current) return;
-      const rec = ensureSpeechRecognition();
-      if (!rec) return;
-
-      try {
-        rec.start();
-      } catch {
-        // If start fails right after output audio, retry once after a longer delay.
-        if (isIOS) {
-          resetSpeechRecognition();
-          setTimeout(() => {
-            if (!sttEnabledRef.current || sttPausedRef.current) return;
-            const rec2 = ensureSpeechRecognition();
-            if (!rec2) return;
-            try {
-              rec2.start();
-            } catch {
-              // The SR onerror handler already includes recovery/backoff for iOS.
-            }
-          }, 1100);
-        }
-      }
-    };
-
-    setTimeout(startOnce, isIOS ? 700 : 80);
-  }, [ensureSpeechRecognition, isIOS, kickBackendStt, resetSpeechRecognition, setSttError, setSttFinal, setSttInterim, setSttRunning, useBackendStt]);
 
   const stopSpeechToText = useCallback(
     (clearError: boolean = true) => {
