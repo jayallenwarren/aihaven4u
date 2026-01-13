@@ -1702,19 +1702,17 @@ const stateToSendWithCompanion: SessionState = {
     return `${(sttFinalRef.current || "").trim()} ${(sttInterimRef.current || "").trim()}`.trim();
   }, []);
 
-  // ------------------------------------------------------------
-  // Backend STT (record + server-side transcription) — FALLBACK ONLY.
-  // We only use this when the browser has NO Web Speech API support.
-  // (Live Avatar STT already uses Web Speech; we keep that path unchanged.)
+    // ------------------------------------------------------------
+  // Backend STT (record + server-side transcription).
+  // iOS/iPadOS Web Speech STT can be unstable; this path is far more reliable.
+  // Requires backend endpoint: POST /stt/transcribe (raw audio Blob; Content-Type audio/webm|audio/mp4) -> { text }
   // ------------------------------------------------------------
   const liveAvatarActive =
     avatarStatus === "connecting" || avatarStatus === "connected" || avatarStatus === "reconnecting";
 
-  const hasSpeechRecognition =
-    typeof window !== "undefined" &&
-    !!((window as any).SpeechRecognition || (window as any).webkitSpeechRecognition);
-
-  const useBackendStt = backendSttAvailable && !liveAvatarActive && !hasSpeechRecognition;
+  // Prefer backend STT for iOS **audio-only** mode (more stable than browser SpeechRecognition).
+  // Keep Live Avatar mode on browser STT (it is already stable across devices).
+  const useBackendStt = isIOS && backendSttAvailable && !liveAvatarActive && !isEmbedded;
 
   const cleanupBackendSttResources = useCallback(() => {
     try {
@@ -2290,7 +2288,7 @@ const pauseSpeechToText = useCallback(() => {
 
     sttPausedRef.current = false;
 
-    // If Web Speech is not available, fall back to backend STT recorder.
+    // iOS/iPadOS: use backend STT recorder (more stable than Web Speech)
     if (useBackendStt) {
       kickBackendStt();
       return;
@@ -2338,7 +2336,8 @@ const pauseSpeechToText = useCallback(() => {
     [abortBackendStt, clearSttSilenceTimer, resetSpeechRecognition]
   );
 
-  const startSpeechToText = useCallback(async () => {
+  const startSpeechToText = useCallback(async (opts?: { forceBrowser?: boolean }) => {
+    const forceBrowser = !!opts?.forceBrowser;
     primeLocalTtsAudio();
 
     sttEnabledRef.current = true;
@@ -2353,8 +2352,9 @@ const pauseSpeechToText = useCallback(() => {
       return;
     }
 
-    // If Web Speech is not available, fall back to backend STT recorder.
-    if (useBackendStt) {
+    // iOS/iPadOS: prefer backend STT recorder (more stable than Web Speech)
+    // NOTE: When starting Live Avatar, we force browser STT so D-ID voice doesn't rely on backend recorder.
+    if (useBackendStt && !forceBrowser) {
       kickBackendStt();
       return;
     }
@@ -2378,13 +2378,39 @@ const pauseSpeechToText = useCallback(() => {
   ]);
 
   const toggleSpeechToText = useCallback(async () => {
+    // In Live Avatar mode, mic is required. We don't allow toggling it off.
+    // If STT isn't running (permission denied or stopped), we try to start it again.
+    if (liveAvatarActive) {
+      if (!sttEnabledRef.current) {
+        await startSpeechToText({ forceBrowser: true });
+      }
+      return;
+    }
+
     if (sttEnabledRef.current) stopSpeechToText();
     else await startSpeechToText();
-  }, [startSpeechToText, stopSpeechToText]);
+  }, [liveAvatarActive, startSpeechToText, stopSpeechToText]);
 
   const stopHandsFreeSTT = useCallback(() => {
+    // Stop listening immediately
     stopSpeechToText();
-  }, [stopSpeechToText]);
+
+    // Stop any local audio-only playback
+    try {
+      const a = localTtsAudioRef.current;
+      if (a) {
+        a.pause();
+        a.currentTime = 0;
+      }
+    } catch {
+      // ignore
+    }
+
+    // If Live Avatar is running, stop it too (mic is required in Live Avatar mode)
+    if (liveAvatarActive) {
+      void stopLiveAvatar();
+    }
+  }, [liveAvatarActive, stopLiveAvatar, stopSpeechToText]);
 
   // Cleanup
   useEffect(() => {
@@ -2486,7 +2512,22 @@ const pauseSpeechToText = useCallback(() => {
         ) {
           void stopLiveAvatar();
         } else {
-          void startLiveAvatar();
+          void (async () => {
+            // Live Avatar requires microphone / STT. Start it automatically.
+            // If iOS audio-only backend STT is currently running, restart in browser STT for Live Avatar.
+            if (sttEnabledRef.current && useBackendStt) {
+              stopSpeechToText();
+            }
+
+            if (!sttEnabledRef.current) {
+              await startSpeechToText({ forceBrowser: true });
+            }
+
+            // If mic permission was denied, don't start Live Avatar.
+            if (!sttEnabledRef.current) return;
+
+            await startLiveAvatar();
+          })();
         }
       }}
       style={{
@@ -2610,8 +2651,16 @@ const pauseSpeechToText = useCallback(() => {
             <button
               type="button"
               onClick={toggleSpeechToText}
-              disabled={!sttEnabled && loading}
-              title={sttEnabled ? "Stop speech-to-text" : "Start speech-to-text"}
+              disabled={(!sttEnabled && loading) || (liveAvatarActive && sttEnabled)}
+              title={
+                liveAvatarActive
+                  ? sttEnabled
+                    ? "Mic is required in Live Avatar (use Stop to end)"
+                    : "Enable microphone (required for Live Avatar)"
+                  : sttEnabled
+                    ? "Stop speech-to-text"
+                    : "Start speech-to-text"
+              }
               style={{
                 width: 44,
                 minWidth: 44,
