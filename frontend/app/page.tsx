@@ -780,10 +780,11 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string): Promis
 }, []);
 
   type SpeakAssistantHooks = {
-    // Called right before we ask D-ID to speak.
-    // Used to delay the assistant text until the avatar begins speaking.
-    onWillSpeak?: () => void;
-    // Called when we cannot / did not speak via D-ID.
+    // Called once media playback has actually started (audio-only or Live Avatar).
+    // Use this to commit assistant text only after media is ready.
+    onMediaReady?: () => void;
+
+    // Called when we cannot / did not speak (fallback to text-only).
     onDidNotSpeak?: () => void;
   };
 
@@ -959,42 +960,10 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string): Promis
         await new Promise((r) => setTimeout(r, isIphone ? 220 : 150));
       }
 
-      // iOS/iPadOS: Safari can need an extra beat after STT ends before playback becomes audible.
-      if (isIOS) {
-        const dt = Date.now() - sttLastEndAtRef.current;
-        const minSettle = isIphone ? 380 : 260;
-        if (dt >= 0 && dt < minSettle) {
-          await new Promise((r) => setTimeout(r, minSettle - dt));
-        }
-      }
-
-      hooks?.onWillSpeak?.();
-
-      const playWithRetry = async () => {
-        const delays = isIOS ? (isIphone ? [0, 220, 480] : [0, 180, 420]) : [0, 150];
-        let lastErr: any = null;
-
-        for (let i = 0; i < delays.length; i++) {
-          if (delays[i] > 0) {
-            await new Promise((r) => setTimeout(r, delays[i]));
-          }
-          try {
-            // Nudge the element; iOS can drop the first play() right after mic activity
-            a.pause();
-            a.currentTime = 0;
-            a.load?.();
-            await a.play();
-            return;
-          } catch (err) {
-            lastErr = err;
-          }
-        }
-        throw lastErr ?? new Error("Local TTS play() failed");
-      };
-
       try {
-        await playWithRetry();
+        await a.play();
         localTtsUnlockedRef.current = true;
+        hooks?.onMediaReady?.();
       } catch (err) {
         console.warn("Local TTS playback failed:", err);
         hooks?.onDidNotSpeak?.();
@@ -1064,7 +1033,7 @@ const speakAssistantReply = useCallback(
       if (willSpeakCalled) return;
       willSpeakCalled = true;
       try {
-        hooks?.onWillSpeak?.();
+        hooks?.onMediaReady?.();
       } catch {
         // ignore
       }
@@ -1172,8 +1141,8 @@ const speakAssistantReply = useCallback(
       }
 
       try {
-        callWillSpeakOnce();
         await mgr.speak(speakPayload);
+        callWillSpeakOnce();
         spoke = true;
         break;
       } catch (e) {
@@ -1252,7 +1221,6 @@ const speakAssistantReply = useCallback(
   const sttRecoverTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sttAudioCaptureFailsRef = useRef<number>(0);
   const sttLastAudioCaptureAtRef = useRef<number>(0);
-  const sttLastEndAtRef = useRef<number>(0);
 
   const sttFinalRef = useRef<string>("");
   const sttInterimRef = useRef<string>("");
@@ -1630,7 +1598,7 @@ const stateToSendWithCompanion: SessionState = {
       const estimatedSpeechMs = estimateSpeechMs(replyText);
 
       const hooks: SpeakAssistantHooks = {
-        onWillSpeak: () => {
+        onMediaReady: () => {
           // We'll treat "speaking" the same whether it's Live Avatar or local audio-only.
           if (!assistantCommitted) {
             commitAssistantMessage();
@@ -2195,7 +2163,6 @@ const pauseSpeechToText = useCallback(() => {
     };
 
     rec.onend = () => {
-      sttLastEndAtRef.current = Date.now();
       setSttRunning(false);
 
       if (!sttEnabledRef.current || sttPausedRef.current) return;
@@ -2220,7 +2187,6 @@ const pauseSpeechToText = useCallback(() => {
     };
 
     rec.onerror = (event: any) => {
-      sttLastEndAtRef.current = Date.now();
       const code = String(event?.error || "");
 
       if (code === "no-speech" || code === "aborted") {
