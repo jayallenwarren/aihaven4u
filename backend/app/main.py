@@ -8,7 +8,7 @@ import hashlib
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, HTTPException, Request, UploadFile, File
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 # Threadpool helper (prevents blocking the event loop on requests/azure upload)
@@ -36,14 +36,81 @@ app = FastAPI(title="AIHaven4U API")
 # ----------------------------
 # CORS
 # ----------------------------
-_raw = (getattr(settings, "CORS_ALLOW_ORIGINS", "") or "").strip()
-raw_origins = [o.strip() for o in _raw.split(",") if o.strip()]
-allow_all = (_raw == "*")
+# CORS_ALLOW_ORIGINS can be:
+#   - comma-separated list of exact origins (e.g. https://aihaven4u.com,https://www.aihaven4u.com)
+#   - entries with wildcards (e.g. https://*.azurestaticapps.net)
+#   - or a single "*" to allow all (NOT recommended for production)
+cors_env = (
+    os.getenv("CORS_ALLOW_ORIGINS", "")
+    or getattr(settings, "CORS_ALLOW_ORIGINS", None)
+    or ""
+).strip()
+
+def _split_cors_origins(raw: str) -> list[str]:
+    """Split + normalize CORS origins from an env var.
+
+    Supports comma and/or whitespace separation.
+    Removes trailing slashes (browser Origin never includes a trailing slash).
+    De-dupes while preserving order.
+    """
+    if not raw:
+        return []
+    tokens = re.split(r"[\s,]+", raw.strip())
+    out: list[str] = []
+    seen: set[str] = set()
+    for t in tokens:
+        if not t:
+            continue
+        t = t.strip()
+        if not t:
+            continue
+        if t != "*" and t.endswith("/"):
+            t = t.rstrip("/")
+        if t not in seen:
+            out.append(t)
+            seen.add(t)
+    return out
+
+raw_items = _split_cors_origins(cors_env)
+allow_all = (len(raw_items) == 1 and raw_items[0] == "*")
+
+allow_origins: list[str] = []
+allow_origin_regex: str | None = None
+allow_credentials = True
+
+if allow_all:
+    # Allow-all is only enabled when explicitly configured via "*".
+    allow_origins = ["*"]
+    allow_credentials = False  # cannot be True with wildcard
+else:
+    # Support optional wildcards (e.g., "https://*.azurestaticapps.net").
+    literal: list[str] = []
+    wildcard: list[str] = []
+    for o in raw_items:
+        if "*" in o:
+            wildcard.append(o)
+        else:
+            literal.append(o)
+
+    allow_origins = literal
+
+    if wildcard:
+        # Convert wildcard origins to a regex.
+        parts: list[str] = []
+        for w in wildcard:
+            parts.append("^" + re.escape(w).replace("\\*", ".*") + "$")
+        allow_origin_regex = "|".join(parts)
+
+    # Security-first default: if CORS_ALLOW_ORIGINS is empty, we do NOT allow browser cross-origin calls.
+    # (Server-to-server calls without an Origin header still work.)
+    if not allow_origins and not allow_origin_regex:
+        print("[CORS] WARNING: CORS_ALLOW_ORIGINS is empty. Browser requests from other origins will be blocked.")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"] if allow_all else raw_origins,
-    allow_credentials=False if allow_all else True,
+    allow_origins=allow_origins,
+    allow_origin_regex=allow_origin_regex,
+    allow_credentials=allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -570,46 +637,58 @@ async def tts_audio_url(request: Request) -> Dict[str, Any]:
     return {"audio_url": audio_url}
 
 
+# --------------------------
+# STT (Speech-to-Text)
+# --------------------------
+# NOTE: This endpoint intentionally accepts RAW audio bytes in the request body (not multipart/form-data)
+# to avoid requiring the `python-multipart` package (which can otherwise prevent FastAPI from starting).
+#
+# Frontend should POST the recorded Blob directly:
+#   fetch(`${API_BASE}/stt/transcribe`, { method:"POST", headers:{ "Content-Type": blob.type }, body: blob })
+#
 @app.post("/stt/transcribe")
-async def stt_transcribe(audio: UploadFile = File(...)) -> Dict[str, Any]:
-    """
-    Server-side speech-to-text using OpenAI transcription.
+async def stt_transcribe(request: Request):
+    if not settings.OPENAI_API_KEY:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not configured")
 
-    Expects multipart/form-data with:
-      - audio: uploaded audio file (webm/mp4/etc.)
+    content_type = (request.headers.get("content-type") or "").lower().strip()
+    audio_bytes = await request.body()
 
-    Returns:
-      { "text": "..." }
-    """
-    import io
-    from openai import OpenAI
+    if not audio_bytes or len(audio_bytes) < 16:
+        raise HTTPException(status_code=400, detail="No audio received")
 
-    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set")
+    # Infer file extension for OpenAI transcription.
+    if "webm" in content_type:
+        ext = "webm"
+    elif "ogg" in content_type:
+        ext = "ogg"
+    elif "mp4" in content_type or "m4a" in content_type or "aac" in content_type:
+        ext = "mp4"
+    elif "wav" in content_type:
+        ext = "wav"
+    else:
+        # Fallback; OpenAI can often still detect format, but providing a filename helps.
+        ext = "bin"
 
-    # Read the uploaded file into memory
-    raw = await audio.read()
-    if not raw:
-        raise HTTPException(status_code=422, detail="Empty audio upload")
-
-    buf = io.BytesIO(raw)
-    buf.name = (audio.filename or "audio.webm")
-
-    model = os.environ.get("OPENAI_STT_MODEL", "whisper-1")
+    bio = io.BytesIO(audio_bytes)
+    bio.name = f"stt.{ext}"
 
     try:
-        client = OpenAI(api_key=api_key)
-        result = client.audio.transcriptions.create(
-            model=model,
-            file=buf,
+        # Use the same OpenAI client used elsewhere in this service.
+        # `settings.STT_MODEL` can be set; fallback is whisper-1.
+        stt_model = getattr(settings, "STT_MODEL", None) or "whisper-1"
+        resp = client.audio.transcriptions.create(
+            model=stt_model,
+            file=bio,
         )
+        text = getattr(resp, "text", None)
+        if text is None and isinstance(resp, dict):
+            text = resp.get("text")
+        if not text:
+            text = ""
+        return {"text": str(text).strip()}
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"STT failed: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail=f"STT transcription failed: {e}")
 
-    # OpenAI Python SDK returns an object with .text (or a dict-like response)
-    text = getattr(result, "text", None)
-    if text is None and isinstance(result, dict):
-        text = result.get("text")
-
-    return {"text": (text or "").strip()}
