@@ -2257,6 +2257,29 @@ const pauseSpeechToText = useCallback(() => {
     }
   }, [ensureSpeechRecognition, kickBackendStt, useBackendStt]);
 
+  const stopSpeechToText = useCallback(
+    (clearError: boolean = true) => {
+      sttEnabledRef.current = false;
+      sttPausedRef.current = false;
+      setSttEnabled(false);
+      clearSttSilenceTimer();
+
+      setSttInterim("");
+      setSttFinal("");
+      setSttRunning(false);
+
+      // Abort backend STT capture/transcribe if in flight
+      abortBackendStt();
+      backendSttInFlightRef.current = false;
+
+      // Stop browser SpeechRecognition if it exists
+      resetSpeechRecognition();
+
+      if (clearError) setSttError(null);
+    },
+    [abortBackendStt, clearSttSilenceTimer, resetSpeechRecognition]
+  );
+
   const startSpeechToText = useCallback(async () => {
     primeLocalTtsAudio();
 
@@ -2295,29 +2318,6 @@ const pauseSpeechToText = useCallback(() => {
     stopSpeechToText,
     useBackendStt,
   ]);
-
-  const stopSpeechToText = useCallback(
-    (clearError: boolean = true) => {
-      sttEnabledRef.current = false;
-      sttPausedRef.current = false;
-      setSttEnabled(false);
-      clearSttSilenceTimer();
-
-      setSttInterim("");
-      setSttFinal("");
-      setSttRunning(false);
-
-      // Abort backend STT capture/transcribe if in flight
-      abortBackendStt();
-      backendSttInFlightRef.current = false;
-
-      // Stop browser SpeechRecognition if it exists
-      resetSpeechRecognition();
-
-      if (clearError) setSttError(null);
-    },
-    [abortBackendStt, clearSttSilenceTimer, resetSpeechRecognition]
-  );
 
   const toggleSpeechToText = useCallback(async () => {
     if (sttEnabledRef.current) stopSpeechToText();
