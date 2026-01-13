@@ -2065,16 +2065,44 @@ const pauseSpeechToText = useCallback(() => {
     // Backend STT: abort any in-flight record/transcribe
     abortBackendStt();
 
-    // Browser STT: stop recognition if it exists
-    const rec = sttRecRef.current;
+    // Browser STT:
+    // iOS Safari (especially when embedded in Wix) can get stuck after stop() and fail to restart
+    // reliably on the next turn. For Audio STT/TTS (non-Live-Avatar), we fully dispose the
+    // recognition instance so resumeSpeechToText() recreates a fresh one.
+    const shouldHardResetBrowserStt = isIOS && isEmbedded && !liveAvatarActive;
+
+    const rec: any = sttRecRef.current;
     try {
-      rec?.stop?.();
+      if (rec) {
+        if (shouldHardResetBrowserStt) {
+          try {
+            rec.onresult = null;
+            rec.onerror = null;
+            rec.onend = null;
+          } catch {
+            // ignore
+          }
+          try {
+            rec.abort?.();
+          } catch {
+            // ignore
+          }
+          try {
+            rec.stop?.();
+          } catch {
+            // ignore
+          }
+          sttRecRef.current = null;
+        } else {
+          rec.stop?.();
+        }
+      }
     } catch {
       // ignore
     }
 
     setSttRunning(false);
-  }, [abortBackendStt, clearSttSilenceTimer]);
+  }, [abortBackendStt, clearSttSilenceTimer, isIOS, isEmbedded, liveAvatarActive]);
 
   const scheduleSttAutoSend = useCallback(() => {
     if (!sttEnabledRef.current) return;
