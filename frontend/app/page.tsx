@@ -1189,7 +1189,9 @@ const speakAssistantReply = useCallback(
   const sttRecRef = useRef<any>(null);
   const sttSilenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sttRestartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const sttAudioCaptureCountRef = useRef<number>(0);
+  const sttRecoverTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const sttAudioCaptureFailsRef = useRef<number>(0);
+  const sttLastAudioCaptureAtRef = useRef<number>(0);
 
   const sttFinalRef = useRef<string>("");
   const sttInterimRef = useRef<string>("");
@@ -1201,6 +1203,17 @@ const speakAssistantReply = useCallback(
 
   const sttEnabledRef = useRef<boolean>(false);
   const sttPausedRef = useRef<boolean>(false);
+  // Backend STT (iOS-safe): record mic audio via getUserMedia + MediaRecorder and transcribe server-side.
+  const backendSttInFlightRef = useRef<boolean>(false);
+  const backendSttAbortRef = useRef<AbortController | null>(null);
+  const backendSttStreamRef = useRef<MediaStream | null>(null);
+  const backendSttRecorderRef = useRef<MediaRecorder | null>(null);
+  const backendSttAudioCtxRef = useRef<AudioContext | null>(null);
+  const backendSttRafRef = useRef<number | null>(null);
+  const backendSttHardStopTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const backendSttLastVoiceAtRef = useRef<number>(0);
+  const backendSttHasSpokenRef = useRef<boolean>(false);
+
 
   const getEmbedHint = useCallback(() => {
     if (typeof window === "undefined") return "";
@@ -1619,129 +1632,416 @@ const stateToSendWithCompanion: SessionState = {
 
   function clearSttSilenceTimer() {
     if (sttSilenceTimerRef.current) {
-      try {
-        clearTimeout(sttSilenceTimerRef.current);
-      } catch {}
+      clearTimeout(sttSilenceTimerRef.current);
       sttSilenceTimerRef.current = null;
     }
   }
 
   function clearSttRestartTimer() {
     if (sttRestartTimerRef.current) {
-      try {
-        clearTimeout(sttRestartTimerRef.current);
-      } catch {}
+      clearTimeout(sttRestartTimerRef.current);
       sttRestartTimerRef.current = null;
     }
   }
 
-  const getCurrentSttText = useCallback(() => {
-    const finalText = sttFinalRef.current.trim();
-    const interimText = sttInterimRef.current.trim();
-    return `${finalText} ${interimText}`.trim();
-  }, []);
+  function clearSttRecoverTimer() {
+    if (sttRecoverTimerRef.current) {
+      clearTimeout(sttRecoverTimerRef.current);
+      sttRecoverTimerRef.current = null;
+    }
+  }
 
-  const pauseSpeechToText = useCallback(() => {
-    if (!sttEnabledRef.current) return;
-    sttPausedRef.current = true;
-    clearSttSilenceTimer();
-    clearSttRestartTimer();
+  const resetSpeechRecognition = useCallback(() => {
+    const rec = sttRecRef.current as any;
+    if (!rec) return;
+
     try {
-      const rec = sttRecRef.current;
-      if (rec?.stop) rec.stop();
-    } catch {}
+      rec.onstart = null;
+      rec.onend = null;
+      rec.onerror = null;
+      rec.onresult = null;
+    } catch {
+      // ignore
+    }
+
+    try {
+      rec.abort?.();
+    } catch {
+      // ignore
+    }
+    try {
+      rec.stop?.();
+    } catch {
+      // ignore
+    }
+
+    sttRecRef.current = null;
+    setSttRunning(false);
   }, []);
 
-  const resumeSpeechToText = useCallback(() => {
-    if (!sttEnabledRef.current) return;
-    sttPausedRef.current = false;
-    clearSttRestartTimer();
+  const getCurrentSttText = useCallback((): string => {
+    return `${(sttFinalRef.current || "").trim()} ${(sttInterimRef.current || "").trim()}`.trim();
+  }, []);
 
-    const baseDelay = isIOS ? 450 : 0;
-    const delayMs = Math.max(baseDelay, sttIgnoreUntilRef.current - Date.now());
-    if (delayMs > 0) {
-      // Delay restart until after our ignore window (prevents picking up the avatar's audio tail).
-      sttRestartTimerRef.current = setTimeout(() => {
-        if (!sttEnabledRef.current) return;
-        if (sttPausedRef.current) return;
+    // ------------------------------------------------------------
+  // Backend STT (record + server-side transcription).
+  // iOS/iPadOS Web Speech STT can be unstable; this path is far more reliable.
+  // Requires backend endpoint: POST /stt/transcribe (multipart/form-data, field "audio") -> { text }
+  // ------------------------------------------------------------
+  const useBackendStt = isIOS;
+
+  const cleanupBackendSttResources = useCallback(() => {
+    try {
+      if (backendSttRecorderRef.current && backendSttRecorderRef.current.state !== "inactive") {
+        backendSttRecorderRef.current.stop();
+      }
+    } catch {}
+    backendSttRecorderRef.current = null;
+
+    if (backendSttHardStopTimerRef.current) {
+      clearTimeout(backendSttHardStopTimerRef.current);
+      backendSttHardStopTimerRef.current = null;
+    }
+
+    if (backendSttRafRef.current !== null) {
+      cancelAnimationFrame(backendSttRafRef.current);
+      backendSttRafRef.current = null;
+    }
+
+    if (backendSttStreamRef.current) {
+      backendSttStreamRef.current.getTracks().forEach((t) => {
         try {
-          const rec = sttRecRef.current;
-          if (!rec?.start) return;
-          rec.start();
-        } catch {
-          // Ignore InvalidStateError if already started.
+          t.stop();
+        } catch {}
+      });
+      backendSttStreamRef.current = null;
+    }
+
+    if (backendSttAudioCtxRef.current) {
+      try {
+        backendSttAudioCtxRef.current.close();
+      } catch {}
+      backendSttAudioCtxRef.current = null;
+    }
+
+    backendSttHasSpokenRef.current = false;
+    backendSttLastVoiceAtRef.current = 0;
+  }, []);
+
+  const abortBackendStt = useCallback(() => {
+    try {
+      backendSttAbortRef.current?.abort();
+    } catch {}
+    backendSttAbortRef.current = null;
+
+    cleanupBackendSttResources();
+
+    // NOTE: we intentionally do NOT flip backendSttInFlightRef here.
+    // startBackendSttOnce() owns that lifecycle and will clear it in its own finally blocks.
+    setSttRunning(false);
+  }, [cleanupBackendSttResources]);
+
+  const transcribeBackendStt = useCallback(
+    async (blob: Blob): Promise<string> => {
+      const controller = new AbortController();
+      backendSttAbortRef.current = controller;
+
+      const fd = new FormData();
+      fd.append("audio", blob, blob.type.includes("mp4") ? "stt.mp4" : "stt.webm");
+
+      const res = await fetch(`${API_BASE}/stt/transcribe`, {
+        method: "POST",
+        body: fd,
+        signal: controller.signal,
+      });
+
+      let data: any = null;
+      try {
+        data = await res.json();
+      } catch {
+        data = null;
+      }
+
+      if (!res.ok) {
+        const msg = (data && (data.error || data.message)) || `STT failed (${res.status})`;
+        throw new Error(msg);
+      }
+
+      return (data?.text ?? "").toString().trim();
+    },
+    [API_BASE]
+  );
+
+  const startBackendSttOnce = useCallback(async (): Promise<void> => {
+    if (!useBackendStt) return;
+    if (!sttEnabledRef.current || sttPausedRef.current) return;
+    if (backendSttInFlightRef.current) return;
+
+    const now0 = performance.now();
+    if (now0 < sttIgnoreUntilRef.current) {
+      const waitMs = Math.max(0, Math.ceil(sttIgnoreUntilRef.current - now0 + 50));
+      setTimeout(() => {
+        if (sttEnabledRef.current && !sttPausedRef.current) {
+          startBackendSttOnce().catch(() => {});
         }
-      }, delayMs);
+      }, waitMs);
       return;
     }
 
+    backendSttInFlightRef.current = true;
+    backendSttHasSpokenRef.current = false;
+    backendSttLastVoiceAtRef.current = performance.now();
+
+    clearSttSilenceTimer();
+    setSttError(null);
+    setSttRunning(true);
+    setSttInterim("");
+    setSttFinal("");
+
     try {
-      const rec = sttRecRef.current;
-      if (!rec?.start) return;
-      rec.start();
-    } catch {
-      // Ignore InvalidStateError if already started.
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+      backendSttStreamRef.current = stream;
+
+      // Choose best available recording MIME type for this browser.
+      let mimeType = "";
+      try {
+        const candidates = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/aac", "audio/mpeg"];
+        for (const c of candidates) {
+          if (typeof MediaRecorder !== "undefined" && (MediaRecorder as any).isTypeSupported?.(c)) {
+            mimeType = c;
+            break;
+          }
+        }
+      } catch {}
+
+      let recorder: MediaRecorder;
+      try {
+        recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      } catch {
+        throw new Error("This browser cannot record audio for STT. Please use Live Avatar mode on this device.");
+      }
+      backendSttRecorderRef.current = recorder;
+
+      const chunks: BlobPart[] = [];
+      recorder.ondataavailable = (ev: BlobEvent) => {
+        if (ev.data && ev.data.size > 0) chunks.push(ev.data);
+      };
+
+      const blobPromise = new Promise<Blob>((resolve, reject) => {
+        recorder.onstop = () => {
+          const type = recorder.mimeType || mimeType || "audio/webm";
+          resolve(new Blob(chunks, { type }));
+        };
+        (recorder as any).onerror = (ev: any) => reject(ev?.error || new Error("Recorder error"));
+      });
+
+      // Simple VAD (silence detection) using AnalyserNode
+      try {
+        const Ctx: any = (window as any).AudioContext || (window as any).webkitAudioContext;
+        const ctx: AudioContext = new Ctx();
+        backendSttAudioCtxRef.current = ctx;
+        try {
+          await ctx.resume();
+        } catch {}
+
+        const src = ctx.createMediaStreamSource(stream);
+        const analyser = ctx.createAnalyser();
+        analyser.fftSize = 2048;
+        src.connect(analyser);
+
+        const data = new Uint8Array(analyser.fftSize);
+
+        const threshold = 0.02; // RMS threshold
+        const minRecordMs = 350;
+        const maxRecordMs = 15000;
+        const silenceMs = 2000;
+        const startedAt = performance.now();
+
+        const tick = () => {
+          if (!sttEnabledRef.current || sttPausedRef.current) {
+            try {
+              if (recorder.state !== "inactive") recorder.stop();
+            } catch {}
+            return;
+          }
+
+          analyser.getByteTimeDomainData(data);
+          let sum = 0;
+          for (let i = 0; i < data.length; i++) {
+            const v = (data[i] - 128) / 128;
+            sum += v * v;
+          }
+          const rms = Math.sqrt(sum / data.length);
+          const now = performance.now();
+
+          if (rms > threshold) {
+            backendSttLastVoiceAtRef.current = now;
+            backendSttHasSpokenRef.current = true;
+          }
+
+          const elapsed = now - startedAt;
+          const silentFor = now - backendSttLastVoiceAtRef.current;
+
+          if (elapsed >= maxRecordMs) {
+            try {
+              if (recorder.state !== "inactive") recorder.stop();
+            } catch {}
+            return;
+          }
+
+          if (backendSttHasSpokenRef.current && elapsed > minRecordMs && silentFor >= silenceMs) {
+            try {
+              if (recorder.state !== "inactive") recorder.stop();
+            } catch {}
+            return;
+          }
+
+          backendSttRafRef.current = requestAnimationFrame(tick);
+        };
+
+        backendSttRafRef.current = requestAnimationFrame(tick);
+      } catch {
+        // If VAD setup fails, we still record; hard-stop timer will end it.
+      }
+
+      backendSttHardStopTimerRef.current = setTimeout(() => {
+        try {
+          if (recorder.state !== "inactive") recorder.stop();
+        } catch {}
+      }, 16000);
+
+      try {
+        recorder.start(250);
+      } catch {
+        throw new Error("Failed to start recording.");
+      }
+
+      const blob = await blobPromise;
+      const hadSpeech = backendSttHasSpokenRef.current;
+
+      // Important: release the mic/audio session BEFORE we attempt any TTS playback.
+      cleanupBackendSttResources();
+      setSttRunning(false);
+
+      // If user disabled/paused during capture, do nothing further.
+      if (!sttEnabledRef.current || sttPausedRef.current) return;
+
+      // If we never detected speech, skip transcription to avoid cost/noise.
+      if (!hadSpeech) return;
+      if (!blob || blob.size < 2048) return;
+
+      const text = await transcribeBackendStt(blob);
+      if (!text) return;
+
+      // Ignore if we're still inside an ignore window (e.g., avatar speech bleed).
+      if (performance.now() < sttIgnoreUntilRef.current) return;
+
+      setSttFinal(text);
+      sttFinalRef.current = text;
+
+      await send(text);
+    } catch (e: any) {
+      setSttError(e?.message || "STT failed.");
+    } finally {
+      cleanupBackendSttResources();
+      setSttRunning(false);
+      backendSttInFlightRef.current = false;
+
+      // Hands-free loop: if still enabled, start listening again.
+      if (sttEnabledRef.current && !sttPausedRef.current) {
+        const now = performance.now();
+        const ignoreWait = now < sttIgnoreUntilRef.current ? Math.ceil(sttIgnoreUntilRef.current - now + 50) : 0;
+        const baseDelay = isIOS ? 100 : 0;
+
+        setTimeout(() => {
+          startBackendSttOnce().catch(() => {});
+        }, Math.max(ignoreWait, baseDelay));
+      }
     }
-  }, [isIOS]);
+  }, [
+    clearSttSilenceTimer,
+    cleanupBackendSttResources,
+    isIOS,
+    send,
+    transcribeBackendStt,
+    useBackendStt,
+  ]);
+
+  const kickBackendStt = useCallback(() => {
+    if (!useBackendStt) return;
+    if (!sttEnabledRef.current || sttPausedRef.current) return;
+    if (backendSttInFlightRef.current) return;
+
+    // Small delay helps iOS fully exit previous audio state.
+    setTimeout(() => {
+      startBackendSttOnce().catch(() => {});
+    }, isIOS ? 100 : 0);
+  }, [isIOS, startBackendSttOnce, useBackendStt]);
+
+const pauseSpeechToText = useCallback(() => {
+    sttPausedRef.current = true;
+    clearSttSilenceTimer();
+
+    setSttInterim("");
+    setSttFinal("");
+
+    // Backend STT: abort any in-flight record/transcribe
+    abortBackendStt();
+
+    // Browser STT: stop recognition if it exists
+    const rec = sttRecRef.current;
+    try {
+      rec?.stop?.();
+    } catch {
+      // ignore
+    }
+
+    setSttRunning(false);
+  }, [abortBackendStt, clearSttSilenceTimer]);
 
   const scheduleSttAutoSend = useCallback(() => {
     if (!sttEnabledRef.current) return;
 
     clearSttSilenceTimer();
+
     sttSilenceTimerRef.current = setTimeout(() => {
       const text = getCurrentSttText();
       if (!text) return;
 
-    // If speech-to-text "hands-free" mode is enabled, pause recognition while we send
-    // and while the avatar speaks. We'll auto-resume after speaking finishes.
-    const resumeSttAfter = sttEnabledRef.current;
-    let resumeScheduled = false;
-    if (resumeSttAfter) {
+      // Pause BEFORE we send so the assistant doesn't "talk to itself".
       pauseSpeechToText();
 
-      // Defensive: clear any in-progress transcript to avoid accidental duplicate sends.
       sttFinalRef.current = "";
       sttInterimRef.current = "";
-    }
-
-      // Stop listening while we send + while the avatar speaks, but keep STT enabled.
-      pauseSpeechToText();
-
-      // Clear current transcript so the next turn starts clean.
-      sttFinalRef.current = "";
-      sttInterimRef.current = "";
+      setInputValue("");
 
       void sendRef.current(text);
     }, 2000);
   }, [getCurrentSttText, pauseSpeechToText]);
 
-  const requestMicPermission = useCallback(async () => {
-    // IMPORTANT:
-    // - Must be triggered by a user gesture (e.g., mic button click), or browsers may block it.
-    // - If embedded, the embedding iframe must include: allow="microphone"
-    if (typeof window === "undefined" || !navigator?.mediaDevices?.getUserMedia) return false;
+  const requestMicPermission = useCallback(async (): Promise<boolean> => {
+    // NOTE: Web Speech API does not reliably prompt on iOS if start() is called
+    // outside the user's click. We still use getUserMedia to ensure permission exists.
+    if (!navigator.mediaDevices?.getUserMedia) return true;
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      // Immediately stop tracks. We only need to trigger the permission prompt / verify access.
-      for (const track of stream.getTracks()) {
-        try {
-          track.stop();
-        } catch {}
-      }
+      stream.getTracks().forEach((t) => t.stop());
       return true;
-    } catch (e: any) {
-      const msg = String(e?.name || e?.message || "");
-      if (msg.toLowerCase().includes("notallowed") || msg.toLowerCase().includes("permission")) {
-        setSttError(getEmbedHint());
-      } else {
-        setSttError(`Speech-to-text error: ${msg || "microphone not available"}`);
-      }
+    } catch (e) {
+      console.warn("Mic permission denied/unavailable:", e);
+      setSttError(getEmbedHint());
       return false;
     }
   }, [getEmbedHint]);
 
-  const ensureSpeechRecognition = useCallback(() => {
+  const ensureSpeechRecognition = useCallback((): any | null => {
     if (typeof window === "undefined") return null;
 
     const SpeechRecognitionCtor =
@@ -1749,175 +2049,276 @@ const stateToSendWithCompanion: SessionState = {
 
     if (!SpeechRecognitionCtor) return null;
 
-    if (sttRecRef.current) return sttRecRef.current;
+    if (sttRecRef.current) return sttRecRef.current as any;
 
     const rec = new SpeechRecognitionCtor();
-    rec.lang = "en-US";
-    rec.continuous = true;
-    rec.interimResults = true;
+
+    // iOS + embedded contexts are more stable with continuous=false and manual restarts.
+    try {
+      rec.continuous = !isIOS;
+    } catch {
+      // ignore
+    }
+
+    try {
+      rec.interimResults = true;
+    } catch {
+      // ignore
+    }
+
+    try {
+      rec.lang = "en-US";
+    } catch {
+      // ignore
+    }
 
     rec.onstart = () => {
-        sttAudioCaptureCountRef.current = 0;
-        setSttError(null);
-        setSttRunning(true);
-      };
+      setSttRunning(true);
+      setSttError(null);
+      // reset audio-capture fail window on successful start
+      sttAudioCaptureFailsRef.current = 0;
+      sttLastAudioCaptureAtRef.current = 0;
+    };
 
     rec.onend = () => {
       setSttRunning(false);
 
-      // Browsers often end recognition automatically (silence, time limits, etc).
-      // If STT is enabled and not intentionally paused, restart.
-      if (sttEnabledRef.current && !sttPausedRef.current) {
-        clearSttRestartTimer();
-        const restartDelay = isIOS ? 750 : 250;
-        sttRestartTimerRef.current = setTimeout(() => {
-          try {
-            rec.start();
-          } catch {}
-        }, restartDelay);
-      }
+      if (!sttEnabledRef.current || sttPausedRef.current) return;
+
+      clearSttRestartTimer();
+
+      const now = Date.now();
+      const ignoreDelay = Math.max(0, (sttIgnoreUntilRef.current || 0) - now);
+
+      // On iOS we add a larger delay between restarts to avoid transient audio-capture failures.
+      const baseDelay = isIOS ? 850 : 250;
+
+      sttRestartTimerRef.current = setTimeout(() => {
+        if (!sttEnabledRef.current || sttPausedRef.current) return;
+
+        try {
+          rec.start();
+        } catch {
+          // ignore
+        }
+      }, baseDelay + ignoreDelay);
     };
 
     rec.onerror = (event: any) => {
       const code = String(event?.error || "");
+
+      if (code === "no-speech" || code === "aborted") {
+        return;
+      }
+
       if (code === "not-allowed" || code === "service-not-allowed") {
-        // Hard block — stop "hands-free" mode until user explicitly starts again.
         sttEnabledRef.current = false;
         sttPausedRef.current = false;
         setSttEnabled(false);
         setSttRunning(false);
         clearSttSilenceTimer();
         clearSttRestartTimer();
-        setSttError(getEmbedHint());
+        clearSttRecoverTimer();
+        clearSttRecoverTimer();
+        setSttError("Microphone permission was blocked." + getEmbedHint());
+        try {
+          rec.stop?.();
+        } catch {
+          // ignore
+        }
         return;
       }
 
       if (code === "audio-capture") {
-        // iOS Safari (and some mobile WebViews) can intermittently throw audio-capture even when a mic exists.
-        // We'll do a short backoff + hard-reset and retry a couple times.
-        sttAudioCaptureCountRef.current += 1;
-        setSttRunning(false);
-        setSttError("Speech-to-text error: audio-capture (no microphone found).");
+        const now = Date.now();
+        const withinWindow = now - sttLastAudioCaptureAtRef.current < 10_000;
+        sttAudioCaptureFailsRef.current = withinWindow
+          ? sttAudioCaptureFailsRef.current + 1
+          : 1;
+        sttLastAudioCaptureAtRef.current = now;
 
-        // Best-effort: try to (re)warm mic permissions (won't always prompt without a user gesture).
-        void requestMicPermission();
+        setSttError("Speech-to-text error: audio-capture (no microphone found). Retrying…");
 
-        clearSttRestartTimer();
-
-        // After a few consecutive failures, stop STT and require the user to tap the mic again.
-        if (sttAudioCaptureCountRef.current >= 3) {
+        // If it keeps failing, we stop instead of looping forever.
+        if (sttAudioCaptureFailsRef.current >= 4) {
           sttEnabledRef.current = false;
           sttPausedRef.current = false;
           setSttEnabled(false);
+          setSttRunning(false);
           clearSttSilenceTimer();
+          clearSttRestartTimer();
+        clearSttRecoverTimer();
+          clearSttRecoverTimer();
+          setSttError(
+            "Speech-to-text could not access the microphone on this device. Please reload the page and try again."
+              + getEmbedHint()
+          );
+          try {
+            rec.stop?.();
+          } catch {
+            // ignore
+          }
           return;
         }
 
-        const backoff = isIOS ? 1200 : 600;
-        sttRestartTimerRef.current = setTimeout(() => {
+        // Recovery path: recreate recognition (helps iOS) and try again after a short delay.
+        clearSttRecoverTimer();
+        sttRecoverTimerRef.current = setTimeout(async () => {
           if (!sttEnabledRef.current || sttPausedRef.current) return;
 
-          // Hard reset recognition instance (Safari can get "stuck" after audio-capture).
-          try {
-            rec.abort?.();
-          } catch {}
+          resetSpeechRecognition();
 
-          sttRecRef.current = null;
-          const next = ensureSpeechRecognition();
+          const ok = await requestMicPermission();
+          if (!ok) return;
+
+          const r2 = ensureSpeechRecognition();
+          if (!r2) return;
+
           try {
-            next?.start?.();
-          } catch {}
-        }, backoff);
+            r2.start();
+          } catch {
+            // ignore
+          }
+        }, isIOS ? 1200 : 650);
 
         return;
       }
 
-      // Other errors are often transient (no-speech, aborted, network). Let onend handle restart.
+      console.warn("STT error:", code, event);
+      setSttError(`Speech-to-text error: ${code}`);
     };
 
     rec.onresult = (event: any) => {
-      try {
-        const results = event?.results;
-        if (!results) return;
-        if (!sttEnabledRef.current) return;
-        if (sttPausedRef.current) return;
-        if (Date.now() < sttIgnoreUntilRef.current) return;
+      if (!sttEnabledRef.current || sttPausedRef.current) return;
+      if (Date.now() < (sttIgnoreUntilRef.current || 0)) return;
 
-        let finalText = "";
-        let interimText = "";
+      let finalText = "";
+      let interimText = "";
 
-        for (let i = 0; i < results.length; i++) {
-          const res = results[i];
-          const t = String(res?.[0]?.transcript || "");
-          if (res?.isFinal) finalText += t;
-          else interimText += t;
-        }
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const res = event.results[i];
+        const txt = res?.[0]?.transcript ?? "";
+        if (res?.isFinal) finalText += txt;
+        else interimText += txt;
+      }
 
-        sttFinalRef.current = finalText.trim();
-        sttInterimRef.current = interimText.trim();
+      if (finalText) sttFinalRef.current = `${sttFinalRef.current} ${finalText}`.trim();
+      sttInterimRef.current = interimText.trim();
 
-        const combined = getCurrentSttText();
-        if (combined) setInput(combined);
+      const combined = getCurrentSttText();
+      setInputValue(combined);
 
-        scheduleSttAutoSend();
-      } catch {}
+      scheduleSttAutoSend();
     };
 
     sttRecRef.current = rec;
     return rec;
-  }, [getCurrentSttText, scheduleSttAutoSend, getEmbedHint, requestMicPermission, isIOS]);
+  }, [
+    isIOS,
+    getCurrentSttText,
+    scheduleSttAutoSend,
+    getEmbedHint,
+    requestMicPermission,
+    resetSpeechRecognition,
+  ]);
 
-  const startSpeechToText = useCallback(() => {
-    setSttError(null);
-    sttAudioCaptureCountRef.current = 0;
+  const resumeSpeechToText = useCallback(() => {
+    if (!sttEnabledRef.current) return;
 
-    // Prime audio (unlocks playback on iOS after a user gesture).
-    primeLocalTtsAudio();
+    sttPausedRef.current = false;
 
-    const rec = ensureSpeechRecognition();
-    if (!rec) {
-      setSttError("SpeechRecognition is not supported in this browser.");
+    // iOS/iPadOS: use backend STT recorder (more stable than Web Speech)
+    if (useBackendStt) {
+      kickBackendStt();
       return;
     }
+
+    const ok = ensureSpeechRecognition();
+    if (!ok) {
+      sttEnabledRef.current = false;
+      setSttRunning(false);
+      setSttError("Speech-to-text is not supported in this browser.");
+      return;
+    }
+
+    const rec = sttRecRef.current;
+    if (!rec) return;
+
+    try {
+      rec.start();
+      setSttRunning(true);
+    } catch {
+      // ignore; will restart on onend if needed
+    }
+  }, [ensureSpeechRecognition, kickBackendStt, useBackendStt]);
+
+  const startSpeechToText = useCallback(async () => {
+    primeLocalTtsAudio();
 
     sttEnabledRef.current = true;
     sttPausedRef.current = false;
     setSttEnabled(true);
+    setSttError(null);
 
-    // IMPORTANT (iOS/Safari): start recognition synchronously from the click handler
-    // (avoid awaiting anything before calling `start()`).
-    try {
-      rec.start();
-    } catch {
-      // Ignore: some browsers throw if already started; `onend`/`onerror` handlers will recover.
+    const permOk = await requestMicPermission();
+    if (!permOk) {
+      setSttError("Microphone permission denied.");
+      stopSpeechToText(false);
+      return;
     }
-  }, [ensureSpeechRecognition, primeLocalTtsAudio]);
 
+    // iOS/iPadOS: prefer backend STT recorder (more stable than Web Speech)
+    if (useBackendStt) {
+      kickBackendStt();
+      return;
+    }
 
-  const stopSpeechToText = useCallback(() => {
-    sttEnabledRef.current = false;
-    sttPausedRef.current = false;
-    setSttEnabled(false);
-    setSttRunning(false);
-    clearSttSilenceTimer();
-    clearSttRestartTimer();
+    const ok = ensureSpeechRecognition();
+    if (!ok) {
+      setSttError("Speech-to-text is not supported in this browser.");
+      stopSpeechToText(false);
+      return;
+    }
 
-    sttFinalRef.current = "";
-    sttInterimRef.current = "";
+    resumeSpeechToText();
+  }, [
+    ensureSpeechRecognition,
+    kickBackendStt,
+    primeLocalTtsAudio,
+    requestMicPermission,
+    resumeSpeechToText,
+    stopSpeechToText,
+    useBackendStt,
+  ]);
 
-    try {
-      const rec = sttRecRef.current;
-      if (rec?.stop) rec.stop();
-    } catch {}
-  }, []);
+  const stopSpeechToText = useCallback(
+    (clearError: boolean = true) => {
+      sttEnabledRef.current = false;
+      sttPausedRef.current = false;
+      setSttEnabled(false);
+      clearSttSilenceTimer();
 
-  const toggleSpeechToText = useCallback(() => {
+      setSttInterim("");
+      setSttFinal("");
+      setSttRunning(false);
+
+      // Abort backend STT capture/transcribe if in flight
+      abortBackendStt();
+      backendSttInFlightRef.current = false;
+
+      // Stop browser SpeechRecognition if it exists
+      resetSpeechRecognition();
+
+      if (clearError) setSttError(null);
+    },
+    [abortBackendStt, clearSttSilenceTimer, resetSpeechRecognition]
+  );
+
+  const toggleSpeechToText = useCallback(async () => {
     if (sttEnabledRef.current) stopSpeechToText();
-    else startSpeechToText();
+    else await startSpeechToText();
   }, [startSpeechToText, stopSpeechToText]);
 
-
-  // Dedicated stop button for STT (so the user can stop listening even when Live Avatar isn't used)
   const stopHandsFreeSTT = useCallback(() => {
     stopSpeechToText();
   }, [stopSpeechToText]);
@@ -1930,6 +2331,7 @@ const stateToSendWithCompanion: SessionState = {
         sttPausedRef.current = false;
         clearSttSilenceTimer();
         clearSttRestartTimer();
+        clearSttRecoverTimer();
         const rec = sttRecRef.current;
         if (rec) {
           try {

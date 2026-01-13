@@ -8,7 +8,7 @@ import hashlib
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 
 # Threadpool helper (prevents blocking the event loop on requests/azure upload)
@@ -568,3 +568,48 @@ async def tts_audio_url(request: Request) -> Dict[str, Any]:
         raise HTTPException(status_code=502, detail=f"TTS failed: {type(e).__name__}: {e}")
 
     return {"audio_url": audio_url}
+
+
+@app.post("/stt/transcribe")
+async def stt_transcribe(audio: UploadFile = File(...)) -> Dict[str, Any]:
+    """
+    Server-side speech-to-text using OpenAI transcription.
+
+    Expects multipart/form-data with:
+      - audio: uploaded audio file (webm/mp4/etc.)
+
+    Returns:
+      { "text": "..." }
+    """
+    import io
+    from openai import OpenAI
+
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set")
+
+    # Read the uploaded file into memory
+    raw = await audio.read()
+    if not raw:
+        raise HTTPException(status_code=422, detail="Empty audio upload")
+
+    buf = io.BytesIO(raw)
+    buf.name = (audio.filename or "audio.webm")
+
+    model = os.environ.get("OPENAI_STT_MODEL", "whisper-1")
+
+    try:
+        client = OpenAI(api_key=api_key)
+        result = client.audio.transcriptions.create(
+            model=model,
+            file=buf,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"STT failed: {type(e).__name__}: {e}")
+
+    # OpenAI Python SDK returns an object with .text (or a dict-like response)
+    text = getattr(result, "text", None)
+    if text is None and isinstance(result, dict):
+        text = result.get("text")
+
+    return {"text": (text or "").strip()}
