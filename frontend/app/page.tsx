@@ -1785,10 +1785,7 @@ const stateToSendWithCompanion: SessionState = {
       const data = (await resp.json()) as any;
       return String(data?.text ?? "").trim();
     },
-    [isIOS],
-  );
-,
-    [API_BASE]
+    [API_BASE, isIOS],
   );
 
   const startBackendSttOnce = useCallback(async (): Promise<void> => {
