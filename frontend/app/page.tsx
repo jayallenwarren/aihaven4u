@@ -363,6 +363,7 @@ export default function Page() {
   // Local audio-only TTS element (used when Live Avatar is not active/available)
   const localTtsAudioRef = useRef<HTMLAudioElement | null>(null);
   const localTtsUnlockedRef = useRef(false);
+  const localTtsPrimePromiseRef = useRef<Promise<void> | null>(null);
 
 
   // Companion identity (drives persona + Phase 1 live avatar mapping)
@@ -792,66 +793,73 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string): Promis
   // this hidden <audio> element on the first mic click.
   const PRIME_SILENT_WAV =
     "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YQAAAAA=";
+  const primeLocalTtsAudio = useCallback((): Promise<void> => {
+    // iOS/Safari: unlock audio playback with a user gesture so future .play() calls work.
+    // IMPORTANT: Do NOT clobber the shared playback element if it has already been repurposed
+    // for real TTS (this was causing the *first* reply after STT to be silent on iOS).
+    if (typeof window === "undefined") return Promise.resolve();
+    if (localTtsUnlockedRef.current) return Promise.resolve();
 
-  const primeLocalTtsAudio = useCallback(() => {
-    if (localTtsUnlockedRef.current) return;
+    // If a prime is already in-flight, reuse it.
+    if (localTtsPrimePromiseRef.current) return localTtsPrimePromiseRef.current;
+
     const a = localTtsAudioRef.current;
-    if (!a) return;
+    if (!a) return Promise.resolve();
 
-    try {
-      a.setAttribute("playsinline", "true");
-      (a as any).playsInline = true;
-    } catch {
-      // ignore
-    }
+    const primeSrc = PRIME_SILENT_WAV;
 
-    // Must be triggered from a user gesture (e.g., mic button click).
-    // IMPORTANT for iOS Safari: unlocking should be an *unmuted* play() (muted playback can
-    // "succeed" but still leave later unmuted TTS blocked). We keep volume near-zero so it
-    // stays inaudible.
-    a.muted = false;
-    a.volume = 0.001;
-    a.src = PRIME_SILENT_WAV;
-
-    const p = a.play?.();
-    if (p && typeof (p as any).then === "function") {
-      (p as Promise<any>)
-        .then(() => {
-          try {
-            a.pause();
-            a.currentTime = 0;
-          } catch {
-            // ignore
-          }
-          localTtsUnlockedRef.current = true;
-        })
-        .catch(() => {
-          // If this fails, Safari may still allow playback after another gesture; we'll try again later.
-        })
-        .finally(() => {
-          try {
-            a.pause();
-            a.currentTime = 0;
-          } catch {
-            // ignore
-          }
-          a.muted = false;
-          a.volume = 1;
-          a.src = "";
-        });
-    } else {
-      // Non-promise play()
+    const primePromise = (async () => {
       try {
-        a.pause();
-        a.currentTime = 0;
+        a.setAttribute("playsinline", "true");
+        a.setAttribute("webkit-playsinline", "true");
+        (a as any).playsInline = true;
+
+        a.preload = "auto";
+        a.muted = false;
+        a.volume = 0.001;
+
+        // Prime with a tiny silent audio clip.
+        a.src = primeSrc;
+
+        try {
+          a.load?.();
+        } catch {
+          // ignore
+        }
+
+        const p = a.play();
+        if (p && typeof (p as any).then === "function") {
+          await p;
+        }
+
+        localTtsUnlockedRef.current = true;
       } catch {
-        // ignore
+        // If blocked, we will try again on the next explicit user gesture.
+      } finally {
+        // Only clean up the prime src if we're still on it.
+        // If something else already set a real TTS src, DO NOT pause/reset it.
+        try {
+          if (a.src === primeSrc) {
+            try {
+              a.pause();
+              a.currentTime = 0;
+            } catch {
+              // ignore
+            }
+            a.src = "";
+            a.volume = 1;
+            a.muted = false;
+          }
+        } catch {
+          // ignore
+        }
+
+        localTtsPrimePromiseRef.current = null;
       }
-      localTtsUnlockedRef.current = true;
-      a.muted = false;
-      a.volume = 1;
-      a.src = "";
-    }
+    })();
+
+    localTtsPrimePromiseRef.current = primePromise;
+    return primePromise;
   }, []);
 
   const playLocalTtsUrl = useCallback(
@@ -860,6 +868,17 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string): Promis
       if (!a) {
         hooks?.onDidNotSpeak?.();
         return;
+      }
+
+      // If we're still priming/unlocking iOS audio, wait for it to finish so it doesn't
+      // reset/clear the audio element right as we start real playback.
+      const prime = localTtsPrimePromiseRef.current;
+      if (prime) {
+        try {
+          await prime;
+        } catch {
+          // ignore
+        }
       }
 
       try {
@@ -940,10 +959,41 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string): Promis
         await new Promise((r) => setTimeout(r, isIphone ? 220 : 150));
       }
 
+      // iOS/iPadOS: Safari can need an extra beat after STT ends before playback becomes audible.
+      if (isIOS) {
+        const dt = Date.now() - sttLastEndAtRef.current;
+        const minSettle = isIphone ? 380 : 260;
+        if (dt >= 0 && dt < minSettle) {
+          await new Promise((r) => setTimeout(r, minSettle - dt));
+        }
+      }
+
       hooks?.onWillSpeak?.();
 
+      const playWithRetry = async () => {
+        const delays = isIOS ? (isIphone ? [0, 220, 480] : [0, 180, 420]) : [0, 150];
+        let lastErr: any = null;
+
+        for (let i = 0; i < delays.length; i++) {
+          if (delays[i] > 0) {
+            await new Promise((r) => setTimeout(r, delays[i]));
+          }
+          try {
+            // Nudge the element; iOS can drop the first play() right after mic activity
+            a.pause();
+            a.currentTime = 0;
+            a.load?.();
+            await a.play();
+            return;
+          } catch (err) {
+            lastErr = err;
+          }
+        }
+        throw lastErr ?? new Error("Local TTS play() failed");
+      };
+
       try {
-        await a.play();
+        await playWithRetry();
         localTtsUnlockedRef.current = true;
       } catch (err) {
         console.warn("Local TTS playback failed:", err);
@@ -1202,6 +1252,7 @@ const speakAssistantReply = useCallback(
   const sttRecoverTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sttAudioCaptureFailsRef = useRef<number>(0);
   const sttLastAudioCaptureAtRef = useRef<number>(0);
+  const sttLastEndAtRef = useRef<number>(0);
 
   const sttFinalRef = useRef<string>("");
   const sttInterimRef = useRef<string>("");
@@ -1702,17 +1753,19 @@ const stateToSendWithCompanion: SessionState = {
     return `${(sttFinalRef.current || "").trim()} ${(sttInterimRef.current || "").trim()}`.trim();
   }, []);
 
-    // ------------------------------------------------------------
-  // Backend STT (record + server-side transcription).
-  // iOS/iPadOS Web Speech STT can be unstable; this path is far more reliable.
-  // Requires backend endpoint: POST /stt/transcribe (raw audio Blob; Content-Type audio/webm|audio/mp4) -> { text }
+  // ------------------------------------------------------------
+  // Backend STT (record + server-side transcription) — FALLBACK ONLY.
+  // We only use this when the browser has NO Web Speech API support.
+  // (Live Avatar STT already uses Web Speech; we keep that path unchanged.)
   // ------------------------------------------------------------
   const liveAvatarActive =
     avatarStatus === "connecting" || avatarStatus === "connected" || avatarStatus === "reconnecting";
 
-  // Prefer backend STT for iOS **audio-only** mode (more stable than browser SpeechRecognition).
-  // Keep Live Avatar mode on browser STT (it is already stable across devices).
-  const useBackendStt = isIOS && backendSttAvailable && !liveAvatarActive && !isEmbedded;
+  const hasSpeechRecognition =
+    typeof window !== "undefined" &&
+    !!((window as any).SpeechRecognition || (window as any).webkitSpeechRecognition);
+
+  const useBackendStt = backendSttAvailable && !liveAvatarActive && !hasSpeechRecognition;
 
   const cleanupBackendSttResources = useCallback(() => {
     try {
@@ -2142,6 +2195,7 @@ const pauseSpeechToText = useCallback(() => {
     };
 
     rec.onend = () => {
+      sttLastEndAtRef.current = Date.now();
       setSttRunning(false);
 
       if (!sttEnabledRef.current || sttPausedRef.current) return;
@@ -2166,6 +2220,7 @@ const pauseSpeechToText = useCallback(() => {
     };
 
     rec.onerror = (event: any) => {
+      sttLastEndAtRef.current = Date.now();
       const code = String(event?.error || "");
 
       if (code === "no-speech" || code === "aborted") {
@@ -2288,7 +2343,7 @@ const pauseSpeechToText = useCallback(() => {
 
     sttPausedRef.current = false;
 
-    // iOS/iPadOS: use backend STT recorder (more stable than Web Speech)
+    // If Web Speech is not available, fall back to backend STT recorder.
     if (useBackendStt) {
       kickBackendStt();
       return;
@@ -2336,9 +2391,8 @@ const pauseSpeechToText = useCallback(() => {
     [abortBackendStt, clearSttSilenceTimer, resetSpeechRecognition]
   );
 
-  const startSpeechToText = useCallback(async (opts?: { forceBrowser?: boolean }) => {
-    const forceBrowser = !!opts?.forceBrowser;
-    primeLocalTtsAudio();
+  const startSpeechToText = useCallback(async () => {
+    await primeLocalTtsAudio();
 
     sttEnabledRef.current = true;
     sttPausedRef.current = false;
@@ -2352,9 +2406,8 @@ const pauseSpeechToText = useCallback(() => {
       return;
     }
 
-    // iOS/iPadOS: prefer backend STT recorder (more stable than Web Speech)
-    // NOTE: When starting Live Avatar, we force browser STT so D-ID voice doesn't rely on backend recorder.
-    if (useBackendStt && !forceBrowser) {
+    // If Web Speech is not available, fall back to backend STT recorder.
+    if (useBackendStt) {
       kickBackendStt();
       return;
     }
@@ -2378,39 +2431,13 @@ const pauseSpeechToText = useCallback(() => {
   ]);
 
   const toggleSpeechToText = useCallback(async () => {
-    // In Live Avatar mode, mic is required. We don't allow toggling it off.
-    // If STT isn't running (permission denied or stopped), we try to start it again.
-    if (liveAvatarActive) {
-      if (!sttEnabledRef.current) {
-        await startSpeechToText({ forceBrowser: true });
-      }
-      return;
-    }
-
     if (sttEnabledRef.current) stopSpeechToText();
     else await startSpeechToText();
-  }, [liveAvatarActive, startSpeechToText, stopSpeechToText]);
+  }, [startSpeechToText, stopSpeechToText]);
 
   const stopHandsFreeSTT = useCallback(() => {
-    // Stop listening immediately
     stopSpeechToText();
-
-    // Stop any local audio-only playback
-    try {
-      const a = localTtsAudioRef.current;
-      if (a) {
-        a.pause();
-        a.currentTime = 0;
-      }
-    } catch {
-      // ignore
-    }
-
-    // If Live Avatar is running, stop it too (mic is required in Live Avatar mode)
-    if (liveAvatarActive) {
-      void stopLiveAvatar();
-    }
-  }, [liveAvatarActive, stopLiveAvatar, stopSpeechToText]);
+  }, [stopSpeechToText]);
 
   // Cleanup
   useEffect(() => {
@@ -2512,22 +2539,7 @@ const pauseSpeechToText = useCallback(() => {
         ) {
           void stopLiveAvatar();
         } else {
-          void (async () => {
-            // Live Avatar requires microphone / STT. Start it automatically.
-            // If iOS audio-only backend STT is currently running, restart in browser STT for Live Avatar.
-            if (sttEnabledRef.current && useBackendStt) {
-              stopSpeechToText();
-            }
-
-            if (!sttEnabledRef.current) {
-              await startSpeechToText({ forceBrowser: true });
-            }
-
-            // If mic permission was denied, don't start Live Avatar.
-            if (!sttEnabledRef.current) return;
-
-            await startLiveAvatar();
-          })();
+          void startLiveAvatar();
         }
       }}
       style={{
@@ -2651,16 +2663,8 @@ const pauseSpeechToText = useCallback(() => {
             <button
               type="button"
               onClick={toggleSpeechToText}
-              disabled={(!sttEnabled && loading) || (liveAvatarActive && sttEnabled)}
-              title={
-                liveAvatarActive
-                  ? sttEnabled
-                    ? "Mic is required in Live Avatar (use Stop to end)"
-                    : "Enable microphone (required for Live Avatar)"
-                  : sttEnabled
-                    ? "Stop speech-to-text"
-                    : "Start speech-to-text"
-              }
+              disabled={!sttEnabled && loading}
+              title={sttEnabled ? "Stop speech-to-text" : "Start speech-to-text"}
               style={{
                 width: 44,
                 minWidth: 44,
