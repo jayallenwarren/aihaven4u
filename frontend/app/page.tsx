@@ -2345,6 +2345,21 @@ const pauseSpeechToText = useCallback(() => {
     setSttEnabled(true);
     setSttError(null);
 
+    const usingBackend = useBackendStt && !forceBrowser;
+
+    // IMPORTANT (iOS Safari / iOS embedded): SpeechRecognition.start() must be invoked directly
+    // from the user's gesture. Avoid awaiting anything before starting browser STT.
+    if (isIOS && !usingBackend) {
+      const ok = ensureSpeechRecognition();
+      if (!ok) {
+        setSttError("Speech-to-text is not supported in this browser.");
+        stopSpeechToText(false);
+        return;
+      }
+      resumeSpeechToText();
+      return;
+    }
+
     const permOk = await requestMicPermission();
     if (!permOk) {
       setSttError("Microphone permission denied.");
@@ -2354,7 +2369,7 @@ const pauseSpeechToText = useCallback(() => {
 
     // iOS/iPadOS: prefer backend STT recorder (more stable than Web Speech)
     // NOTE: When starting Live Avatar, we force browser STT so D-ID voice doesn't rely on backend recorder.
-    if (useBackendStt && !forceBrowser) {
+    if (usingBackend) {
       kickBackendStt();
       return;
     }
