@@ -1757,7 +1757,8 @@ const stateToSendWithCompanion: SessionState = {
 
   // Prefer backend STT for iOS **audio-only** mode (more stable than browser SpeechRecognition).
   // Keep Live Avatar mode on browser STT (it is already stable across devices).
-  const useBackendStt = isIOS && backendSttAvailable && !liveAvatarActive && !isEmbedded;
+  const useBackendStt = isIOS && backendSttAvailable && !liveAvatarActive; // allow in embeds (Wix) now that mic permission works
+
 
   const cleanupBackendSttResources = useCallback(() => {
     try {
