@@ -2024,7 +2024,7 @@ const pauseSpeechToText = useCallback(() => {
 
       sttFinalRef.current = "";
       sttInterimRef.current = "";
-      setInputValue("");
+      setInput("");
 
       void sendRef.current(text);
     }, 2000);
@@ -2211,7 +2211,7 @@ const pauseSpeechToText = useCallback(() => {
       sttInterimRef.current = interimText.trim();
 
       const combined = getCurrentSttText();
-      setInputValue(combined);
+      setInput(combined);
 
       scheduleSttAutoSend();
     };
