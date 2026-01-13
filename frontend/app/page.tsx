@@ -1201,6 +1201,11 @@ const speakAssistantReply = useCallback(
   const [sttRunning, setSttRunning] = useState(false);
   const [sttError, setSttError] = useState<string | null>(null);
 
+  // These state setters exist to trigger renders when backend STT updates refs (mobile stability).
+  // We intentionally ignore the state values to avoid UI changes.
+  const [, setSttInterim] = useState<string>("");
+  const [, setSttFinal] = useState<string>("");
+
   const sttEnabledRef = useRef<boolean>(false);
   const sttPausedRef = useRef<boolean>(false);
   // Backend STT (iOS-safe): record mic audio via getUserMedia + MediaRecorder and transcribe server-side.
