@@ -363,6 +363,7 @@ export default function Page() {
   // Local audio-only TTS element (used when Live Avatar is not active/available)
   const localTtsAudioRef = useRef<HTMLAudioElement | null>(null);
   const localTtsUnlockedRef = useRef(false);
+  const localTtsPrimeTokenRef = useRef(0); // prevents prime cleanup from interrupting real playback
 
 
   // Companion identity (drives persona + Phase 1 live avatar mapping)
@@ -798,65 +799,91 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string): Promis
     const a = localTtsAudioRef.current;
     if (!a) return;
 
-    try {
-      a.setAttribute("playsinline", "true");
-      (a as any).playsInline = true;
-    } catch {
-      // ignore
-    }
+    // IMPORTANT (iOS/Safari):
+    // We use the mic-button gesture to "unlock" audio playback with a silent clip.
+    // A late-resolving promise from that silent clip must NOT be allowed to pause/clear
+    // the *real* TTS audio (first reply). We guard cleanup with a token/attribute.
+    const token = ++localTtsPrimeTokenRef.current;
 
-    // Must be triggered from a user gesture (e.g., mic button click).
-    // IMPORTANT for iOS Safari: unlocking should be an *unmuted* play() (muted playback can
-    // "succeed" but still leave later unmuted TTS blocked). We keep volume near-zero so it
-    // stays inaudible.
-    a.muted = false;
-    a.volume = 0.001;
-    a.src = PRIME_SILENT_WAV;
+    const cleanup = () => {
+      try {
+        if (a.getAttribute("data-tts-prime") !== String(token)) return;
+        a.removeAttribute("data-tts-prime");
+      } catch {
+        return;
+      }
 
-    const p = a.play?.();
-    if (p && typeof (p as any).then === "function") {
-      (p as Promise<any>)
-        .then(() => {
-          try {
-            a.pause();
-            a.currentTime = 0;
-          } catch {
-            // ignore
-          }
-          localTtsUnlockedRef.current = true;
-        })
-        .catch(() => {
-          // If this fails, Safari may still allow playback after another gesture; we'll try again later.
-        })
-        .finally(() => {
-          try {
-            a.pause();
-            a.currentTime = 0;
-          } catch {
-            // ignore
-          }
-          a.muted = false;
-          a.volume = 1;
-          a.src = "";
-        });
-    } else {
-      // Non-promise play()
       try {
         a.pause();
         a.currentTime = 0;
       } catch {
         // ignore
       }
-      localTtsUnlockedRef.current = true;
+
+      try {
+        a.src = "";
+      } catch {
+        // ignore
+      }
+
       a.muted = false;
       a.volume = 1;
-      a.src = "";
+    };
+
+    try {
+      a.setAttribute("playsinline", "");
+      a.setAttribute("webkit-playsinline", "");
+    } catch {
+      // ignore
+    }
+
+    try {
+      a.muted = false;
+      a.volume = 0.001;
+      a.src = PRIME_SILENT_WAV;
+
+      // Mark this element as being in "prime" mode for this token.
+      a.setAttribute("data-tts-prime", String(token));
+
+      const p = a.play?.();
+
+      // Fallback cleanup in case the promise is slow/never resolves on some Safari builds.
+      setTimeout(cleanup, 800);
+
+      if (p && typeof (p as any).then === "function") {
+        (p as Promise<void>)
+          .then(() => {
+            localTtsUnlockedRef.current = true;
+          })
+          .catch(() => {
+            // ignore; we'll retry unlock on next gesture
+          })
+          .finally(() => {
+            cleanup();
+          });
+      } else {
+        localTtsUnlockedRef.current = true;
+        cleanup();
+      }
+    } catch {
+      // ignore
     }
   }, []);
 
   const playLocalTtsUrl = useCallback(
     async (audioUrl: string, hooks?: SpeakAssistantHooks) => {
       const a = localTtsAudioRef.current;
+
+      // If a previous prime attempt is still resolving, make sure its cleanup can't
+      // interrupt the real TTS playback.
+      if (a) {
+        try {
+          a.removeAttribute("data-tts-prime");
+        } catch {
+          // ignore
+        }
+      }
+
       if (!a) {
         hooks?.onDidNotSpeak?.();
         return;
