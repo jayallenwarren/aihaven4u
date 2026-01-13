@@ -990,6 +990,18 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string): Promis
           } catch {
             // ignore
           }
+
+          // Release the audio element's source so iOS/Safari can reliably return the audio-session
+          // to input mode for the next STT turn.
+          try {
+            a.pause();
+            a.currentTime = 0;
+            a.removeAttribute("src");
+            a.load();
+          } catch {
+            // ignore
+          }
+
           resolve();
         };
         a.onended = finish;
@@ -1653,7 +1665,13 @@ const stateToSendWithCompanion: SessionState = {
       if (resumeSttAfter) {
         resumeScheduled = true;
         speakPromise.finally(() => {
-          if (sttEnabledRef.current) resumeSpeechToText();
+          if (!sttEnabledRef.current) return;
+
+          // iOS Safari can fail to re-acquire the mic if we restart STT immediately after
+          // assistant audio-only playback. Use a delayed restart for local TTS so follow-on
+          // STT remains reliable.
+          if (shouldUseLocalTts) resumeSpeechToTextAfterLocalTts();
+          else resumeSpeechToText();
         });
       }
     } catch (err: any) {
@@ -2367,6 +2385,59 @@ const pauseSpeechToText = useCallback(() => {
       // ignore; will restart on onend if needed
     }
   }, [ensureSpeechRecognition, kickBackendStt, useBackendStt]);
+
+  const resumeSpeechToTextAfterLocalTts = useCallback(() => {
+    if (!sttEnabledRef.current) return;
+
+    // Bring STT out of a "paused for send/playback" state
+    sttPausedRef.current = false;
+    setSttError(null);
+    setSttRunning(true);
+    setSttInterim("");
+    setSttFinal("");
+    sttFinalRef.current = "";
+    sttInterimRef.current = "";
+
+    // Backend STT doesn't depend on browser SpeechRecognition.
+    if (useBackendStt) {
+      kickBackendStt();
+      return;
+    }
+
+    // IMPORTANT (iOS): after we play assistant audio, Safari can get into an "audio-capture"
+    // failure mode if SpeechRecognition is restarted immediately. Hard-reset the SR instance
+    // and wait a beat before starting.
+    if (isIOS) {
+      resetSpeechRecognition();
+    }
+
+    const startOnce = () => {
+      if (!sttEnabledRef.current || sttPausedRef.current) return;
+      const rec = ensureSpeechRecognition();
+      if (!rec) return;
+
+      try {
+        rec.start();
+      } catch {
+        // If start fails right after output audio, retry once after a longer delay.
+        if (isIOS) {
+          resetSpeechRecognition();
+          setTimeout(() => {
+            if (!sttEnabledRef.current || sttPausedRef.current) return;
+            const rec2 = ensureSpeechRecognition();
+            if (!rec2) return;
+            try {
+              rec2.start();
+            } catch {
+              // The SR onerror handler already includes recovery/backoff for iOS.
+            }
+          }, 1100);
+        }
+      }
+    };
+
+    setTimeout(startOnce, isIOS ? 700 : 80);
+  }, [ensureSpeechRecognition, isIOS, kickBackendStt, resetSpeechRecognition, setSttError, setSttFinal, setSttInterim, setSttRunning, useBackendStt]);
 
   const stopSpeechToText = useCallback(
     (clearError: boolean = true) => {
