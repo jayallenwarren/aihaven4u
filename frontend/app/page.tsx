@@ -1189,6 +1189,7 @@ const speakAssistantReply = useCallback(
   const sttRecRef = useRef<any>(null);
   const sttSilenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sttRestartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const sttAudioCaptureCountRef = useRef<number>(0);
 
   const sttFinalRef = useRef<string>("");
   const sttInterimRef = useRef<string>("");
@@ -1656,7 +1657,8 @@ const stateToSendWithCompanion: SessionState = {
     sttPausedRef.current = false;
     clearSttRestartTimer();
 
-    const delayMs = Math.max(0, sttIgnoreUntilRef.current - Date.now());
+    const baseDelay = isIOS ? 450 : 0;
+    const delayMs = Math.max(baseDelay, sttIgnoreUntilRef.current - Date.now());
     if (delayMs > 0) {
       // Delay restart until after our ignore window (prevents picking up the avatar's audio tail).
       sttRestartTimerRef.current = setTimeout(() => {
@@ -1680,7 +1682,7 @@ const stateToSendWithCompanion: SessionState = {
     } catch {
       // Ignore InvalidStateError if already started.
     }
-  }, []);
+  }, [isIOS]);
 
   const scheduleSttAutoSend = useCallback(() => {
     if (!sttEnabledRef.current) return;
@@ -1755,8 +1757,10 @@ const stateToSendWithCompanion: SessionState = {
     rec.interimResults = true;
 
     rec.onstart = () => {
-      setSttRunning(true);
-    };
+        sttAudioCaptureCountRef.current = 0;
+        setSttError(null);
+        setSttRunning(true);
+      };
 
     rec.onend = () => {
       setSttRunning(false);
@@ -1765,11 +1769,12 @@ const stateToSendWithCompanion: SessionState = {
       // If STT is enabled and not intentionally paused, restart.
       if (sttEnabledRef.current && !sttPausedRef.current) {
         clearSttRestartTimer();
+        const restartDelay = isIOS ? 750 : 250;
         sttRestartTimerRef.current = setTimeout(() => {
           try {
             rec.start();
           } catch {}
-        }, 250);
+        }, restartDelay);
       }
     };
 
@@ -1788,7 +1793,42 @@ const stateToSendWithCompanion: SessionState = {
       }
 
       if (code === "audio-capture") {
+        // iOS Safari (and some mobile WebViews) can intermittently throw audio-capture even when a mic exists.
+        // We'll do a short backoff + hard-reset and retry a couple times.
+        sttAudioCaptureCountRef.current += 1;
+        setSttRunning(false);
         setSttError("Speech-to-text error: audio-capture (no microphone found).");
+
+        // Best-effort: try to (re)warm mic permissions (won't always prompt without a user gesture).
+        void requestMicPermission();
+
+        clearSttRestartTimer();
+
+        // After a few consecutive failures, stop STT and require the user to tap the mic again.
+        if (sttAudioCaptureCountRef.current >= 3) {
+          sttEnabledRef.current = false;
+          sttPausedRef.current = false;
+          setSttEnabled(false);
+          clearSttSilenceTimer();
+          return;
+        }
+
+        const backoff = isIOS ? 1200 : 600;
+        sttRestartTimerRef.current = setTimeout(() => {
+          if (!sttEnabledRef.current || sttPausedRef.current) return;
+
+          // Hard reset recognition instance (Safari can get "stuck" after audio-capture).
+          try {
+            rec.abort?.();
+          } catch {}
+
+          sttRecRef.current = null;
+          const next = ensureSpeechRecognition();
+          try {
+            next?.start?.();
+          } catch {}
+        }, backoff);
+
         return;
       }
 
@@ -1825,36 +1865,34 @@ const stateToSendWithCompanion: SessionState = {
 
     sttRecRef.current = rec;
     return rec;
-  }, [getCurrentSttText, scheduleSttAutoSend, getEmbedHint]);
+  }, [getCurrentSttText, scheduleSttAutoSend, getEmbedHint, requestMicPermission, isIOS]);
 
-  const startSpeechToText = useCallback(async () => {
+  const startSpeechToText = useCallback(() => {
     setSttError(null);
+    sttAudioCaptureCountRef.current = 0;
 
-    // Prime local audio so iOS can play TTS hands-free later.
+    // Prime audio (unlocks playback on iOS after a user gesture).
     primeLocalTtsAudio();
 
-    // 1) Ask for mic permission (or validate it)
-    const ok = await requestMicPermission();
-    if (!ok) return;
-
-    // 2) Ensure SpeechRecognition exists
     const rec = ensureSpeechRecognition();
     if (!rec) {
-      setSttError("Speech-to-text is not supported in this browser.");
+      setSttError("SpeechRecognition is not supported in this browser.");
       return;
     }
 
-    // 3) Enable hands-free mode and start listening
     sttEnabledRef.current = true;
     sttPausedRef.current = false;
     setSttEnabled(true);
 
+    // IMPORTANT (iOS/Safari): start recognition synchronously from the click handler
+    // (avoid awaiting anything before calling `start()`).
     try {
       rec.start();
     } catch {
-      // ignore InvalidStateError if already started
+      // Ignore: some browsers throw if already started; `onend`/`onerror` handlers will recover.
     }
-  }, [ensureSpeechRecognition, requestMicPermission, primeLocalTtsAudio]);
+  }, [ensureSpeechRecognition, primeLocalTtsAudio]);
+
 
   const stopSpeechToText = useCallback(() => {
     sttEnabledRef.current = false;
@@ -1873,13 +1911,11 @@ const stateToSendWithCompanion: SessionState = {
     } catch {}
   }, []);
 
-  const toggleSpeechToText = useCallback(async () => {
-    if (sttEnabledRef.current) {
-      stopSpeechToText();
-      return;
-    }
-    await startSpeechToText();
+  const toggleSpeechToText = useCallback(() => {
+    if (sttEnabledRef.current) stopSpeechToText();
+    else startSpeechToText();
   }, [startSpeechToText, stopSpeechToText]);
+
 
   // Dedicated stop button for STT (so the user can stop listening even when Live Avatar isn't used)
   const stopHandsFreeSTT = useCallback(() => {
