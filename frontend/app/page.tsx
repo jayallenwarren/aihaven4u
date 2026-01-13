@@ -1170,9 +1170,9 @@ const speakAssistantReply = useCallback(
   // - Auto-sends after 2s of silence
   // - Automatically restarts recognition when it stops (browser behavior)
   const sttRecRef = useRef<any>(null);
-  const sttSilenceTimerRef = useRef<ReturnType<typeof window.setTimeout> | null>(null);
-  const sttRestartTimerRef = useRef<ReturnType<typeof window.setTimeout> | null>(null);
-  const sttRecoverTimerRef = useRef<ReturnType<typeof window.setTimeout> | null>(null);
+  const sttSilenceTimerRef = useRef<number | null>(null);
+  const sttRestartTimerRef = useRef<number | null>(null);
+  const sttRecoverTimerRef = useRef<number | null>(null);
   const sttAudioCaptureFailsRef = useRef<number>(0);
   const sttLastAudioCaptureAtRef = useRef<number>(0);
 
@@ -1202,7 +1202,7 @@ const speakAssistantReply = useCallback(
   const backendSttRecorderRef = useRef<MediaRecorder | null>(null);
   const backendSttAudioCtxRef = useRef<AudioContext | null>(null);
   const backendSttRafRef = useRef<number | null>(null);
-  const backendSttHardStopTimerRef = useRef<ReturnType<typeof window.setTimeout> | null>(null);
+  const backendSttHardStopTimerRef = useRef<number | null>(null);
   const backendSttLastVoiceAtRef = useRef<number>(0);
   const backendSttHasSpokenRef = useRef<boolean>(false);
 
