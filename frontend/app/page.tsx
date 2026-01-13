@@ -1170,9 +1170,9 @@ const speakAssistantReply = useCallback(
   // - Auto-sends after 2s of silence
   // - Automatically restarts recognition when it stops (browser behavior)
   const sttRecRef = useRef<any>(null);
-  const sttSilenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const sttRestartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const sttRecoverTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const sttSilenceTimerRef = useRef<ReturnType<typeof window.setTimeout> | null>(null);
+  const sttRestartTimerRef = useRef<ReturnType<typeof window.setTimeout> | null>(null);
+  const sttRecoverTimerRef = useRef<ReturnType<typeof window.setTimeout> | null>(null);
   const sttAudioCaptureFailsRef = useRef<number>(0);
   const sttLastAudioCaptureAtRef = useRef<number>(0);
 
@@ -1202,7 +1202,7 @@ const speakAssistantReply = useCallback(
   const backendSttRecorderRef = useRef<MediaRecorder | null>(null);
   const backendSttAudioCtxRef = useRef<AudioContext | null>(null);
   const backendSttRafRef = useRef<number | null>(null);
-  const backendSttHardStopTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const backendSttHardStopTimerRef = useRef<ReturnType<typeof window.setTimeout> | null>(null);
   const backendSttLastVoiceAtRef = useRef<number>(0);
   const backendSttHasSpokenRef = useRef<boolean>(false);
 
@@ -1624,21 +1624,21 @@ const stateToSendWithCompanion: SessionState = {
 
   function clearSttSilenceTimer() {
     if (sttSilenceTimerRef.current) {
-      clearTimeout(sttSilenceTimerRef.current);
+      window.clearTimeout(sttSilenceTimerRef.current);
       sttSilenceTimerRef.current = null;
     }
   }
 
   function clearSttRestartTimer() {
     if (sttRestartTimerRef.current) {
-      clearTimeout(sttRestartTimerRef.current);
+      window.clearTimeout(sttRestartTimerRef.current);
       sttRestartTimerRef.current = null;
     }
   }
 
   function clearSttRecoverTimer() {
     if (sttRecoverTimerRef.current) {
-      clearTimeout(sttRecoverTimerRef.current);
+      window.clearTimeout(sttRecoverTimerRef.current);
       sttRecoverTimerRef.current = null;
     }
   }
@@ -1696,7 +1696,7 @@ const stateToSendWithCompanion: SessionState = {
     backendSttRecorderRef.current = null;
 
     if (backendSttHardStopTimerRef.current) {
-      clearTimeout(backendSttHardStopTimerRef.current);
+      window.clearTimeout(backendSttHardStopTimerRef.current);
       backendSttHardStopTimerRef.current = null;
     }
 
@@ -1927,7 +1927,7 @@ const stateToSendWithCompanion: SessionState = {
         // If VAD setup fails, we still record; hard-stop timer will end it.
       }
 
-      backendSttHardStopTimerRef.current = setTimeout(() => {
+      backendSttHardStopTimerRef.current = window.setTimeout(() => {
         try {
           if (recorder.state !== "inactive") recorder.stop();
         } catch {}
@@ -2033,7 +2033,7 @@ const pauseSpeechToText = useCallback(() => {
 
     clearSttSilenceTimer();
 
-    sttSilenceTimerRef.current = setTimeout(() => {
+    sttSilenceTimerRef.current = window.setTimeout(() => {
       const text = getCurrentSttText();
       if (!text) return;
 
@@ -2133,7 +2133,7 @@ const pauseSpeechToText = useCallback(() => {
       // On iOS we add a larger delay between restarts to avoid transient audio-capture failures.
       const baseDelay = isIOS ? 850 : 250;
 
-      sttRestartTimerRef.current = setTimeout(() => {
+      sttRestartTimerRef.current = window.setTimeout(() => {
         if (!sttEnabledRef.current || sttPausedRef.current) return;
 
         try {
@@ -2203,7 +2203,7 @@ const pauseSpeechToText = useCallback(() => {
 
         // Recovery path: recreate recognition (helps iOS) and try again after a short delay.
         clearSttRecoverTimer();
-        sttRecoverTimerRef.current = setTimeout(async () => {
+        sttRecoverTimerRef.current = window.setTimeout(async () => {
           if (!sttEnabledRef.current || sttPausedRef.current) return;
 
           resetSpeechRecognition();
