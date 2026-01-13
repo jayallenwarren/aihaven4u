@@ -347,6 +347,16 @@ export default function Page() {
     return /iPhone|iPod/i.test(navigator.userAgent || "");
   }, []);
 
+  const isEmbedded = useMemo(() => {
+    if (typeof window === "undefined") return false;
+    try {
+      return window.self !== window.top;
+    } catch {
+      // Cross-origin access to window.top can throw; assume embedded.
+      return true;
+    }
+  }, []);
+
 
   const sessionIdRef = useRef<string | null>(null);
 
@@ -1693,7 +1703,7 @@ const stateToSendWithCompanion: SessionState = {
   // iOS/iPadOS Web Speech STT can be unstable; this path is far more reliable.
   // Requires backend endpoint: POST /stt/transcribe (multipart/form-data, field "audio") -> { text }
   // ------------------------------------------------------------
-  const useBackendStt = isIOS;
+  const useBackendStt = isIOS && !isEmbedded;
 
   const cleanupBackendSttResources = useCallback(() => {
     try {
@@ -1748,101 +1758,39 @@ const stateToSendWithCompanion: SessionState = {
 
   const transcribeBackendStt = useCallback(
     async (blob: Blob): Promise<string> => {
-      if (!API_BASE) throw new Error("NEXT_PUBLIC_API_BASE_URL not set");
+      if (!API_BASE) throw new Error("Missing NEXT_PUBLIC_API_BASE_URL");
 
-      // Abort any in-flight STT request
-      try {
-        backendSttAbortRef.current?.abort();
-      } catch {
-        // ignore
-      }
+      // Backend expects raw audio bytes in the request body (NOT multipart/form-data).
       const controller = new AbortController();
       backendSttAbortRef.current = controller;
 
-      const url = `${API_BASE}/stt/transcribe`;
+      const apiBase = API_BASE.replace(/\/+$/, "");
+      const contentType = blob.type || (isIOS ? "audio/mp4" : "audio/webm");
 
-      // New backend (fixed40+): expects RAW audio bytes (request body = blob),
-      // with Content-Type: audio/* (or application/octet-stream) and returns { text }.
-      const tryRaw = async (): Promise<Response> => {
-        const contentType =
-          (blob && (blob.type || "")).trim() || "application/octet-stream";
-        return fetch(url, {
-          method: "POST",
-          headers: { "Content-Type": contentType },
-          body: blob,
-          signal: controller.signal,
-        });
-      };
+      const resp = await fetch(`${apiBase}/stt/transcribe`, {
+        method: "POST",
+        headers: { "Content-Type": contentType, Accept: "application/json" },
+        body: blob,
+        signal: controller.signal,
+      });
 
-      // Backward-compat: older backend variants accepted multipart/form-data
-      // with field name "audio".
-      const tryMultipart = async (): Promise<Response> => {
-        const fd = new FormData();
-        const t = (blob?.type || "").toLowerCase();
-        const inferredExt = t.includes("webm")
-          ? "webm"
-          : t.includes("ogg")
-          ? "ogg"
-          : t.includes("mp4")
-          ? "mp4"
-          : t.includes("m4a")
-          ? "m4a"
-          : t.includes("aac")
-          ? "aac"
-          : t.includes("wav")
-          ? "wav"
-          : "bin";
-        fd.append("audio", blob, `stt.${inferredExt}`);
-        return fetch(url, {
-          method: "POST",
-          body: fd,
-          signal: controller.signal,
-        });
-      };
-
-      let res: Response | null = null;
-
-      try {
-        res = await tryRaw();
-
-        // If backend is still expecting multipart, it commonly responds 400/415.
-        if (!res.ok && (res.status === 400 || res.status === 415)) {
-          res = await tryMultipart();
-        }
-      } catch (e: any) {
-        // If the raw attempt failed for a non-abort reason, try multipart once.
-        if (e?.name !== "AbortError") {
-          res = await tryMultipart();
-        } else {
-          throw e;
-        }
-      }
-
-      if (!res) throw new Error("STT request failed");
-
-      if (!res.ok) {
-        let msg = `STT failed (${res.status})`;
+      if (!resp.ok) {
+        let detail = "";
         try {
-          const data = await res.json();
-          msg =
-            (data && (data.error || data.message)) ||
-            `${msg}: ${JSON.stringify(data)}`;
-        } catch {
-          try {
-            const t = await res.text();
-            if (t) msg = `${msg}: ${t.slice(0, 300)}`;
-          } catch {
-            // ignore
-          }
-        }
-        throw new Error(msg);
+          detail = await resp.text();
+        } catch {}
+        throw new Error(`STT backend error ${resp.status}: ${detail || resp.statusText}`);
       }
 
-      const data = await res.json();
-      return (data?.text ?? "").toString().trim();
+      const data = (await resp.json()) as any;
+      return String(data?.text ?? "").trim();
     },
+    [isIOS],
+  );
+,
     [API_BASE]
   );
+
   const startBackendSttOnce = useCallback(async (): Promise<void> => {
     if (!useBackendStt) return;
     if (!sttEnabledRef.current || sttPausedRef.current) return;
@@ -2100,6 +2048,9 @@ const pauseSpeechToText = useCallback(() => {
     // NOTE: Web Speech API does not reliably prompt on iOS if start() is called
     // outside the user's click. We still use getUserMedia to ensure permission exists.
     if (!navigator.mediaDevices?.getUserMedia) return true;
+    // iOS Safari (especially when embedded) can reject getUserMedia even when SpeechRecognition still works.
+    // If we're not using backend STT, let SpeechRecognition trigger the permission prompt instead.
+    if (isIOS && !useBackendStt) return true;
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -2110,7 +2061,7 @@ const pauseSpeechToText = useCallback(() => {
       setSttError(getEmbedHint());
       return false;
     }
-  }, [getEmbedHint]);
+  }, [getEmbedHint, isIOS, useBackendStt]);
 
   const ensureSpeechRecognition = useCallback((): any | null => {
     if (typeof window === "undefined") return null;
