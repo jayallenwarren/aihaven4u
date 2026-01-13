@@ -1211,6 +1211,10 @@ const speakAssistantReply = useCallback(
   const [sttRunning, setSttRunning] = useState(false);
   const [sttError, setSttError] = useState<string | null>(null);
 
+  // iOS: prefer backend STT (MediaRecorder → /stt/transcribe) for **audio-only** mode.
+  // Browser SpeechRecognition can be flaky on iOS (especially after auto-restarts).
+  const [backendSttAvailable, setBackendSttAvailable] = useState(true);
+
   // These state setters exist to trigger renders when backend STT updates refs (mobile stability).
   // We intentionally ignore the state values to avoid UI changes.
   const [, setSttInterim] = useState<string>("");
@@ -1701,9 +1705,14 @@ const stateToSendWithCompanion: SessionState = {
     // ------------------------------------------------------------
   // Backend STT (record + server-side transcription).
   // iOS/iPadOS Web Speech STT can be unstable; this path is far more reliable.
-  // Requires backend endpoint: POST /stt/transcribe (multipart/form-data, field "audio") -> { text }
+  // Requires backend endpoint: POST /stt/transcribe (raw audio Blob; Content-Type audio/webm|audio/mp4) -> { text }
   // ------------------------------------------------------------
-  const useBackendStt = isIOS && !isEmbedded;
+  const liveAvatarActive =
+    avatarStatus === "connecting" || avatarStatus === "connected" || avatarStatus === "reconnecting";
+
+  // Prefer backend STT for iOS **audio-only** mode (more stable than browser SpeechRecognition).
+  // Keep Live Avatar mode on browser STT (it is already stable across devices).
+  const useBackendStt = isIOS && backendSttAvailable && !liveAvatarActive;
 
   const cleanupBackendSttResources = useCallback(() => {
     try {
@@ -1815,13 +1824,32 @@ const stateToSendWithCompanion: SessionState = {
     setSttFinal("");
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-      });
+      const getStreamWithRetries = async (): Promise<MediaStream> => {
+        const constraints: MediaStreamConstraints = {
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+        };
+
+        let lastErr: any = null;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            return await navigator.mediaDevices.getUserMedia(constraints);
+          } catch (e: any) {
+            lastErr = e;
+            const name = e?.name || "";
+            // Permission/security errors won't succeed on retry.
+            if (name === "NotAllowedError" || name === "SecurityError") break;
+            await new Promise((r) => setTimeout(r, 250));
+          }
+        }
+
+        throw lastErr;
+      };
+
+      const stream = await getStreamWithRetries();
       backendSttStreamRef.current = stream;
 
       // Choose best available recording MIME type for this browser.
@@ -2053,12 +2081,26 @@ const pauseSpeechToText = useCallback(() => {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       stream.getTracks().forEach((t) => t.stop());
       return true;
-    } catch (e) {
+    } catch (e: any) {
       console.warn("Mic permission denied/unavailable:", e);
       setSttError(getEmbedHint());
+
+      const name = e?.name || "";
+      // If backend STT can't access the mic (common in some embedded contexts),
+      // fall back to browser SpeechRecognition for this session.
+      if (name === "NotAllowedError" || name === "SecurityError") {
+        setBackendSttAvailable(false);
+        try {
+          sttRecRef.current?.abort?.();
+        } catch {
+          // ignore
+        }
+        sttRecRef.current = null;
+      }
+
       return false;
     }
-  }, [getEmbedHint, isIOS, useBackendStt]);
+  }, [getEmbedHint, isIOS, setBackendSttAvailable, useBackendStt]);
 
   const ensureSpeechRecognition = useCallback((): any | null => {
     if (typeof window === "undefined") return null;
