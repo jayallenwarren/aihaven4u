@@ -1001,9 +1001,10 @@ const playLocalTtsUrl = useCallback(
       const audioEl = localTtsAudioRef.current;
       const videoEl = localTtsVideoRef.current;
 
-      // iOS Safari can route <audio> to the receiver (or mute it) after mic/STT.
-      // Using a hidden <video> element often matches Live Avatar output routing (speaker).
-      const preferVideo = isIOS && !!videoEl;
+      // IMPORTANT: In the Wix-embedded iOS Safari path, forcing media to load in CORS mode
+      // can fail with MEDIA_ERR_SRC_NOT_SUPPORTED (code 4) even though the MP3 is valid.
+      // To maximize compatibility, try <audio> first and keep <video> only as a fallback.
+      const preferVideo = false;
 
       const stopWebSpeechIfNeeded = async () => {
         if (!(isIOS && sttRecRef.current)) return;
@@ -1055,8 +1056,13 @@ const playLocalTtsUrl = useCallback(
           m.currentTime = 0;
         } catch {}
 
+        // IMPORTANT: do NOT force CORS-mode media loading here.
+        // In Wix-embedded iOS Safari, the iframe can have a "null" origin (sandboxed),
+        // and CORS-mode media loads can fail with MEDIA_ERR_SRC_NOT_SUPPORTED (code 4)
+        // even though the MP3 is valid. Plain playback does not require CORS.
         try {
-          (m as any).crossOrigin = "anonymous";
+          m.removeAttribute("crossorigin");
+          (m as any).crossOrigin = null;
         } catch {}
 
         if (useVideo) {
@@ -2726,7 +2732,19 @@ const pauseSpeechToText = useCallback(() => {
   return (
     <main style={{ maxWidth: 880, margin: "24px auto", padding: "0 16px", fontFamily: "system-ui" }}>
       {/* Hidden audio element for audio-only TTS (mic mode) */}
-      <audio ref={localTtsAudioRef} style={{ display: "none" }} />
+      {/* Keep a real <audio> element in the DOM (NOT display:none) for iOS Safari reliability */}
+      <audio
+        ref={localTtsAudioRef}
+        preload="auto"
+        style={{
+          position: "absolute",
+          width: 1,
+          height: 1,
+          left: -9999,
+          top: -9999,
+          opacity: 0,
+        }}
+      />
       {/* Hidden video element used on iOS to play audio-only TTS reliably (matches Live Avatar routing) */}
       <video
         ref={localTtsVideoRef}
