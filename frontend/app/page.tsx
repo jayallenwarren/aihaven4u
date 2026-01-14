@@ -378,9 +378,12 @@ export default function Page() {
       const qs = new URLSearchParams(window.location.search);
       const fromQuery = qs.get("debug") === "1";
       const fromStorage = window.localStorage.getItem(DEBUG_KEY) === "1";
+
+      // Never auto-open the overlay (it can cover important UI). Allow it to open only
+      // if explicitly requested via ?debugOpen=1, otherwise require the 5-tap gesture.
       if (fromQuery || fromStorage) {
         setDebugEnabled(true);
-        setDebugOpen(true);
+        setDebugOpen(qs.get("debugOpen") === "1");
       }
     } catch {
       // ignore
@@ -3115,7 +3118,8 @@ const pauseSpeechToText = useCallback(() => {
             position: "fixed",
             left: 10,
             right: 10,
-            top: 10,
+            // Place the overlay at the bottom so it doesn't cover the mic + input controls.
+            bottom: "calc(10px + env(safe-area-inset-bottom))",
             zIndex: 999999,
             background: "rgba(0,0,0,0.88)",
             color: "#fff",
