@@ -939,7 +939,7 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string): Promis
       if (unlocked) return;
       unlocked = true;
       localTtsUnlockedRef.current = true;
-      dbgLog("Local TTS unlocked");
+      console.log("Local TTS unlocked");
     };
 
     const prime = (m: HTMLMediaElement | null, label: string) => {
@@ -968,7 +968,7 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string): Promis
             } catch {}
           })
           .catch((e) => {
-            dbgWarn("Failed to prime local TTS", {
+            console.warn("Failed to prime local TTS", {
               label,
               err: String(e),
               name: (e as any)?.name,
@@ -976,7 +976,7 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string): Promis
             });
           });
       } catch (e) {
-        dbgWarn("Failed to prime local TTS", {
+        console.warn("Failed to prime local TTS", {
           label,
           err: String(e),
           name: (e as any)?.name,
@@ -991,7 +991,7 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string): Promis
     prime(localTtsAudioRef.current, "audio");
 
     // If neither succeeds, localTtsUnlockedRef remains false and we'll retry on the next user gesture.
-  }, [dbgLog, dbgWarn]);
+  }, []);
 
 const playLocalTtsUrl = useCallback(
     async (url: string, hooks?: SpeakAssistantHooks) => {
