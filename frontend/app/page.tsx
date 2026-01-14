@@ -926,75 +926,74 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string): Promis
   // Used when Live Avatar is NOT active/available, but the user is in hands-free STT mode.
   // iOS Safari requires a user gesture to "unlock" programmatic audio playback, so we prime
   // this hidden <audio> element on the first mic click.
-  const PRIME_SILENT_WAV =
-    "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YQAAAAA=";
+  const PRIME_SILENT_MP3 =
+    "data:audio/mpeg;base64,SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjU5LjI3LjEwMAAAAAAAAAAAAAAA//tAwAAAAAAAAAAAAAAAAAAAAAAASW5mbwAAAA8AAAAJAAAEXgBBQUFBQUFBQUFBQVlZWVlZWVlZWVlZcXFxcXFxcXFxcXGIiIiIiIiIiIiIiKCgoKCgoKCgoKCguLi4uLi4uLi4uLjQ0NDQ0NDQ0NDQ0Ojo6Ojo6Ojo6Ojo//////////////8AAAAATGF2YzU5LjM3AAAAAAAAAAAAAAAAJAPMAAAAAAAABF6gwS6ZAAAAAAD/+xDEAAPAAAGkAAAAIAAANIAAAARMQU1FMy4xMDBVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVTEFNRTMuMTAwVVVVVf/7EMQpg8AAAaQAAAAgAAA0gAAABFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVMQU1FMy4xMDBVVVVV//sQxFMDwAABpAAAACAAADSAAAAEVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVX/+xDEfIPAAAGkAAAAIAAANIAAAARVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVf/7EMSmA8AAAaQAAAAgAAA0gAAABFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV//sQxM+DwAABpAAAACAAADSAAAAEVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVX/+xDE1gPAAAGkAAAAIAAANIAAAARVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVf/7EMTWA8AAAaQAAAAgAAA0gAAABFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV//sQxNYDwAABpAAAACAAADSAAAAEVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU=";
 
   const primeLocalTtsAudio = useCallback(() => {
+    // iOS/Safari autoplay rules: unlocking media MUST happen synchronously in a user gesture
+    // (e.g., mic button tap). We "prime" a hidden media element with a tiny silent MP3.
     if (localTtsUnlockedRef.current) return;
 
-    try {
-      // Use a throwaway <audio> element for priming so we never interfere with the
-      // real TTS <audio> element (avoids iOS race conditions on first playback).
-      const a = new Audio(PRIME_SILENT_WAV);
-      a.preload = "auto";
-      a.setAttribute("playsinline", "true");
-      a.setAttribute("webkit-playsinline", "true");
+    let unlocked = false;
+    const markUnlocked = () => {
+      if (unlocked) return;
+      unlocked = true;
+      localTtsUnlockedRef.current = true;
+      dbgLog("Local TTS unlocked");
+    };
 
-      // Some iOS builds require an unmuted play() attempt with volume near-zero to unlock.
-      a.muted = false;
-      a.volume = 0.0001;
+    const prime = (m: HTMLMediaElement | null, label: string) => {
+      if (!m) return;
+      try {
+        // Load a tiny silent MP3 and attempt play/pause.
+        m.src = PRIME_SILENT_MP3;
+        m.muted = false;
+        m.volume = 1;
 
-      a
-        .play()
-        .then(() => {
-          try {
-            a.pause();
-            a.currentTime = 0;
-          } catch {
-            // ignore
-          }
-          localTtsUnlockedRef.current = true;
-          // Also prime the hidden <video> element on iOS so later audio-only TTS routes like Live Avatar.
-          const v = localTtsVideoRef.current;
-          if (v) {
+        // playsinline helps on iOS; safe to set on audio too.
+        try {
+          (m as any).playsInline = true;
+          (m as any).setAttribute?.("playsinline", "");
+        } catch {}
+
+        const p = m.play();
+        Promise.resolve(p)
+          .then(() => {
+            markUnlocked();
             try {
-              v.playsInline = true;
-              v.setAttribute("playsinline", "true");
-              v.setAttribute("webkit-playsinline", "true");
-              v.crossOrigin = "anonymous";
-              v.muted = true;
-              v.volume = 0.0001;
-              v.src = PRIME_SILENT_WAV;
-              v.load();
-              v.play()
-                .then(() => {
-                  setTimeout(() => {
-                    try {
-                      v.pause();
-                      v.currentTime = 0;
-                      v.removeAttribute("src");
-                      v.load();
-                      v.muted = false;
-                      v.volume = 1;
-                    } catch {}
-                  }, 60);
-                })
-                .catch(() => {
-                  // ignore video priming failures
-                });
+              m.pause();
             } catch {}
-          }
-
-        })
-        .catch(() => {
-          localTtsUnlockedRef.current = false;
+            try {
+              (m as any).currentTime = 0;
+            } catch {}
+          })
+          .catch((e) => {
+            dbgWarn("Failed to prime local TTS", {
+              label,
+              err: String(e),
+              name: (e as any)?.name,
+              message: (e as any)?.message,
+            });
+          });
+      } catch (e) {
+        dbgWarn("Failed to prime local TTS", {
+          label,
+          err: String(e),
+          name: (e as any)?.name,
+          message: (e as any)?.message,
         });
-    } catch {
-      localTtsUnlockedRef.current = false;
-    }
-  }, []);
+      }
+    };
 
-    const playLocalTtsUrl = useCallback(
+    // Prime BOTH. iOS prefers the hidden VIDEO element (routes like Live Avatar),
+    // but we also prime the AUDIO element as fallback.
+    prime(localTtsVideoRef.current, "video");
+    prime(localTtsAudioRef.current, "audio");
+
+    // If neither succeeds, localTtsUnlockedRef remains false and we'll retry on the next user gesture.
+  }, [dbgLog, dbgWarn]);
+
+const playLocalTtsUrl = useCallback(
     async (url: string, hooks?: SpeakAssistantHooks) => {
       const audioEl = localTtsAudioRef.current;
       const videoEl = localTtsVideoRef.current;
@@ -1138,7 +1137,16 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string): Promis
             return false;
           }
         } catch (e) {
-          console.warn("Local TTS playback failed:", e);
+          console.warn("Local TTS playback failed:", {
+            label,
+            err: String(e),
+            name: (e as any)?.name,
+            message: (e as any)?.message,
+            readyState: m.readyState,
+            networkState: m.networkState,
+            src: (m as any).currentSrc || m.src,
+            mediaError: m.error ? { code: m.error.code } : null,
+          });
           localTtsUnlockedRef.current = false;
           return false;
         }
@@ -3107,14 +3115,14 @@ const pauseSpeechToText = useCallback(() => {
             position: "fixed",
             left: 10,
             right: 10,
-            bottom: 10,
+            top: 10,
             zIndex: 999999,
             background: "rgba(0,0,0,0.88)",
             color: "#fff",
             borderRadius: 12,
             padding: 10,
             boxShadow: "0 10px 24px rgba(0,0,0,0.35)",
-            maxHeight: "45vh",
+            maxHeight: "35vh",
             overflow: "hidden",
           }}
         >
@@ -3198,7 +3206,7 @@ const pauseSpeechToText = useCallback(() => {
               whiteSpace: "pre-wrap",
               wordBreak: "break-word",
               overflowY: "auto",
-              maxHeight: "36vh",
+              maxHeight: "26vh",
               borderRadius: 10,
               padding: 8,
               background: "rgba(255,255,255,0.06)",
