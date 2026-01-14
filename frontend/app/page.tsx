@@ -1001,10 +1001,9 @@ const playLocalTtsUrl = useCallback(
       const audioEl = localTtsAudioRef.current;
       const videoEl = localTtsVideoRef.current;
 
-      // IMPORTANT: In the Wix-embedded iOS Safari path, forcing media to load in CORS mode
-      // can fail with MEDIA_ERR_SRC_NOT_SUPPORTED (code 4) even though the MP3 is valid.
-      // To maximize compatibility, try <audio> first and keep <video> only as a fallback.
-      const preferVideo = false;
+      // iOS Safari can route <audio> to the receiver (or mute it) after mic/STT.
+      // Using a hidden <video> element often matches Live Avatar output routing (speaker).
+      const preferVideo = isIOS && !!videoEl;
 
       const stopWebSpeechIfNeeded = async () => {
         if (!(isIOS && sttRecRef.current)) return;
@@ -1056,13 +1055,7 @@ const playLocalTtsUrl = useCallback(
           m.currentTime = 0;
         } catch {}
 
-        // IMPORTANT: do NOT force CORS-mode media loading here.
-        // In Wix-embedded iOS Safari, the iframe can have a "null" origin (sandboxed),
-        // and CORS-mode media loads can fail with MEDIA_ERR_SRC_NOT_SUPPORTED (code 4)
-        // even though the MP3 is valid. Plain playback does not require CORS.
         try {
-          m.removeAttribute("crossorigin");
-          (m as any).crossOrigin = null;
         } catch {}
 
         if (useVideo) {
@@ -1198,15 +1191,12 @@ const playLocalTtsUrl = useCallback(
         return true;
       };
 
-      // Try iOS-preferred video first, then fallback to audio.
+      // iOS: prefer the hidden VIDEO element for TTS playback.
+      // We intentionally do NOT fall back to <audio> on iOS because it has historically
+      // destabilized STT after the first playback in embedded Safari/WebViews.
       if (preferVideo && videoEl) {
         const ok = await playOn(videoEl, true);
         if (ok) return;
-
-        if (audioEl) {
-          const ok2 = await playOn(audioEl, false);
-          if (ok2) return;
-        }
 
         try {
           hooks?.onDidNotSpeak?.();
@@ -1316,7 +1306,6 @@ const speakAssistantReply = useCallback(
         a.preload = "metadata";
         // Some CDNs require this for cross-origin metadata access (best-effort).
         try {
-          (a as any).crossOrigin = "anonymous";
         } catch {
           // ignore
         }
@@ -2732,19 +2721,7 @@ const pauseSpeechToText = useCallback(() => {
   return (
     <main style={{ maxWidth: 880, margin: "24px auto", padding: "0 16px", fontFamily: "system-ui" }}>
       {/* Hidden audio element for audio-only TTS (mic mode) */}
-      {/* Keep a real <audio> element in the DOM (NOT display:none) for iOS Safari reliability */}
-      <audio
-        ref={localTtsAudioRef}
-        preload="auto"
-        style={{
-          position: "absolute",
-          width: 1,
-          height: 1,
-          left: -9999,
-          top: -9999,
-          opacity: 0,
-        }}
-      />
+      <audio ref={localTtsAudioRef} style={{ display: "none" }} />
       {/* Hidden video element used on iOS to play audio-only TTS reliably (matches Live Avatar routing) */}
       <video
         ref={localTtsVideoRef}
