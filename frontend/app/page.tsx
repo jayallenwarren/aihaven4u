@@ -1163,6 +1163,12 @@ const playLocalTtsUrl = useCallback(
             m.onended = null;
             m.onerror = null;
             m.onabort = null;
+            m.onloadedmetadata = null;
+            m.ondurationchange = null;
+            if (hardTimer != null) {
+              window.clearTimeout(hardTimer);
+              hardTimer = null;
+            }
 
             try {
               m.pause();
@@ -1185,7 +1191,29 @@ const playLocalTtsUrl = useCallback(
           m.onabort = cleanup;
 
           // Hard timeout if Safari never fires ended
-          setTimeout(() => cleanup(), 12000);
+          // Safari occasionally fails to fire `ended`. Use a duration-aware hard timeout
+          // so we *don't* cut off longer audio, but we also don't hang forever.
+          let hardTimer: number | null = null;
+
+          const armHardTimeout = (ms: number) => {
+            if (hardTimer != null) window.clearTimeout(hardTimer);
+            hardTimer = window.setTimeout(() => cleanup(), ms);
+          };
+
+          // Start with a generous fallback; tighten once duration is known.
+          armHardTimeout(90_000);
+
+          const maybeTightenHardTimeout = () => {
+            const d = Number.isFinite(m.duration) ? m.duration : NaN;
+            if (!Number.isFinite(d) || d <= 0) return;
+            // duration is seconds; add a small buffer
+            const ms = Math.min(5 * 60_000, Math.max(15_000, Math.ceil(d * 1000) + 2_000));
+            armHardTimeout(ms);
+          };
+
+          m.onloadedmetadata = maybeTightenHardTimeout;
+          m.ondurationchange = maybeTightenHardTimeout;
+
         });
 
         return true;
@@ -2398,8 +2426,8 @@ const pauseSpeechToText = useCallback(() => {
       const now = Date.now();
       const ignoreDelay = Math.max(0, (sttIgnoreUntilRef.current || 0) - now);
 
-      // On iOS we add a larger delay between restarts to avoid transient audio-capture failures.
-      const baseDelay = isIOS ? 850 : 250;
+      // iOS/iPadOS: keep restart delay short to reduce clipped first words; onerror recovery handles flaky starts.
+      const baseDelay = isIOS ? 200 : 250;
 
       sttRestartTimerRef.current = window.setTimeout(() => {
         if (!sttEnabledRef.current || sttPausedRef.current) return;
@@ -2541,10 +2569,11 @@ const pauseSpeechToText = useCallback(() => {
       return;
     }
 
-    // After assistant TTS on iOS, restarting recognition immediately can trigger
-    // intermittent "audio-capture" failures. Delay + reuse the existing restart timer.
+    // iOS/iPadOS: starting recognition can be flaky right after media playback,
+    // but adding a big delay clips the user's first words. Start immediately and
+    // rely on the onerror recovery path to back off if Safari isn't ready yet.
     clearSttRestartTimer();
-    const delayMs = isIOS ? 850 : 0;
+    const delayMs = 0; // Start immediately to avoid clipping the user's first words; onerror recovery handles mic warm-up.
 
     sttRestartTimerRef.current = window.setTimeout(() => {
       if (!sttEnabledRef.current) return;
