@@ -969,7 +969,7 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string): Promis
           })
           .catch((e) => {
             console.warn("Failed to prime local TTS", {
-              label,
+            mediaTag: m.tagName,
               err: String(e),
               name: (e as any)?.name,
               message: (e as any)?.message,
@@ -977,7 +977,7 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string): Promis
           });
       } catch (e) {
         console.warn("Failed to prime local TTS", {
-          label,
+            mediaTag: m.tagName,
           err: String(e),
           name: (e as any)?.name,
           message: (e as any)?.message,
@@ -1138,7 +1138,7 @@ const playLocalTtsUrl = useCallback(
           }
         } catch (e) {
           console.warn("Local TTS playback failed:", {
-            label,
+            mediaTag: m.tagName,
             err: String(e),
             name: (e as any)?.name,
             message: (e as any)?.message,
