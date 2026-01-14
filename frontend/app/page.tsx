@@ -2877,7 +2877,6 @@ const pauseSpeechToText = useCallback(() => {
         {sttEnabled ? (
           <button
             onClick={stopHandsFreeSTT}
-            disabled={isStoppingConversation}
             title="Stop conversation"
             style={{
               width: 44,
@@ -2890,7 +2889,7 @@ const pauseSpeechToText = useCallback(() => {
               fontSize: 18,
               display: "grid",
               placeItems: "center",
-              opacity: isStoppingConversation ? 0.6 : 1,
+              opacity: 1,
             }}
           >
             ■
