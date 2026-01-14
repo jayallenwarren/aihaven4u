@@ -362,6 +362,7 @@ export default function Page() {
 
   // Local audio-only TTS element (used when Live Avatar is not active/available)
   const localTtsAudioRef = useRef<HTMLAudioElement | null>(null);
+  const localTtsVideoRef = useRef<HTMLVideoElement | null>(null);
   const localTtsUnlockedRef = useRef(false);
 
 
@@ -795,27 +796,21 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string): Promis
 
   const primeLocalTtsAudio = useCallback(() => {
     if (localTtsUnlockedRef.current) return;
-    const a = localTtsAudioRef.current;
-    if (!a) return;
 
     try {
+      // Use a throwaway <audio> element for priming so we never interfere with the
+      // real TTS <audio> element (avoids iOS race conditions on first playback).
+      const a = new Audio(PRIME_SILENT_WAV);
+      a.preload = "auto";
       a.setAttribute("playsinline", "true");
-      (a as any).playsInline = true;
-    } catch {
-      // ignore
-    }
+      a.setAttribute("webkit-playsinline", "true");
 
-    // Must be triggered from a user gesture (e.g., mic button click).
-    // IMPORTANT for iOS Safari: unlocking should be an *unmuted* play() (muted playback can
-    // "succeed" but still leave later unmuted TTS blocked). We keep volume near-zero so it
-    // stays inaudible.
-    a.muted = false;
-    a.volume = 0.001;
-    a.src = PRIME_SILENT_WAV;
+      // Some iOS builds require an unmuted play() attempt with volume near-zero to unlock.
+      a.muted = false;
+      a.volume = 0.0001;
 
-    const p = a.play?.();
-    if (p && typeof (p as any).then === "function") {
-      (p as Promise<any>)
+      a
+        .play()
         .then(() => {
           try {
             a.pause();
@@ -824,154 +819,259 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string): Promis
             // ignore
           }
           localTtsUnlockedRef.current = true;
+          // Also prime the hidden <video> element on iOS so later audio-only TTS routes like Live Avatar.
+          const v = localTtsVideoRef.current;
+          if (v) {
+            try {
+              v.playsInline = true;
+              v.setAttribute("playsinline", "true");
+              v.setAttribute("webkit-playsinline", "true");
+              v.crossOrigin = "anonymous";
+              v.muted = true;
+              v.volume = 0.0001;
+              v.src = PRIME_SILENT_WAV;
+              v.load();
+              v.play()
+                .then(() => {
+                  setTimeout(() => {
+                    try {
+                      v.pause();
+                      v.currentTime = 0;
+                      v.removeAttribute("src");
+                      v.load();
+                      v.muted = false;
+                      v.volume = 1;
+                    } catch {}
+                  }, 60);
+                })
+                .catch(() => {
+                  // ignore video priming failures
+                });
+            } catch {}
+          }
+
         })
         .catch(() => {
-          // If this fails, Safari may still allow playback after another gesture; we'll try again later.
-        })
-        .finally(() => {
-          try {
-            a.pause();
-            a.currentTime = 0;
-          } catch {
-            // ignore
-          }
-          a.muted = false;
-          a.volume = 1;
-          a.src = "";
+          localTtsUnlockedRef.current = false;
         });
-    } else {
-      // Non-promise play()
-      try {
-        a.pause();
-        a.currentTime = 0;
-      } catch {
-        // ignore
-      }
-      localTtsUnlockedRef.current = true;
-      a.muted = false;
-      a.volume = 1;
-      a.src = "";
+    } catch {
+      localTtsUnlockedRef.current = false;
     }
   }, []);
 
-  const playLocalTtsUrl = useCallback(
-    async (audioUrl: string, hooks?: SpeakAssistantHooks) => {
-      const a = localTtsAudioRef.current;
-      if (!a) {
-        hooks?.onDidNotSpeak?.();
-        return;
-      }
+    const playLocalTtsUrl = useCallback(
+    async (url: string, hooks?: SpeakAssistantHooks) => {
+      const audioEl = localTtsAudioRef.current;
+      const videoEl = localTtsVideoRef.current;
 
-      try {
-        a.pause();
-      } catch {
-        // ignore
-      }
-      try {
-        a.currentTime = 0;
-      } catch {
-        // ignore
-      }
+      // iOS Safari can route <audio> to the receiver (or mute it) after mic/STT.
+      // Using a hidden <video> element often matches Live Avatar output routing (speaker).
+      const preferVideo = isIOS && !!videoEl;
 
-      try {
-        a.setAttribute("playsinline", "true");
-        (a as any).playsInline = true;
-      } catch {
-        // ignore
-      }
+      const stopWebSpeechIfNeeded = async () => {
+        if (!(isIOS && sttRecRef.current)) return;
 
-      a.muted = false;
-      a.volume = 1;
-      a.src = audioUrl;
-      a.preload = "auto";
-      try {
-        a.load?.();
-      } catch {
-        // ignore
-      }
-
-      // iOS Safari: after stopping mic/recording, ensure the mic session is fully released
-      // before starting playback (otherwise audio can be inaudible or stop after the first turn).
-      if (isIOS) {
+        const rec = sttRecRef.current;
         try {
-          const rec = sttRecRef.current;
-          if (rec && typeof rec.stop === "function") {
-            await new Promise<void>((resolve) => {
-              let settled = false;
-              const prevOnEnd = rec.onend;
-              const finish = () => {
-                if (settled) return;
-                settled = true;
-                try {
-                  rec.onend = prevOnEnd;
-                } catch {
-                  // ignore
-                }
-                resolve();
-              };
+          await new Promise<void>((resolve) => {
+            let done = false;
+            const finish = () => {
+              if (done) return;
+              done = true;
+              resolve();
+            };
 
+            const prevOnEnd = (rec as any).onend;
+            (rec as any).onend = (...args: any[]) => {
               try {
-                rec.onend = (...args: any[]) => {
-                  try {
-                    prevOnEnd?.apply(rec, args as any);
-                  } catch {
-                    // ignore
-                  }
-                  finish();
-                };
-              } catch {
-                // ignore
-              }
+                prevOnEnd?.(...args);
+              } catch {}
+              finish();
+            };
 
-              try {
-                rec.stop();
-              } catch {
-                finish();
-              }
+            try {
+              rec.stop();
+            } catch {
+              finish();
+            }
 
-              setTimeout(finish, 650);
-            });
-          }
+            // Safety if onend never arrives
+            setTimeout(finish, 220);
+          });
         } catch {
           // ignore
         }
+      };
 
-        // Give iOS a beat to switch audio route back to playback.
-        await new Promise((r) => setTimeout(r, isIphone ? 220 : 150));
-      }
+      const playOn = async (m: HTMLMediaElement, useVideo: boolean): Promise<boolean> => {
+        await stopWebSpeechIfNeeded();
 
-      hooks?.onWillSpeak?.();
+        // Give Safari a beat to swap audio-session away from capture.
+        if (isIOS) await new Promise((r) => setTimeout(r, 180));
 
-      try {
-        await a.play();
-        localTtsUnlockedRef.current = true;
-      } catch (err) {
-        console.warn("Local TTS playback failed:", err);
-        hooks?.onDidNotSpeak?.();
+        // Cache-bust on iOS (some devices can aggressively cache the same URL path).
+        const finalUrl = isIOS ? `${url}${url.includes("?") ? "&" : "?"}cb=${Date.now()}` : url;
+
+        // Prepare element
+        try {
+          m.pause();
+          m.currentTime = 0;
+        } catch {}
+
+        try {
+          (m as any).crossOrigin = "anonymous";
+        } catch {}
+
+        if (useVideo) {
+          try {
+            const v = m as HTMLVideoElement;
+            v.playsInline = true;
+            v.setAttribute("playsinline", "true");
+            v.setAttribute("webkit-playsinline", "true");
+          } catch {}
+        }
+
+        try {
+          m.muted = false;
+          m.volume = 1;
+        } catch {}
+
+        try {
+          (m as any).preload = "auto";
+        } catch {}
+
+        try {
+          m.src = finalUrl;
+          try {
+            (m as any).load?.();
+          } catch {}
+        } catch {}
+
+        try {
+          hooks?.onWillSpeak?.();
+        } catch {}
+
+        try {
+          await m.play();
+          localTtsUnlockedRef.current = true;
+          // iOS Safari can sometimes resolve play() but keep media effectively paused/silent.
+          // Confirm playback actually started before we proceed.
+          const started = await new Promise<boolean>((resolve) => {
+            let settled = false;
+
+            function finish(ok: boolean) {
+              if (settled) return;
+              settled = true;
+              try {
+                m.removeEventListener("playing", onPlaying);
+                m.removeEventListener("timeupdate", onTimeUpdate);
+                m.removeEventListener("error", onErr);
+              } catch {}
+              resolve(ok);
+            }
+
+            function onPlaying() {
+              finish(true);
+            }
+            function onTimeUpdate() {
+              if (m.currentTime > 0) finish(true);
+            }
+            function onErr() {
+              finish(false);
+            }
+
+            try {
+              m.addEventListener("playing", onPlaying, { once: true });
+              m.addEventListener("timeupdate", onTimeUpdate);
+              m.addEventListener("error", onErr, { once: true });
+            } catch {
+              // If we can't attach events, just accept.
+              finish(true);
+              return;
+            }
+
+            setTimeout(() => {
+              finish(m.currentTime > 0 || !m.paused);
+            }, 600);
+          });
+
+          if (!started) {
+            try {
+              m.pause();
+              m.currentTime = 0;
+            } catch {}
+            return false;
+          }
+        } catch (e) {
+          console.warn("Local TTS playback failed:", e);
+          localTtsUnlockedRef.current = false;
+          return false;
+        }
+
+        await new Promise<void>((resolve) => {
+          let done = false;
+
+          const cleanup = () => {
+            if (done) return;
+            done = true;
+
+            m.onended = null;
+            m.onerror = null;
+            m.onabort = null;
+
+            try {
+              m.pause();
+              m.currentTime = 0;
+            } catch {}
+
+            // iOS Safari sometimes gets "stuck" if we leave the src attached.
+            if (isIOS) {
+              try {
+                m.removeAttribute("src");
+                (m as any).load?.();
+              } catch {}
+            }
+
+            resolve();
+          };
+
+          m.onended = cleanup;
+          m.onerror = cleanup;
+          m.onabort = cleanup;
+
+          // Hard timeout if Safari never fires ended
+          setTimeout(() => cleanup(), 12000);
+        });
+
+        return true;
+      };
+
+      // Try iOS-preferred video first, then fallback to audio.
+      if (preferVideo && videoEl) {
+        const ok = await playOn(videoEl, true);
+        if (ok) return;
+
+        if (audioEl) {
+          const ok2 = await playOn(audioEl, false);
+          if (ok2) return;
+        }
+
+        try {
+          hooks?.onDidNotSpeak?.();
+        } catch {}
         return;
       }
 
-      // Wait for completion (or error) so we can resume STT afterwards.
-      await new Promise<void>((resolve) => {
-        let done = false;
-        const finish = () => {
-          if (done) return;
-          done = true;
-          try {
-            a.onended = null;
-            a.onerror = null;
-          } catch {
-            // ignore
-          }
-          resolve();
-        };
-        a.onended = finish;
-        a.onerror = finish;
-        // Safety timeout
-        setTimeout(finish, 90_000);
-      });
+      if (audioEl) {
+        const ok = await playOn(audioEl, false);
+        if (ok) return;
+      }
+
+      try {
+        hooks?.onDidNotSpeak?.();
+      } catch {}
     },
-    [isIOS, isIphone]
+    [isIOS],
   );
 
   const speakLocalTtsReply = useCallback(
@@ -1197,9 +1297,9 @@ const speakAssistantReply = useCallback(
   // - Auto-sends after 2s of silence
   // - Automatically restarts recognition when it stops (browser behavior)
   const sttRecRef = useRef<any>(null);
-  const sttSilenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const sttRestartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const sttRecoverTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const sttSilenceTimerRef = useRef<number | null>(null);
+  const sttRestartTimerRef = useRef<number | null>(null);
+  const sttRecoverTimerRef = useRef<number | null>(null);
   const sttAudioCaptureFailsRef = useRef<number>(0);
   const sttLastAudioCaptureAtRef = useRef<number>(0);
 
@@ -1229,7 +1329,7 @@ const speakAssistantReply = useCallback(
   const backendSttRecorderRef = useRef<MediaRecorder | null>(null);
   const backendSttAudioCtxRef = useRef<AudioContext | null>(null);
   const backendSttRafRef = useRef<number | null>(null);
-  const backendSttHardStopTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const backendSttHardStopTimerRef = useRef<number | null>(null);
   const backendSttLastVoiceAtRef = useRef<number>(0);
   const backendSttHasSpokenRef = useRef<boolean>(false);
 
@@ -1651,21 +1751,21 @@ const stateToSendWithCompanion: SessionState = {
 
   function clearSttSilenceTimer() {
     if (sttSilenceTimerRef.current) {
-      clearTimeout(sttSilenceTimerRef.current);
+      window.clearTimeout(sttSilenceTimerRef.current);
       sttSilenceTimerRef.current = null;
     }
   }
 
   function clearSttRestartTimer() {
     if (sttRestartTimerRef.current) {
-      clearTimeout(sttRestartTimerRef.current);
+      window.clearTimeout(sttRestartTimerRef.current);
       sttRestartTimerRef.current = null;
     }
   }
 
   function clearSttRecoverTimer() {
     if (sttRecoverTimerRef.current) {
-      clearTimeout(sttRecoverTimerRef.current);
+      window.clearTimeout(sttRecoverTimerRef.current);
       sttRecoverTimerRef.current = null;
     }
   }
@@ -1723,7 +1823,7 @@ const stateToSendWithCompanion: SessionState = {
     backendSttRecorderRef.current = null;
 
     if (backendSttHardStopTimerRef.current) {
-      clearTimeout(backendSttHardStopTimerRef.current);
+      window.clearTimeout(backendSttHardStopTimerRef.current);
       backendSttHardStopTimerRef.current = null;
     }
 
@@ -1954,7 +2054,7 @@ const stateToSendWithCompanion: SessionState = {
         // If VAD setup fails, we still record; hard-stop timer will end it.
       }
 
-      backendSttHardStopTimerRef.current = setTimeout(() => {
+      backendSttHardStopTimerRef.current = window.setTimeout(() => {
         try {
           if (recorder.state !== "inactive") recorder.stop();
         } catch {}
@@ -2046,15 +2146,21 @@ const pauseSpeechToText = useCallback(() => {
       // ignore
     }
 
+    // iOS Web Speech can get stuck after stop(); force a fresh recognizer next time.
+    // (Embedded iOS uses Web Speech; backend STT is disabled when embedded.)
+    if (isIOS && !useBackendStt) {
+      resetSpeechRecognition();
+    }
+
     setSttRunning(false);
-  }, [abortBackendStt, clearSttSilenceTimer]);
+  }, [abortBackendStt, clearSttSilenceTimer, isIOS, useBackendStt, resetSpeechRecognition]);
 
   const scheduleSttAutoSend = useCallback(() => {
     if (!sttEnabledRef.current) return;
 
     clearSttSilenceTimer();
 
-    sttSilenceTimerRef.current = setTimeout(() => {
+    sttSilenceTimerRef.current = window.setTimeout(() => {
       const text = getCurrentSttText();
       if (!text) return;
 
@@ -2154,7 +2260,7 @@ const pauseSpeechToText = useCallback(() => {
       // On iOS we add a larger delay between restarts to avoid transient audio-capture failures.
       const baseDelay = isIOS ? 850 : 250;
 
-      sttRestartTimerRef.current = setTimeout(() => {
+      sttRestartTimerRef.current = window.setTimeout(() => {
         if (!sttEnabledRef.current || sttPausedRef.current) return;
 
         try {
@@ -2224,7 +2330,7 @@ const pauseSpeechToText = useCallback(() => {
 
         // Recovery path: recreate recognition (helps iOS) and try again after a short delay.
         clearSttRecoverTimer();
-        sttRecoverTimerRef.current = setTimeout(async () => {
+        sttRecoverTimerRef.current = window.setTimeout(async () => {
           if (!sttEnabledRef.current || sttPausedRef.current) return;
 
           resetSpeechRecognition();
@@ -2294,24 +2400,40 @@ const pauseSpeechToText = useCallback(() => {
       return;
     }
 
-    const ok = ensureSpeechRecognition();
-    if (!ok) {
-      sttEnabledRef.current = false;
-      setSttRunning(false);
-      setSttError("Speech-to-text is not supported in this browser.");
-      return;
-    }
+    // After assistant TTS on iOS, restarting recognition immediately can trigger
+    // intermittent "audio-capture" failures. Delay + reuse the existing restart timer.
+    clearSttRestartTimer();
+    const delayMs = isIOS ? 850 : 0;
 
-    const rec = sttRecRef.current;
-    if (!rec) return;
+    sttRestartTimerRef.current = window.setTimeout(() => {
+      if (!sttEnabledRef.current) return;
+      if (sttPausedRef.current) return;
 
-    try {
-      rec.start();
-      setSttRunning(true);
-    } catch {
-      // ignore; will restart on onend if needed
-    }
-  }, [ensureSpeechRecognition, kickBackendStt, useBackendStt]);
+      const ok = ensureSpeechRecognition();
+      if (!ok) {
+        sttEnabledRef.current = false;
+        setSttRunning(false);
+        setSttError("Speech-to-text is not supported in this browser.");
+        return;
+      }
+
+      const rec = sttRecRef.current;
+      if (!rec) return;
+
+      try {
+        rec.start();
+        setSttRunning(true);
+      } catch {
+        // ignore; will restart on onend if needed
+      }
+    }, delayMs);
+  }, [
+    clearSttRestartTimer,
+    ensureSpeechRecognition,
+    isIOS,
+    kickBackendStt,
+    useBackendStt,
+  ]);
 
   const stopSpeechToText = useCallback(
     (clearError: boolean = true) => {
@@ -2459,6 +2581,13 @@ const pauseSpeechToText = useCallback(() => {
     <main style={{ maxWidth: 880, margin: "24px auto", padding: "0 16px", fontFamily: "system-ui" }}>
       {/* Hidden audio element for audio-only TTS (mic mode) */}
       <audio ref={localTtsAudioRef} style={{ display: "none" }} />
+      {/* Hidden video element used on iOS to play audio-only TTS reliably (matches Live Avatar routing) */}
+      <video
+        ref={localTtsVideoRef}
+        playsInline
+        preload="auto"
+        style={{ position: "absolute", width: 1, height: 1, left: -9999, top: -9999, opacity: 0 }}
+      />
       <header style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 10 }}>
         <div aria-hidden style={{ width: 56, height: 56, borderRadius: "50%", overflow: "hidden" }}>
           <img
