@@ -795,21 +795,27 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string): Promis
 
   const primeLocalTtsAudio = useCallback(() => {
     if (localTtsUnlockedRef.current) return;
+    const a = localTtsAudioRef.current;
+    if (!a) return;
 
     try {
-      // Use a throwaway <audio> element for priming so we never interfere with the
-      // real TTS <audio> element (avoids iOS race conditions on first playback).
-      const a = new Audio(PRIME_SILENT_WAV);
-      a.preload = "auto";
       a.setAttribute("playsinline", "true");
-      a.setAttribute("webkit-playsinline", "true");
+      (a as any).playsInline = true;
+    } catch {
+      // ignore
+    }
 
-      // Some iOS builds require an unmuted play() attempt with volume near-zero to unlock.
-      a.muted = false;
-      a.volume = 0.0001;
+    // Must be triggered from a user gesture (e.g., mic button click).
+    // IMPORTANT for iOS Safari: unlocking should be an *unmuted* play() (muted playback can
+    // "succeed" but still leave later unmuted TTS blocked). We keep volume near-zero so it
+    // stays inaudible.
+    a.muted = false;
+    a.volume = 0.001;
+    a.src = PRIME_SILENT_WAV;
 
-      a
-        .play()
+    const p = a.play?.();
+    if (p && typeof (p as any).then === "function") {
+      (p as Promise<any>)
         .then(() => {
           try {
             a.pause();
@@ -820,10 +826,31 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string): Promis
           localTtsUnlockedRef.current = true;
         })
         .catch(() => {
-          localTtsUnlockedRef.current = false;
+          // If this fails, Safari may still allow playback after another gesture; we'll try again later.
+        })
+        .finally(() => {
+          try {
+            a.pause();
+            a.currentTime = 0;
+          } catch {
+            // ignore
+          }
+          a.muted = false;
+          a.volume = 1;
+          a.src = "";
         });
-    } catch {
-      localTtsUnlockedRef.current = false;
+    } else {
+      // Non-promise play()
+      try {
+        a.pause();
+        a.currentTime = 0;
+      } catch {
+        // ignore
+      }
+      localTtsUnlockedRef.current = true;
+      a.muted = false;
+      a.volume = 1;
+      a.src = "";
     }
   }, []);
 
@@ -1170,9 +1197,9 @@ const speakAssistantReply = useCallback(
   // - Auto-sends after 2s of silence
   // - Automatically restarts recognition when it stops (browser behavior)
   const sttRecRef = useRef<any>(null);
-  const sttSilenceTimerRef = useRef<number | null>(null);
-  const sttRestartTimerRef = useRef<number | null>(null);
-  const sttRecoverTimerRef = useRef<number | null>(null);
+  const sttSilenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const sttRestartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const sttRecoverTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sttAudioCaptureFailsRef = useRef<number>(0);
   const sttLastAudioCaptureAtRef = useRef<number>(0);
 
@@ -1202,7 +1229,7 @@ const speakAssistantReply = useCallback(
   const backendSttRecorderRef = useRef<MediaRecorder | null>(null);
   const backendSttAudioCtxRef = useRef<AudioContext | null>(null);
   const backendSttRafRef = useRef<number | null>(null);
-  const backendSttHardStopTimerRef = useRef<number | null>(null);
+  const backendSttHardStopTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const backendSttLastVoiceAtRef = useRef<number>(0);
   const backendSttHasSpokenRef = useRef<boolean>(false);
 
@@ -1624,21 +1651,21 @@ const stateToSendWithCompanion: SessionState = {
 
   function clearSttSilenceTimer() {
     if (sttSilenceTimerRef.current) {
-      window.clearTimeout(sttSilenceTimerRef.current);
+      clearTimeout(sttSilenceTimerRef.current);
       sttSilenceTimerRef.current = null;
     }
   }
 
   function clearSttRestartTimer() {
     if (sttRestartTimerRef.current) {
-      window.clearTimeout(sttRestartTimerRef.current);
+      clearTimeout(sttRestartTimerRef.current);
       sttRestartTimerRef.current = null;
     }
   }
 
   function clearSttRecoverTimer() {
     if (sttRecoverTimerRef.current) {
-      window.clearTimeout(sttRecoverTimerRef.current);
+      clearTimeout(sttRecoverTimerRef.current);
       sttRecoverTimerRef.current = null;
     }
   }
@@ -1696,7 +1723,7 @@ const stateToSendWithCompanion: SessionState = {
     backendSttRecorderRef.current = null;
 
     if (backendSttHardStopTimerRef.current) {
-      window.clearTimeout(backendSttHardStopTimerRef.current);
+      clearTimeout(backendSttHardStopTimerRef.current);
       backendSttHardStopTimerRef.current = null;
     }
 
@@ -1927,7 +1954,7 @@ const stateToSendWithCompanion: SessionState = {
         // If VAD setup fails, we still record; hard-stop timer will end it.
       }
 
-      backendSttHardStopTimerRef.current = window.setTimeout(() => {
+      backendSttHardStopTimerRef.current = setTimeout(() => {
         try {
           if (recorder.state !== "inactive") recorder.stop();
         } catch {}
@@ -2019,21 +2046,15 @@ const pauseSpeechToText = useCallback(() => {
       // ignore
     }
 
-    // iOS Web Speech can get stuck after stop(); force a fresh recognizer next time.
-    // (Embedded iOS uses Web Speech; backend STT is disabled when embedded.)
-    if (isIOS && !useBackendStt) {
-      resetSpeechRecognition();
-    }
-
     setSttRunning(false);
-  }, [abortBackendStt, clearSttSilenceTimer, isIOS, useBackendStt, resetSpeechRecognition]);
+  }, [abortBackendStt, clearSttSilenceTimer]);
 
   const scheduleSttAutoSend = useCallback(() => {
     if (!sttEnabledRef.current) return;
 
     clearSttSilenceTimer();
 
-    sttSilenceTimerRef.current = window.setTimeout(() => {
+    sttSilenceTimerRef.current = setTimeout(() => {
       const text = getCurrentSttText();
       if (!text) return;
 
@@ -2133,7 +2154,7 @@ const pauseSpeechToText = useCallback(() => {
       // On iOS we add a larger delay between restarts to avoid transient audio-capture failures.
       const baseDelay = isIOS ? 850 : 250;
 
-      sttRestartTimerRef.current = window.setTimeout(() => {
+      sttRestartTimerRef.current = setTimeout(() => {
         if (!sttEnabledRef.current || sttPausedRef.current) return;
 
         try {
@@ -2203,7 +2224,7 @@ const pauseSpeechToText = useCallback(() => {
 
         // Recovery path: recreate recognition (helps iOS) and try again after a short delay.
         clearSttRecoverTimer();
-        sttRecoverTimerRef.current = window.setTimeout(async () => {
+        sttRecoverTimerRef.current = setTimeout(async () => {
           if (!sttEnabledRef.current || sttPausedRef.current) return;
 
           resetSpeechRecognition();
@@ -2273,40 +2294,24 @@ const pauseSpeechToText = useCallback(() => {
       return;
     }
 
-    // After assistant TTS on iOS, restarting recognition immediately can trigger
-    // intermittent "audio-capture" failures. Delay + reuse the existing restart timer.
-    clearSttRestartTimer();
-    const delayMs = isIOS ? 850 : 0;
+    const ok = ensureSpeechRecognition();
+    if (!ok) {
+      sttEnabledRef.current = false;
+      setSttRunning(false);
+      setSttError("Speech-to-text is not supported in this browser.");
+      return;
+    }
 
-    sttRestartTimerRef.current = window.setTimeout(() => {
-      if (!sttEnabledRef.current) return;
-      if (sttPausedRef.current) return;
+    const rec = sttRecRef.current;
+    if (!rec) return;
 
-      const ok = ensureSpeechRecognition();
-      if (!ok) {
-        sttEnabledRef.current = false;
-        setSttRunning(false);
-        setSttError("Speech-to-text is not supported in this browser.");
-        return;
-      }
-
-      const rec = sttRecRef.current;
-      if (!rec) return;
-
-      try {
-        rec.start();
-        setSttRunning(true);
-      } catch {
-        // ignore; will restart on onend if needed
-      }
-    }, delayMs);
-  }, [
-    clearSttRestartTimer,
-    ensureSpeechRecognition,
-    isIOS,
-    kickBackendStt,
-    useBackendStt,
-  ]);
+    try {
+      rec.start();
+      setSttRunning(true);
+    } catch {
+      // ignore; will restart on onend if needed
+    }
+  }, [ensureSpeechRecognition, kickBackendStt, useBackendStt]);
 
   const stopSpeechToText = useCallback(
     (clearError: boolean = true) => {
