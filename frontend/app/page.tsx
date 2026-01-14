@@ -7,6 +7,13 @@ type Role = "user" | "assistant";
 type Msg = { role: Role; content: string };
 
 type Mode = "friend" | "romantic" | "intimate";
+
+const RELATIONSHIP_MODES: Record<Mode, { label: string }> = {
+  friend: { label: "Friend" },
+  romantic: { label: "Romantic" },
+  intimate: { label: "Intimate (18+)" },
+};
+
 type ChatStatus = "safe" | "explicit_blocked" | "explicit_allowed";
 
 type SessionState = {
