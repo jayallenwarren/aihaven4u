@@ -2786,87 +2786,124 @@ const pauseSpeechToText = useCallback(() => {
         </div>
       </header>
 
-      <section style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
-        {modePills.map((m) => {
-          const active = effectiveActiveMode === m;
-          const disabled = !allowedModes.includes(m);
-          return (
-            <button
-              key={m}
-              disabled={disabled}
-              onClick={() => {
-                if (disabled) return showUpgradeMessage(m);
-                setModeFromPill(m);
-              }}
-              style={{
-                padding: "8px 12px",
-                borderRadius: 999,
-                border: "1px solid #ddd",
-                background: active ? "#111" : "#fff",
-                color: active ? "#fff" : "#111",
-                opacity: disabled ? 0.45 : 1,
-                cursor: disabled ? "not-allowed" : "pointer",
-              }}
-            >
-              {MODE_LABELS[m]}
-            </button>
-          );
-        })}
+      {/* Controls: Live Avatar + Microphone (mic moved next to Start Live Avatar) */}
+      <section style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12, flexWrap: "wrap" }}>
+        {phase1AvatarMedia ? (
+          <button
+            onClick={() => {
+              if (
+                avatarStatus === "connected" ||
+                avatarStatus === "connecting" ||
+                avatarStatus === "reconnecting"
+              ) {
+                void stopLiveAvatar();
+              } else {
+                void (async () => {
+                  // Live Avatar requires microphone / STT. Start it automatically.
+                  // If iOS audio-only backend STT is currently running, restart in browser STT for Live Avatar.
+                  if (sttEnabledRef.current && useBackendStt) {
+                    stopSpeechToText();
+                  }
+
+                  if (!sttEnabledRef.current) {
+                    await startSpeechToText({ forceBrowser: true });
+                  }
+
+                  // If mic permission was denied, don't start Live Avatar.
+                  if (!sttEnabledRef.current) return;
+
+                  await startLiveAvatar();
+                })();
+              }
+            }}
+            style={{
+              padding: "10px 14px",
+              borderRadius: 10,
+              border: "1px solid #111",
+              background: "#fff",
+              color: "#111",
+              cursor: "pointer",
+              fontWeight: 700,
+            }}
+          >
+            {avatarStatus === "connected" ||
+            avatarStatus === "connecting" ||
+            avatarStatus === "reconnecting"
+              ? "Stop Live Avatar"
+              : "Start Live Avatar"}
+          </button>
+        ) : null}
+
+        {/* Microphone toggle (moved here from the input row) */}
+        <button
+          onClick={() => {
+            // If Live Avatar is active, mic is required and STT is auto-managed by the Live Avatar button.
+            if (
+              (avatarStatus === "connected" ||
+                avatarStatus === "connecting" ||
+                avatarStatus === "reconnecting") &&
+              sttEnabled
+            ) {
+              return;
+            }
+            toggleSpeechToText();
+          }}
+          disabled={(!sttEnabled && loading) || ((avatarStatus === "connected" || avatarStatus === "connecting" || avatarStatus === "reconnecting") && sttEnabled)}
+          title={
+            (avatarStatus === "connected" || avatarStatus === "connecting" || avatarStatus === "reconnecting") && sttEnabled
+              ? "Microphone required for Live Avatar"
+              : sttEnabled
+              ? "Stop listening"
+              : "Start listening"
+          }
+          style={{
+            width: 44,
+            height: 44,
+            borderRadius: 12,
+            border: "1px solid #ddd",
+            background: sttEnabled ? "#b00020" : "#fff",
+            color: sttEnabled ? "#fff" : "#111",
+            cursor: "pointer",
+            fontSize: 18,
+            display: "grid",
+            placeItems: "center",
+            opacity: (!sttEnabled && loading) ? 0.55 : 1,
+          }}
+        >
+          🎤
+        </button>
+
+        {/* Stop button */}
+        {sttEnabled ? (
+          <button
+            onClick={stopHandsFreeSTT}
+            disabled={isStoppingConversation}
+            title="Stop conversation"
+            style={{
+              width: 44,
+              height: 44,
+              borderRadius: 12,
+              border: "1px solid #ddd",
+              background: "#fff",
+              color: "#111",
+              cursor: "pointer",
+              fontSize: 18,
+              display: "grid",
+              placeItems: "center",
+              opacity: isStoppingConversation ? 0.6 : 1,
+            }}
+          >
+            ■
+          </button>
+        ) : null}
+
+        {phase1AvatarMedia ? (
+          <div style={{ fontSize: 12, color: "#666" }}>
+            Live Avatar: <b>{avatarStatus}</b>
+            {avatarError ? <span style={{ color: "#b00020" }}> — {avatarError}</span> : null}
+          </div>
+        ) : null}
       </section>
-
-
-{phase1AvatarMedia && (
-  <section style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12, flexWrap: "wrap" }}>
-    <button
-      onClick={() => {
-        if (
-          avatarStatus === "connected" ||
-          avatarStatus === "connecting" ||
-          avatarStatus === "reconnecting"
-        ) {
-          void stopLiveAvatar();
-        } else {
-          void (async () => {
-            // Live Avatar requires microphone / STT. Start it automatically.
-            // If iOS audio-only backend STT is currently running, restart in browser STT for Live Avatar.
-            if (sttEnabledRef.current && useBackendStt) {
-              stopSpeechToText();
-            }
-
-            if (!sttEnabledRef.current) {
-              await startSpeechToText({ forceBrowser: true });
-            }
-
-            // If mic permission was denied, don't start Live Avatar.
-            if (!sttEnabledRef.current) return;
-
-            await startLiveAvatar();
-          })();
-        }
-      }}
-      style={{
-        padding: "10px 14px",
-        borderRadius: 10,
-        border: "1px solid #111",
-        background: "#fff",
-        color: "#111",
-        cursor: "pointer",
-        fontWeight: 700,
-      }}
-    >
-      {avatarStatus === "connected" ||
-      avatarStatus === "connecting" ||
-      avatarStatus === "reconnecting"
-        ? "Stop Live Avatar"
-        : "Start Live Avatar"}
-    </button>
-
-    <div style={{ fontSize: 12, color: "#666" }}>
-      Live Avatar: <b>{avatarStatus}</b>
-      {avatarError ? <span style={{ color: "#b00020" }}> — {avatarError}</span> : null}
-    </div>
-  </section>
-)}
 
 
       {/* Conversation area (Avatar + Chat) */}
@@ -2961,82 +2998,80 @@ const pauseSpeechToText = useCallback(() => {
             {loading ? <div style={{ color: "#666" }}>Thinking…</div> : null}
           </div>
 
-          <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
-            <button
-              type="button"
-              onClick={toggleSpeechToText}
-              disabled={(!sttEnabled && loading) || (liveAvatarActive && sttEnabled)}
-              title={
-                liveAvatarActive
-                  ? sttEnabled
-                    ? "Mic is required in Live Avatar (use Stop to end)"
-                    : "Enable microphone (required for Live Avatar)"
-                  : sttEnabled
-                    ? "Stop speech-to-text"
-                    : "Start speech-to-text"
-              }
+          {/* Composer row: mode pills + input + send */}
+          <div style={{ display: "flex", gap: 8, marginTop: 12, alignItems: "center", flexWrap: "nowrap" }}>
+            <div
               style={{
-                width: 44,
-                minWidth: 44,
-                borderRadius: 10,
-                border: "1px solid #111",
-                background: sttEnabled ? "#b00020" : "#fff",
-                color: sttEnabled ? "#fff" : "#111",
-                cursor: "pointer",
-                fontWeight: 700,
+                display: "flex",
+                gap: 8,
+                alignItems: "center",
+                overflowX: "auto",
+                WebkitOverflowScrolling: "touch",
+                maxWidth: "42%",
+                minWidth: 150,
+                flex: "0 1 42%",
               }}
             >
-              🎤
-            </button>
-
-            {sttEnabled ? (
-              <button
-                type="button"
-                onClick={stopHandsFreeSTT}
-                title="Stop listening"
-                style={{
-                  width: 44,
-                  minWidth: 44,
-                  borderRadius: 10,
-                  border: "1px solid #111",
-                  background: "#fff",
-                  color: "#111",
-                  cursor: "pointer",
-                  fontWeight: 700,
-                }}
-              >
-                ■
-              </button>
-            ) : null}
+              {modePills.map((m) => {
+                const active = effectiveActiveMode === m;
+                const disabled = !allowedModes.includes(m);
+                return (
+                  <button
+                    key={m}
+                    disabled={disabled}
+                    onClick={() => {
+                      if (disabled) return;
+                      setModeFromPill(m);
+                    }}
+                    style={{
+                      padding: "8px 14px",
+                      borderRadius: 999,
+                      border: active ? "1px solid #111" : "1px solid #ddd",
+                      background: active ? "#111" : "#fff",
+                      color: active ? "#fff" : "#111",
+                      cursor: disabled ? "not-allowed" : "pointer",
+                      opacity: disabled ? 0.5 : 1,
+                      fontWeight: 700,
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    {RELATIONSHIP_MODES[m].label}
+                  </button>
+                );
+              })}
+            </div>
 
             <input
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
+              value={inputValue}
+              onChange={(e) => setInputValue(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === "Enter") {
                   e.preventDefault();
-                  send();
+                  send(inputValue);
                 }
               }}
-              placeholder={sttEnabled ? "Listening…" : "Type a message…"}
+              placeholder={
+                sttEnabled ? "Listening… speak and pause 2s to send" : "Type a message…"
+              }
               style={{
-                flex: 1,
-                padding: "10px 12px",
-                borderRadius: 10,
+                flex: "1 1 auto",
+                minWidth: 140,
+                padding: "12px 12px",
+                borderRadius: 12,
                 border: "1px solid #ddd",
+                outline: "none",
               }}
             />
 
             <button
-              onClick={() => send()}
-              disabled={loading}
+              onClick={() => send(inputValue)}
               style={{
-                padding: "10px 14px",
-                borderRadius: 10,
+                padding: "12px 14px",
+                borderRadius: 12,
                 border: "1px solid #111",
                 background: "#111",
                 color: "#fff",
-                cursor: "pointer",
+                fontWeight: 700,
               }}
             >
               Send
