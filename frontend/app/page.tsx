@@ -2922,7 +2922,7 @@ const pauseSpeechToText = useCallback(() => {
       </header>
 
 {phase1AvatarMedia ? (
-  <section style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12, flexWrap: "wrap" }}>
+  <section style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 12, marginBottom: 12, flexWrap: "wrap" }}>
     <button
       onClick={() => {
         if (
@@ -2970,15 +2970,19 @@ const pauseSpeechToText = useCallback(() => {
     {/* When a Live Avatar is available, place mic/stop controls to the right of Start Live Avatar */}
     {sttControls}
 
-    <div style={{ fontSize: 12, color: "#666" }}>
+    <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+      <div style={{ fontSize: 12, color: "#666" }}>
       Live Avatar: <b>{avatarStatus}</b>
       {avatarError ? <span style={{ color: "#b00020" }}> — {avatarError}</span> : null}
     </div>
+      {modePillControls}
+    </div>
       </section>
 ) : (
-  <section style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12, flexWrap: "wrap" }}>
+  <section style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 12, marginBottom: 12, flexWrap: "wrap" }}>
     {/* When no Live Avatar is available, show mic/stop controls in the Live Avatar button location */}
     {sttControls}
+    {modePillControls}
       </section>
 )}
 
@@ -3050,10 +3054,6 @@ const pauseSpeechToText = useCallback(() => {
             flexDirection: "column",
           }}
         >
-          <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 12 }}>
-            {modePillControls}
-          </div>
-
           <div
             ref={messagesBoxRef}
             style={{
