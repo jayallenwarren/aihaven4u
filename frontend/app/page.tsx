@@ -2668,6 +2668,77 @@ const pauseSpeechToText = useCallback(() => {
     useBackendStt,
   ]);
 
+  // Play the companion greeting in voice/video modes (once per session, per companion).
+  // (The greeting text is already injected into the chat on load — this only plays it.)
+  const speakGreetingIfNeeded = useCallback(
+    async (mode: "audio" | "live") => {
+      if (typeof window === "undefined") return;
+      if (!companionName) return;
+
+      const key = `${GREET_ONCE_KEY}_VOICE_${companionName}`;
+
+      try {
+        if (sessionStorage.getItem(key) === "1") return;
+      } catch {}
+
+      const greetText = greetingFor(companionName);
+      const voiceId = getElevenVoiceIdForAvatar(companionName);
+
+      const hooks: SpeakAssistantHooks = {
+        onWillSpeak: () => {
+          // Pause STT so we don't capture the greeting itself.
+          try {
+            pauseSpeechToText();
+          } catch {}
+
+          // Safety: also block any backend STT restarts during the greeting.
+          sttIgnoreUntilRef.current = performance.now() + 10 * 60 * 1000;
+        },
+        onDidNotSpeak: () => {},
+      };
+
+      try {
+        if (mode === "live" && didAgentMgrRef.current) {
+          await speakAssistantReply(greetText, voiceId, hooks);
+        } else {
+          await speakLocalTtsReply(greetText, voiceId, hooks);
+        }
+
+        try {
+          sessionStorage.setItem(key, "1");
+        } catch {}
+      } catch (e) {
+        console.warn("Greeting playback failed:", e);
+      } finally {
+        sttIgnoreUntilRef.current = 0;
+
+        // Resume listening after greeting (only if the user actually has STT enabled).
+        if (sttEnabledRef.current) {
+          const delay = isIOS ? 150 : 0;
+          if (delay) {
+            window.setTimeout(() => {
+              if (sttEnabledRef.current) {
+                resumeSpeechToText();
+              }
+            }, delay);
+          } else {
+            resumeSpeechToText();
+          }
+        }
+      }
+    },
+    [companionName, isIOS, pauseSpeechToText, resumeSpeechToText, speakAssistantReply, speakLocalTtsReply],
+  );
+
+  // Auto-play the greeting once the Live Avatar is connected.
+  useEffect(() => {
+    if (!liveAvatarActive) return;
+    if (avatarStatus !== "connected") return;
+    void speakGreetingIfNeeded("live");
+  }, [avatarStatus, liveAvatarActive, speakGreetingIfNeeded]);
+
+
+
   const stopSpeechToText = useCallback(
     (clearError: boolean = true) => {
       sttEnabledRef.current = false;
@@ -2712,6 +2783,7 @@ const pauseSpeechToText = useCallback(() => {
         return;
       }
       resumeSpeechToText();
+      if (!liveAvatarActive) void speakGreetingIfNeeded("audio");
       return;
     }
 
@@ -2737,12 +2809,15 @@ const pauseSpeechToText = useCallback(() => {
     }
 
     resumeSpeechToText();
+    if (!liveAvatarActive) void speakGreetingIfNeeded("audio");
   }, [
     ensureSpeechRecognition,
     kickBackendStt,
+    liveAvatarActive,
     primeLocalTtsAudio,
     requestMicPermission,
     resumeSpeechToText,
+    speakGreetingIfNeeded,
     stopSpeechToText,
     useBackendStt,
   ]);
