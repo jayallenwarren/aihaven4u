@@ -2858,8 +2858,13 @@ const pauseSpeechToText = useCallback(() => {
             Set Mode
           </button>
 
-          <a
-            href="https://www.aihaven4u.com/myhaven"
+
+          <button
+            type="button"
+            onClick={() => {
+              // Force full navigation in the same tab (not client-side “soft” navigation).
+              window.location.assign("https://www.aihaven4u.com/myhaven");
+            }}
             style={{
               padding: "10px 14px",
               borderRadius: 10,
@@ -2871,11 +2876,10 @@ const pauseSpeechToText = useCallback(() => {
               whiteSpace: "nowrap",
               display: "inline-flex",
               alignItems: "center",
-              textDecoration: "none",
             }}
           >
             Switch Companion
-          </a>
+          </button>
         </div>
       ) : (
         modePills.map((m) => {
