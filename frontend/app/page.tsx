@@ -1714,9 +1714,15 @@ const stateToSendWithCompanion: SessionState = {
       return;
     }
 
+    // Selecting Intimate (18+) requires explicit consent; trigger the consent overlay if not already consented.
+    if (m === "intimate" && !sessionState.explicit_consented) {
+      setChatStatus("explicit_blocked");
+    }
+
     setSessionState((prev) => {
-      // If switching away from intimate while pending consent, clear pending
-      const nextPending = m === "intimate" ? prev.pending_consent : null;
+      // If switching to intimate and consent is not yet granted, keep pending consent active so the overlay is shown.
+      const nextPending =
+        m === "intimate" && !prev.explicit_consented ? "intimate" : null;
       return { ...prev, mode: m, pending_consent: nextPending };
     });
 
