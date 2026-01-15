@@ -2922,68 +2922,102 @@ const pauseSpeechToText = useCallback(() => {
       </header>
 
 {phase1AvatarMedia ? (
-  <section style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 12, marginBottom: 12, flexWrap: "wrap" }}>
-    <button
-      onClick={() => {
-        if (
+  <section
+    style={{
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "space-between",
+      gap: 12,
+      marginBottom: 12,
+      flexWrap: "wrap",
+    }}
+  >
+    <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+      <button
+        onClick={() => {
+          if (
+            avatarStatus === "connected" ||
+            avatarStatus === "connecting" ||
+            avatarStatus === "reconnecting"
+          ) {
+            void stopLiveAvatar();
+          } else {
+            if (!sttEnabledRef.current) return;
+
+            (async () => {
+              if (!sttEnabledRef.current) return;
+
+              await startLiveAvatar();
+            })();
+          }
+        }}
+        style={{
+          padding: "10px 14px",
+          borderRadius: 10,
+          border: "1px solid #111",
+          background: "#fff",
+          color: "#111",
+          cursor: "pointer",
+          fontWeight: 700,
+        }}
+        aria-label={
           avatarStatus === "connected" ||
           avatarStatus === "connecting" ||
           avatarStatus === "reconnecting"
-        ) {
-          void stopLiveAvatar();
-        } else {
-          void (async () => {
-            // Live Avatar requires microphone / STT. Start it automatically.
-            // If iOS audio-only backend STT is currently running, restart in browser STT for Live Avatar.
-            if (sttEnabledRef.current && useBackendStt) {
-              stopSpeechToText();
-            }
-
-            if (!sttEnabledRef.current) {
-              await startSpeechToText({ forceBrowser: true });
-            }
-
-            // If mic permission was denied, don't start Live Avatar.
-            if (!sttEnabledRef.current) return;
-
-            await startLiveAvatar();
-          })();
+            ? "Stop Live Avatar"
+            : "Start Live Avatar"
         }
-      }}
-      style={{
-        padding: "10px 14px",
-        borderRadius: 10,
-        border: "1px solid #111",
-        background: "#fff",
-        color: "#111",
-        cursor: "pointer",
-        fontWeight: 700,
-      }}
-    >
-      {avatarStatus === "connected" ||
-      avatarStatus === "connecting" ||
-      avatarStatus === "reconnecting"
-        ? <PauseIcon />
-        : <PlayIcon />}
-    </button>
+        title={
+          avatarStatus === "connected" ||
+          avatarStatus === "connecting" ||
+          avatarStatus === "reconnecting"
+            ? "Stop Live Avatar"
+            : "Start Live Avatar"
+        }
+      >
+        {avatarStatus === "connected" ||
+        avatarStatus === "connecting" ||
+        avatarStatus === "reconnecting"
+          ? <PauseIcon />
+          : <PlayIcon />}
+      </button>
 
-    {/* When a Live Avatar is available, place mic/stop controls to the right of Start Live Avatar */}
-    {sttControls}
+      {/* When a Live Avatar is available, place mic/stop controls to the right of play/pause */}
+      {sttControls}
 
-    <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
       <div style={{ fontSize: 12, color: "#666" }}>
-      Live Avatar: <b>{avatarStatus}</b>
-      {avatarError ? <span style={{ color: "#b00020" }}> — {avatarError}</span> : null}
+        Live Avatar: <b>{avatarStatus}</b>
+        {avatarError ? <span style={{ color: "#b00020" }}> — {avatarError}</span> : null}
+      </div>
     </div>
-      {modePillControls}
-    </div>
-      </section>
-) : (
-  <section style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 12, marginBottom: 12, flexWrap: "wrap" }}>
-    {/* When no Live Avatar is available, show mic/stop controls in the Live Avatar button location */}
-    {sttControls}
+
+    {/* Right-justified Mode controls */}
     {modePillControls}
-      </section>
+  </section>
+) : (
+  <section
+    style={{
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "space-between",
+      gap: 12,
+      marginBottom: 12,
+      flexWrap: "wrap",
+    }}
+  >
+    <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+      {/* When no Live Avatar is available, show mic/stop controls in the Live Avatar button location */}
+      {sttControls}
+
+      <div style={{ fontSize: 12, color: "#666" }}>
+        Live Avatar: <b>{avatarStatus}</b>
+        {avatarError ? <span style={{ color: "#b00020" }}> — {avatarError}</span> : null}
+      </div>
+    </div>
+
+    {/* Right-justified Mode controls */}
+    {modePillControls}
+  </section>
 )}
 
 
