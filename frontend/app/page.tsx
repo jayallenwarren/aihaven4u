@@ -2786,67 +2786,34 @@ const pauseSpeechToText = useCallback(() => {
         </div>
       </header>
 
-      
-
-
-
-      {!phase1AvatarMedia && (
-        <section
-          style={{
-            display: "flex",
-            alignItems: "center",
-            gap: 12,
-            marginBottom: 12,
-            flexWrap: "wrap",
-          }}
-        >
-          <button
-            onClick={toggleSpeechToText}
-            title={sttEnabled ? "Stop STT" : "Start STT"}
-            style={{
-              width: 44,
-              height: 44,
-              borderRadius: 999,
-              border: "1px solid #ddd",
-              background: sttEnabled ? "#0b74ff" : "#fff",
-              color: sttEnabled ? "#fff" : "#111",
-              cursor: "pointer",
-              flexShrink: 0,
-            }}
-          >
-            🎙️
-          </button>
-
-          {sttEnabled && (
+      <section style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
+        {modePills.map((m) => {
+          const active = effectiveActiveMode === m;
+          const disabled = !allowedModes.includes(m);
+          return (
             <button
-              onClick={stopHandsFreeSTT}
-              title="Stop conversation"
+              key={m}
+              disabled={disabled}
+              onClick={() => {
+                if (disabled) return showUpgradeMessage(m);
+                setModeFromPill(m);
+              }}
               style={{
-                width: 44,
-                height: 44,
+                padding: "8px 12px",
                 borderRadius: 999,
                 border: "1px solid #ddd",
-                background: "#fff",
-                color: "#111",
-                cursor: "pointer",
-                flexShrink: 0,
+                background: active ? "#111" : "#fff",
+                color: active ? "#fff" : "#111",
+                opacity: disabled ? 0.45 : 1,
+                cursor: disabled ? "not-allowed" : "pointer",
               }}
             >
-              ■
+              {MODE_LABELS[m]}
             </button>
-          )}
+          );
+        })}
+      </section>
 
-          <div style={{ fontSize: 12, color: "#666" }}>
-            Audio TTS: <b>{localTtsPlaying ? "playing" : "idle"}</b>
-            {localTtsError ? (
-              <span style={{ color: "crimson" }}> · {localTtsError}</span>
-            ) : null}
-            <br />
-            STT: <b>{sttEnabled ? "listening" : "off"}</b>
-            {sttError ? <span style={{ color: "crimson" }}> · {sttError}</span> : null}
-          </div>
-        </section>
-      )}
 
 {phase1AvatarMedia && (
   <section style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12, flexWrap: "wrap" }}>
@@ -2893,43 +2860,6 @@ const pauseSpeechToText = useCallback(() => {
         ? "Stop Live Avatar"
         : "Start Live Avatar"}
     </button>
-
-
-    <button
-      onClick={toggleSpeechToText}
-      title={sttEnabled ? "Stop STT" : "Start STT"}
-      style={{
-        width: 44,
-        height: 44,
-        borderRadius: 999,
-        border: "1px solid #ddd",
-        background: sttEnabled ? "#0b74ff" : "#fff",
-        color: sttEnabled ? "#fff" : "#111",
-        cursor: "pointer",
-        flexShrink: 0,
-      }}
-    >
-      🎙️
-    </button>
-
-    {sttEnabled && (
-      <button
-        onClick={stopHandsFreeSTT}
-        title="Stop conversation"
-        style={{
-          width: 44,
-          height: 44,
-          borderRadius: 999,
-          border: "1px solid #ddd",
-          background: "#fff",
-          color: "#111",
-          cursor: "pointer",
-          flexShrink: 0,
-        }}
-      >
-        ■
-      </button>
-    )}
 
     <div style={{ fontSize: 12, color: "#666" }}>
       Live Avatar: <b>{avatarStatus}</b>
@@ -3031,103 +2961,85 @@ const pauseSpeechToText = useCallback(() => {
             {loading ? <div style={{ color: "#666" }}>Thinking…</div> : null}
           </div>
 
-                    <div
-            style={{
-              display: "flex",
-              gap: 8,
-              marginTop: 12,
-              alignItems: "center",
-              flexWrap: "wrap",
-            }}
-          >
+          <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+            <button
+              type="button"
+              onClick={toggleSpeechToText}
+              disabled={(!sttEnabled && loading) || (liveAvatarActive && sttEnabled)}
+              title={
+                liveAvatarActive
+                  ? sttEnabled
+                    ? "Mic is required in Live Avatar (use Stop to end)"
+                    : "Enable microphone (required for Live Avatar)"
+                  : sttEnabled
+                    ? "Stop speech-to-text"
+                    : "Start speech-to-text"
+              }
+              style={{
+                width: 44,
+                minWidth: 44,
+                borderRadius: 10,
+                border: "1px solid #111",
+                background: sttEnabled ? "#b00020" : "#fff",
+                color: sttEnabled ? "#fff" : "#111",
+                cursor: "pointer",
+                fontWeight: 700,
+              }}
+            >
+              🎤
+            </button>
+
+            {sttEnabled ? (
+              <button
+                type="button"
+                onClick={stopHandsFreeSTT}
+                title="Stop listening"
+                style={{
+                  width: 44,
+                  minWidth: 44,
+                  borderRadius: 10,
+                  border: "1px solid #111",
+                  background: "#fff",
+                  color: "#111",
+                  cursor: "pointer",
+                  fontWeight: 700,
+                }}
+              >
+                ■
+              </button>
+            ) : null}
+
             <input
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
+                if (e.key === "Enter") {
                   e.preventDefault();
-                  if (isSending) return;
-                  const v = input.trim();
-                  if (!v) return;
-                  setInput("");
-                  void sendRef.current(v);
+                  send();
                 }
               }}
-              placeholder={
-                sttEnabled
-                  ? liveAvatarActive
-                    ? "Listening… speak to send"
-                    : "Listening… speak (auto-send) or type"
-                  : "Type your message"
-              }
+              placeholder={sttEnabled ? "Listening…" : "Type a message…"}
               style={{
-                flex: "1 1 260px",
-                border: "1px solid #ddd",
-                borderRadius: 10,
+                flex: 1,
                 padding: "10px 12px",
-                height: 44,
-                maxHeight: 88,
-                outline: "none",
+                borderRadius: 10,
+                border: "1px solid #ddd",
               }}
             />
 
-            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-              {modePills.map((m) => {
-                const active = effectiveActiveMode === m;
-                const allowed = allowedModes.includes(m);
-
-                const onClick = () => {
-                  if (!allowed) return showUpgradeMessage(m);
-                  setModeFromPill(m);
-                };
-
-                return (
-                  <button
-                    key={m}
-                    onClick={onClick}
-                    style={{
-                      padding: "8px 12px",
-                      borderRadius: 999,
-                      border: "1px solid " + (active ? "#0b74ff" : "#ddd"),
-                      background: active ? "#eaf2ff" : "#fff",
-                      cursor: allowed ? "pointer" : "not-allowed",
-                      opacity: allowed ? 1 : 0.55,
-                      fontWeight: active ? 700 : 500,
-                      whiteSpace: "nowrap",
-                    }}
-                    title={
-                      allowed
-                        ? MODE_LABELS[m]
-                        : "Upgrade required for " + MODE_LABELS[m]
-                    }
-                  >
-                    {MODE_LABELS[m]}
-                  </button>
-                );
-              })}
-            </div>
-
             <button
-              onClick={() => {
-                if (isSending) return;
-                const v = input.trim();
-                if (!v) return;
-                setInput("");
-                void sendRef.current(v);
-              }}
-              disabled={isSending}
+              onClick={() => send()}
+              disabled={loading}
               style={{
-                padding: "10px 16px",
+                padding: "10px 14px",
                 borderRadius: 10,
-                border: "1px solid #0b74ff",
-                background: "#0b74ff",
+                border: "1px solid #111",
+                background: "#111",
                 color: "#fff",
                 cursor: "pointer",
-                height: 44,
-                whiteSpace: "nowrap",
               }}
             >
-              {isSending ? "Sending…" : "Send"}
+              Send
             </button>
           </div>
 
