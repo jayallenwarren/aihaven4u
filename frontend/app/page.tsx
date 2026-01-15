@@ -3064,12 +3064,9 @@ const pauseSpeechToText = useCallback(() => {
             </button>
           </div>
 
-          {sttError
-          </div>
-
- ? (
-            <div style={{ marginTop: 6, fontSize: 12, color: "#b00020" }}>{sttError}</div>
-          ) : null}
+	          {sttError ? (
+	            <div style={{ marginTop: 6, fontSize: 12, color: "#b00020" }}>{sttError}</div>
+	          ) : null}
         </div>
       </section>
 
