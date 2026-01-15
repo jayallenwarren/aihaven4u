@@ -2670,67 +2670,67 @@ const pauseSpeechToText = useCallback(() => {
 
   // Play the companion greeting in voice/video modes (once per session, per companion).
   // (The greeting text is already injected into the chat on load — this only plays it.)
-  const speakGreetingIfNeeded = useCallback(
-    async (mode: "audio" | "live") => {
-      if (typeof window === "undefined") return;
-      if (!companionName) return;
+const greetInFlightRef = useRef(false);
 
-      const key = `${GREET_ONCE_KEY}_VOICE_${companionName}`;
+const speakGreetingIfNeeded = useCallback(
+  async (mode: "live" | "audio") => {
+    const name = (companionName || "").trim() || "Companion";
+    const key = `AIHAVEN_GREET_SPOKEN:${name}`;
 
+    // Already spoken this session?
+    try {
+      if (sessionStorage.getItem(key) === "1") return;
+    } catch {}
+
+    // Prevent duplicates/races (e.g., Live Avatar connects right after mic-start).
+    if (greetInFlightRef.current) return;
+    greetInFlightRef.current = true;
+
+    const greetText = `${name}: Hi, I'm ${name}. I'm here with you. How are you feeling today?`;
+    const voiceId = phase1AvatarMedia?.elevenVoiceId || "rJ9XoWu8gbUhVKZnKY8X";
+
+    // Belt & suspenders: avoid STT re-capturing the greeting audio.
+    const prevIgnore = sttIgnoreUntilRef.current;
+    sttIgnoreUntilRef.current = performance.now() + 60_000; // 60s
+
+    try {
       try {
-        if (sessionStorage.getItem(key) === "1") return;
+        await pauseSpeechToText();
       } catch {}
 
-      const greetText = greetingFor(companionName);
-      const voiceId = getElevenVoiceIdForAvatar(companionName);
-
       const hooks: SpeakAssistantHooks = {
-        onWillSpeak: () => {
-          // Pause STT so we don't capture the greeting itself.
-          try {
-            pauseSpeechToText();
-          } catch {}
-
-          // Safety: also block any backend STT restarts during the greeting.
-          sttIgnoreUntilRef.current = performance.now() + 10 * 60 * 1000;
-        },
+        onWillSpeak: () => {},
         onDidNotSpeak: () => {},
       };
 
-      try {
-        if (mode === "live" && didAgentMgrRef.current) {
-          // speakAssistantReply signature: (text, hooks?)
-          await speakAssistantReply(greetText, hooks);
-        } else {
-          // speakLocalTtsReply signature: (text, voiceId, hooks?)
-          await speakLocalTtsReply(greetText, voiceId, hooks);
-        }
-
-        try {
-          sessionStorage.setItem(key, "1");
-        } catch {}
-      } catch (e) {
-        console.warn("Greeting playback failed:", e);
-      } finally {
-        sttIgnoreUntilRef.current = 0;
-
-        // Resume listening after greeting (only if the user actually has STT enabled).
-        if (sttEnabledRef.current) {
-          const delay = isIOS ? 150 : 0;
-          if (delay) {
-            window.setTimeout(() => {
-              if (sttEnabledRef.current) {
-                resumeSpeechToText();
-              }
-            }, delay);
-          } else {
-            resumeSpeechToText();
-          }
-        }
+      if (mode === "live" && didAgentMgrRef.current) {
+        // Live avatar speaks using the avatar's configured voice
+        await speakAssistantReply(greetText);
+      } else {
+        // Local audio-only (video element on iOS; audio element on desktop)
+        await speakLocalTtsReply(greetText, voiceId, hooks);
       }
-    },
-    [companionName, isIOS, pauseSpeechToText, resumeSpeechToText, speakAssistantReply, speakLocalTtsReply],
-  );
+
+      // Mark spoken ONLY after successful playback.
+      try {
+        sessionStorage.setItem(key, "1");
+      } catch {}
+    } catch (e) {
+      // Allow retry later if something failed.
+      try {
+        sessionStorage.removeItem(key);
+      } catch {}
+      console.warn("Greeting playback failed:", e);
+    } finally {
+      sttIgnoreUntilRef.current = prevIgnore;
+      greetInFlightRef.current = false;
+      try {
+        await resumeSpeechToText();
+      } catch {}
+    }
+  },
+  [companionName, phase1AvatarMedia, pauseSpeechToText, resumeSpeechToText, speakAssistantReply, speakLocalTtsReply],
+);
 
   // Auto-play the greeting once the Live Avatar is connected.
   useEffect(() => {
@@ -2764,7 +2764,7 @@ const pauseSpeechToText = useCallback(() => {
     [abortBackendStt, clearSttSilenceTimer, resetSpeechRecognition]
   );
 
-  const startSpeechToText = useCallback(async (opts?: { forceBrowser?: boolean }) => {
+  const startSpeechToText = useCallback(async (opts?: { forceBrowser?: boolean; suppressGreeting?: boolean }) => {
     const forceBrowser = !!opts?.forceBrowser;
     primeLocalTtsAudio();
 
@@ -2785,7 +2785,7 @@ const pauseSpeechToText = useCallback(() => {
         return;
       }
       resumeSpeechToText();
-      if (!liveAvatarActive) void speakGreetingIfNeeded("audio");
+      if (!liveAvatarActive && !opts?.suppressGreeting) void speakGreetingIfNeeded("audio");
       return;
     }
 
@@ -2811,7 +2811,7 @@ const pauseSpeechToText = useCallback(() => {
     }
 
     resumeSpeechToText();
-    if (!liveAvatarActive) void speakGreetingIfNeeded("audio");
+    if (!liveAvatarActive && !opts?.suppressGreeting) void speakGreetingIfNeeded("audio");
   }, [
     ensureSpeechRecognition,
     kickBackendStt,
@@ -2829,7 +2829,7 @@ const pauseSpeechToText = useCallback(() => {
     // If STT isn't running (permission denied or stopped), we try to start it again.
     if (liveAvatarActive) {
       if (!sttEnabledRef.current) {
-        await startSpeechToText({ forceBrowser: true });
+        await startSpeechToText({ forceBrowser: true, suppressGreeting: true });
       }
       return;
     }
@@ -3040,7 +3040,7 @@ const pauseSpeechToText = useCallback(() => {
         ref={localTtsVideoRef}
         playsInline
         preload="auto"
-        style={{ position: "absolute", width: 1, height: 1, left: -9999, top: -9999, opacity: 0 }}
+        style={{ position: "fixed", left: 0, bottom: 0, width: 1, height: 1, opacity: 0, pointerEvents: "none", zIndex: -1 }}
       />
       <header style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 10 }}>
         <div aria-hidden onClick={secretDebugTap} style={{ width: 56, height: 56, borderRadius: "50%", overflow: "hidden" }}>
@@ -3099,7 +3099,7 @@ const pauseSpeechToText = useCallback(() => {
               }
 
               if (!sttEnabledRef.current) {
-                await startSpeechToText({ forceBrowser: true });
+                await startSpeechToText({ forceBrowser: true, suppressGreeting: true });
               }
 
               // If mic permission was denied, don't start Live Avatar.
