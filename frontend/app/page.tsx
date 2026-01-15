@@ -3,6 +3,33 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import havenHeart from "../public/ai-haven-heart.png";
 
+
+const PlayIcon = ({ size = 18 }: { size?: number }) => (
+  <svg
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    aria-hidden="true"
+    focusable="false"
+    style={{ display: "block" }}
+  >
+    <path d="M8 5v14l11-7z" fill="currentColor" />
+  </svg>
+);
+
+const PauseIcon = ({ size = 18 }: { size?: number }) => (
+  <svg
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    aria-hidden="true"
+    focusable="false"
+    style={{ display: "block" }}
+  >
+    <path d="M6 5h4v14H6zM14 5h4v14h-4z" fill="currentColor" />
+  </svg>
+);
+
 type Role = "user" | "assistant";
 type Msg = { role: Role; content: string };
 
@@ -2912,8 +2939,8 @@ const pauseSpeechToText = useCallback(() => {
       {avatarStatus === "connected" ||
       avatarStatus === "connecting" ||
       avatarStatus === "reconnecting"
-        ? "⏸"
-        : "📹"}
+        ? <PauseIcon />
+        : <PlayIcon />}
     </button>
 
     {/* When a Live Avatar is available, place mic/stop controls to the right of Start Live Avatar */}
