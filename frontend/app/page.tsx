@@ -2950,11 +2950,13 @@ const pauseSpeechToText = useCallback(() => {
       Live Avatar: <b>{avatarStatus}</b>
       {avatarError ? <span style={{ color: "#b00020" }}> — {avatarError}</span> : null}
     </div>
+    <div style={{ marginLeft: "auto" }}>{modePillControls}</div>
   </section>
 ) : (
   <section style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12, flexWrap: "wrap" }}>
     {/* When no Live Avatar is available, show mic/stop controls in the Live Avatar button location */}
     {sttControls}
+    <div style={{ marginLeft: "auto" }}>{modePillControls}</div>
   </section>
 )}
 
@@ -3086,8 +3088,6 @@ const pauseSpeechToText = useCallback(() => {
             >
               Send
             </button>
-
-            {modePillControls}
 
           </div>
 
