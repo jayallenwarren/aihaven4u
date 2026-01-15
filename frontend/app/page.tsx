@@ -2881,9 +2881,6 @@ const pauseSpeechToText = useCallback(() => {
       )}
     </div>
   );
-      })}
-    </div>
-  );
 
   return (
     <main style={{ maxWidth: 880, margin: "24px auto", padding: "0 16px", fontFamily: "system-ui" }}>
