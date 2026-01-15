@@ -2858,11 +2858,8 @@ const pauseSpeechToText = useCallback(() => {
             Set Mode
           </button>
 
-          <button
-            type="button"
-            onClick={() => {
-              window.location.href = "https://www.aihaven4u.com/myhaven";
-            }}
+          <a
+            href="https://www.aihaven4u.com/myhaven"
             style={{
               padding: "10px 14px",
               borderRadius: 10,
@@ -2874,10 +2871,11 @@ const pauseSpeechToText = useCallback(() => {
               whiteSpace: "nowrap",
               display: "inline-flex",
               alignItems: "center",
+              textDecoration: "none",
             }}
           >
             Switch Companion
-          </button>
+          </a>
         </div>
       ) : (
         modePills.map((m) => {
