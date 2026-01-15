@@ -2778,26 +2778,26 @@ const pauseSpeechToText = useCallback(() => {
         🎤
       </button>
 
-      {sttEnabled ? (
-        <button
-          type="button"
-          onClick={stopHandsFreeSTT}
-          title="Stop listening"
-          style={{
-            width: 44,
-            minWidth: 44,
-            borderRadius: 10,
-            border: "1px solid #111",
-            background: "#fff",
-            color: "#111",
-            cursor: "pointer",
-            fontWeight: 700,
-          }}
-        >
-          ■
-        </button>
-      ) : null}
-    </>
+      <button
+        type="button"
+        onClick={stopHandsFreeSTT}
+        disabled={!sttEnabled}
+        title="Stop listening"
+        style={{
+          width: 44,
+          minWidth: 44,
+          borderRadius: 10,
+          border: "1px solid #111",
+          background: "#fff",
+          color: "#111",
+          cursor: sttEnabled ? "pointer" : "not-allowed",
+          opacity: sttEnabled ? 1 : 0.45,
+          fontWeight: 700,
+        }}
+      >
+        ■
+      </button>
+</>
   );
 
   const modePillControls = (
