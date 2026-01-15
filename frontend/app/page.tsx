@@ -1475,6 +1475,7 @@ const speakAssistantReply = useCallback(
   });
 
   const [planName, setPlanName] = useState<PlanName>(null);
+  const [showModePicker, setShowModePicker] = useState(false);
   const [allowedModes, setAllowedModes] = useState<Mode[]>(["friend"]);
 
   const modePills = useMemo(() => ["friend", "romantic", "intimate"] as const, []);
@@ -2829,31 +2830,57 @@ const pauseSpeechToText = useCallback(() => {
 
   const modePillControls = (
     <div style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "flex-end" }}>
-      {modePills.map((m) => {
-        const active = effectiveActiveMode === m;
-        const disabled = !allowedModes.includes(m);
-        return (
-          <button
-            key={m}
-            disabled={disabled}
-            onClick={() => {
-              if (disabled) return showUpgradeMessage(m);
-              setModeFromPill(m);
-            }}
-            style={{
-              padding: "8px 12px",
-              borderRadius: 999,
-              border: "1px solid #ddd",
-              background: active ? "#111" : "#fff",
-              color: active ? "#fff" : "#111",
-              opacity: disabled ? 0.45 : 1,
-              cursor: disabled ? "not-allowed" : "pointer",
-              whiteSpace: "nowrap",
-            }}
-          >
-            {MODE_LABELS[m]}
-          </button>
-        );
+      {!showModePicker ? (
+        <button
+          type="button"
+          onClick={() => setShowModePicker(true)}
+          style={{
+            padding: "8px 12px",
+            borderRadius: 10,
+            border: "1px solid #111",
+            background: "#111",
+            color: "#fff",
+            cursor: "pointer",
+            fontWeight: 700,
+            whiteSpace: "nowrap",
+          }}
+        >
+          Set Mode
+        </button>
+      ) : (
+        modePills.map((m) => {
+          const active = effectiveActiveMode === m;
+          const disabled = !allowedModes.includes(m);
+          return (
+            <button
+              key={m}
+              disabled={disabled}
+              onClick={() => {
+                if (disabled) {
+                  showUpgradeMessage(m);
+                } else {
+                  setModeFromPill(m);
+                }
+                setShowModePicker(false);
+              }}
+              style={{
+                padding: "8px 12px",
+                borderRadius: 999,
+                border: "1px solid #ddd",
+                background: active ? "#111" : "#fff",
+                color: active ? "#fff" : "#111",
+                opacity: disabled ? 0.45 : 1,
+                cursor: disabled ? "not-allowed" : "pointer",
+                whiteSpace: "nowrap",
+              }}
+            >
+              {MODE_LABELS[m]}
+            </button>
+          );
+        })
+      )}
+    </div>
+  );
       })}
     </div>
   );
@@ -2950,14 +2977,12 @@ const pauseSpeechToText = useCallback(() => {
       Live Avatar: <b>{avatarStatus}</b>
       {avatarError ? <span style={{ color: "#b00020" }}> — {avatarError}</span> : null}
     </div>
-    <div style={{ marginLeft: "auto" }}>{modePillControls}</div>
-  </section>
+      </section>
 ) : (
   <section style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12, flexWrap: "wrap" }}>
     {/* When no Live Avatar is available, show mic/stop controls in the Live Avatar button location */}
     {sttControls}
-    <div style={{ marginLeft: "auto" }}>{modePillControls}</div>
-  </section>
+      </section>
 )}
 
 
@@ -3028,6 +3053,10 @@ const pauseSpeechToText = useCallback(() => {
             flexDirection: "column",
           }}
         >
+          <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 12 }}>
+            {modePillControls}
+          </div>
+
           <div
             ref={messagesBoxRef}
             style={{
