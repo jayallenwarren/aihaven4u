@@ -1595,7 +1595,7 @@ useEffect(() => {
     const modeLabel = MODE_LABELS[requestedMode];
     const msg =
       `The requested mode (${modeLabel}) isn't available on your current plan. ` +
-      `Please upgrade here: ${UPGRADE_URL}`;
+      `Please upgrade here: ${UPGRADE_URL} or click the upgrade button below the text input box`;
 
     setMessages((prev) => [...prev, { role: "assistant", content: msg }]);
   }
@@ -2828,25 +2828,51 @@ const pauseSpeechToText = useCallback(() => {
 </>
   );
 
+  
   const modePillControls = (
     <div style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "flex-end" }}>
       {!showModePicker ? (
-        <button
-          type="button"
-          onClick={() => setShowModePicker(true)}
-          style={{
-            padding: "8px 12px",
-            borderRadius: 10,
-            border: "1px solid #111",
-            background: "#111",
-            color: "#fff",
-            cursor: "pointer",
-            fontWeight: 700,
-            whiteSpace: "nowrap",
-          }}
-        >
-          Set Mode
-        </button>
+        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+          <button
+            type="button"
+            onClick={() => setShowModePicker(true)}
+            style={{
+              padding: "10px 14px",
+              borderRadius: 10,
+              border: "1px solid #111",
+              background: "#fff",
+              color: "#111",
+              cursor: "pointer",
+              fontWeight: 400,
+              whiteSpace: "nowrap",
+              display: "inline-flex",
+              alignItems: "center",
+            }}
+          >
+            Set Mode
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              window.location.href = "https://www.aihaven4u.com/myhaven";
+            }}
+            style={{
+              padding: "10px 14px",
+              borderRadius: 10,
+              border: "1px solid #111",
+              background: "#fff",
+              color: "#111",
+              cursor: "pointer",
+              fontWeight: 400,
+              whiteSpace: "nowrap",
+              display: "inline-flex",
+              alignItems: "center",
+            }}
+          >
+            Switch Companion
+          </button>
+        </div>
       ) : (
         modePills.map((m) => {
           const active = effectiveActiveMode === m;
@@ -2877,6 +2903,11 @@ const pauseSpeechToText = useCallback(() => {
               {MODE_LABELS[m]}
             </button>
           );
+        })
+      )}
+    </div>
+  );
+
         })
       )}
     </div>
