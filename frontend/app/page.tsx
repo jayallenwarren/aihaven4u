@@ -2699,8 +2699,10 @@ const pauseSpeechToText = useCallback(() => {
 
       try {
         if (mode === "live" && didAgentMgrRef.current) {
-          await speakAssistantReply(greetText, voiceId, hooks);
+          // speakAssistantReply signature: (text, hooks?)
+          await speakAssistantReply(greetText, hooks);
         } else {
+          // speakLocalTtsReply signature: (text, voiceId, hooks?)
           await speakLocalTtsReply(greetText, voiceId, hooks);
         }
 
