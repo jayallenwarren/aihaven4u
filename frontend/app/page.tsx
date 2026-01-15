@@ -2912,8 +2912,8 @@ const pauseSpeechToText = useCallback(() => {
       {avatarStatus === "connected" ||
       avatarStatus === "connecting" ||
       avatarStatus === "reconnecting"
-        ? "Stop Live Avatar"
-        : "Start Live Avatar"}
+        ? "⏸"
+        : "📹"}
     </button>
 
     {/* When a Live Avatar is available, place mic/stop controls to the right of Start Live Avatar */}
