@@ -1478,6 +1478,33 @@ const speakAssistantReply = useCallback(
   const [showModePicker, setShowModePicker] = useState(false);
   const [allowedModes, setAllowedModes] = useState<Mode[]>(["friend"]);
 
+  const goToMyHaven = useCallback(() => {
+    const url = "https://www.aihaven4u.com/myhaven";
+
+    // If running inside an iframe, attempt to navigate the *top* browsing context
+    // so we leave the embed and avoid “stacked headers”.
+    try {
+      if (window.top && window.top !== window.self) {
+        window.top.location.href = url;
+        return;
+      }
+    } catch {
+      // Cross-origin access to window.top can throw.
+    }
+
+    // Alternate attempt that may still target the top browsing context.
+    try {
+      window.open(url, "_top");
+      return;
+    } catch {
+      // ignore
+    }
+
+    // Fallback: navigate the current frame.
+    window.location.href = url;
+  }, []);
+
+
   const modePills = useMemo(() => ["friend", "romantic", "intimate"] as const, []);
   const messagesBoxRef = useRef<HTMLDivElement>(null);
 
@@ -2861,10 +2888,7 @@ const pauseSpeechToText = useCallback(() => {
 
           <button
             type="button"
-            onClick={() => {
-              // Force full navigation in the same tab (not client-side “soft” navigation).
-              window.location.assign("https://www.aihaven4u.com/myhaven");
-            }}
+            onClick={goToMyHaven}
             style={{
               padding: "10px 14px",
               borderRadius: 10,
