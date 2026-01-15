@@ -2747,6 +2747,90 @@ const pauseSpeechToText = useCallback(() => {
       } catch {}
     };
   }, []);
+
+  // UI controls (layout-only): reused in multiple locations without changing logic.
+  const sttControls = (
+    <>
+      <button
+        type="button"
+        onClick={toggleSpeechToText}
+        disabled={(!sttEnabled && loading) || (liveAvatarActive && sttEnabled)}
+        title={
+          liveAvatarActive
+            ? sttEnabled
+              ? "Mic is required in Live Avatar (use Stop to end)"
+              : "Enable microphone (required for Live Avatar)"
+            : sttEnabled
+              ? "Stop speech-to-text"
+              : "Start speech-to-text"
+        }
+        style={{
+          width: 44,
+          minWidth: 44,
+          borderRadius: 10,
+          border: "1px solid #111",
+          background: sttEnabled ? "#b00020" : "#fff",
+          color: sttEnabled ? "#fff" : "#111",
+          cursor: "pointer",
+          fontWeight: 700,
+        }}
+      >
+        🎤
+      </button>
+
+      {sttEnabled ? (
+        <button
+          type="button"
+          onClick={stopHandsFreeSTT}
+          title="Stop listening"
+          style={{
+            width: 44,
+            minWidth: 44,
+            borderRadius: 10,
+            border: "1px solid #111",
+            background: "#fff",
+            color: "#111",
+            cursor: "pointer",
+            fontWeight: 700,
+          }}
+        >
+          ■
+        </button>
+      ) : null}
+    </>
+  );
+
+  const modePillControls = (
+    <div style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "flex-end" }}>
+      {modePills.map((m) => {
+        const active = effectiveActiveMode === m;
+        const disabled = !allowedModes.includes(m);
+        return (
+          <button
+            key={m}
+            disabled={disabled}
+            onClick={() => {
+              if (disabled) return showUpgradeMessage(m);
+              setModeFromPill(m);
+            }}
+            style={{
+              padding: "8px 12px",
+              borderRadius: 999,
+              border: "1px solid #ddd",
+              background: active ? "#111" : "#fff",
+              color: active ? "#fff" : "#111",
+              opacity: disabled ? 0.45 : 1,
+              cursor: disabled ? "not-allowed" : "pointer",
+              whiteSpace: "nowrap",
+            }}
+          >
+            {MODE_LABELS[m]}
+          </button>
+        );
+      })}
+    </div>
+  );
+
   return (
     <main style={{ maxWidth: 880, margin: "24px auto", padding: "0 16px", fontFamily: "system-ui" }}>
       {/* Hidden audio element for audio-only TTS (mic mode) */}
@@ -2786,36 +2870,7 @@ const pauseSpeechToText = useCallback(() => {
         </div>
       </header>
 
-      <section style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
-        {modePills.map((m) => {
-          const active = effectiveActiveMode === m;
-          const disabled = !allowedModes.includes(m);
-          return (
-            <button
-              key={m}
-              disabled={disabled}
-              onClick={() => {
-                if (disabled) return showUpgradeMessage(m);
-                setModeFromPill(m);
-              }}
-              style={{
-                padding: "8px 12px",
-                borderRadius: 999,
-                border: "1px solid #ddd",
-                background: active ? "#111" : "#fff",
-                color: active ? "#fff" : "#111",
-                opacity: disabled ? 0.45 : 1,
-                cursor: disabled ? "not-allowed" : "pointer",
-              }}
-            >
-              {MODE_LABELS[m]}
-            </button>
-          );
-        })}
-      </section>
-
-
-{phase1AvatarMedia && (
+{phase1AvatarMedia ? (
   <section style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12, flexWrap: "wrap" }}>
     <button
       onClick={() => {
@@ -2861,12 +2916,21 @@ const pauseSpeechToText = useCallback(() => {
         : "Start Live Avatar"}
     </button>
 
+    {/* When a Live Avatar is available, place mic/stop controls to the right of Start Live Avatar */}
+    {sttControls}
+
     <div style={{ fontSize: 12, color: "#666" }}>
       Live Avatar: <b>{avatarStatus}</b>
       {avatarError ? <span style={{ color: "#b00020" }}> — {avatarError}</span> : null}
     </div>
   </section>
+) : (
+  <section style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12, flexWrap: "wrap" }}>
+    {/* When no Live Avatar is available, show mic/stop controls in the Live Avatar button location */}
+    {sttControls}
+  </section>
 )}
+
 
 
       {/* Conversation area (Avatar + Chat) */}
@@ -2961,54 +3025,8 @@ const pauseSpeechToText = useCallback(() => {
             {loading ? <div style={{ color: "#666" }}>Thinking…</div> : null}
           </div>
 
-          <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
-            <button
-              type="button"
-              onClick={toggleSpeechToText}
-              disabled={(!sttEnabled && loading) || (liveAvatarActive && sttEnabled)}
-              title={
-                liveAvatarActive
-                  ? sttEnabled
-                    ? "Mic is required in Live Avatar (use Stop to end)"
-                    : "Enable microphone (required for Live Avatar)"
-                  : sttEnabled
-                    ? "Stop speech-to-text"
-                    : "Start speech-to-text"
-              }
-              style={{
-                width: 44,
-                minWidth: 44,
-                borderRadius: 10,
-                border: "1px solid #111",
-                background: sttEnabled ? "#b00020" : "#fff",
-                color: sttEnabled ? "#fff" : "#111",
-                cursor: "pointer",
-                fontWeight: 700,
-              }}
-            >
-              🎤
-            </button>
-
-            {sttEnabled ? (
-              <button
-                type="button"
-                onClick={stopHandsFreeSTT}
-                title="Stop listening"
-                style={{
-                  width: 44,
-                  minWidth: 44,
-                  borderRadius: 10,
-                  border: "1px solid #111",
-                  background: "#fff",
-                  color: "#111",
-                  cursor: "pointer",
-                  fontWeight: 700,
-                }}
-              >
-                ■
-              </button>
-            ) : null}
-
+          <div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap", alignItems: "center" }}>
+            {/** Input line with mode pills moved to the right (layout-only). */}
             <input
               value={input}
               onChange={(e) => setInput(e.target.value)}
@@ -3027,6 +3045,9 @@ const pauseSpeechToText = useCallback(() => {
               }}
             />
 
+            {modePillControls}
+
+
             <button
               onClick={() => send()}
               disabled={loading}
@@ -3043,7 +3064,10 @@ const pauseSpeechToText = useCallback(() => {
             </button>
           </div>
 
-          {sttError ? (
+          {sttError
+          </div>
+
+ ? (
             <div style={{ marginTop: 6, fontSize: 12, color: "#b00020" }}>{sttError}</div>
           ) : null}
         </div>
