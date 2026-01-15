@@ -1475,7 +1475,9 @@ const speakAssistantReply = useCallback(
   });
 
   const [planName, setPlanName] = useState<PlanName>(null);
-  const [showModePicker, setShowModePicker] = useState(false);
+  const \[showModePicker, setShowModePicker\] = useState\(false\);
+  const [setModeFlash, setSetModeFlash] = useState(false);
+  const [switchCompanionFlash, setSwitchCompanionFlash] = useState(false);
   const [allowedModes, setAllowedModes] = useState<Mode[]>(["friend"]);
 
   const goToMyHaven = useCallback(() => {
@@ -2868,13 +2870,19 @@ const pauseSpeechToText = useCallback(() => {
         <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
           <button
             type="button"
-            onClick={() => setShowModePicker(true)}
+            onClick={() => {
+              setSetModeFlash(true);
+              window.setTimeout(() => {
+                setShowModePicker(true);
+                setSetModeFlash(false);
+              }, 120);
+            }}
             style={{
               padding: "10px 14px",
               borderRadius: 10,
               border: "1px solid #111",
-              background: "#fff",
-              color: "#111",
+              background: setModeFlash ? "#111" : "#fff",
+              color: setModeFlash ? "#fff" : "#111",
               cursor: "pointer",
               fontWeight: 400,
               whiteSpace: "nowrap",
@@ -2888,13 +2896,19 @@ const pauseSpeechToText = useCallback(() => {
 
           <button
             type="button"
-            onClick={goToMyHaven}
+            onClick={() => {
+              setSwitchCompanionFlash(true);
+              window.setTimeout(() => {
+                goToMyHaven();
+                setSwitchCompanionFlash(false);
+              }, 120);
+            }}
             style={{
               padding: "10px 14px",
               borderRadius: 10,
               border: "1px solid #111",
-              background: "#fff",
-              color: "#111",
+              background: switchCompanionFlash ? "#111" : "#fff",
+              color: switchCompanionFlash ? "#fff" : "#111",
               cursor: "pointer",
               fontWeight: 400,
               whiteSpace: "nowrap",
