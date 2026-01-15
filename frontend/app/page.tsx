@@ -1475,7 +1475,7 @@ const speakAssistantReply = useCallback(
   });
 
   const [planName, setPlanName] = useState<PlanName>(null);
-  const \[showModePicker, setShowModePicker\] = useState\(false\);
+  const [showModePicker, setShowModePicker] = useState(false);
   const [setModeFlash, setSetModeFlash] = useState(false);
   const [switchCompanionFlash, setSwitchCompanionFlash] = useState(false);
   const [allowedModes, setAllowedModes] = useState<Mode[]>(["friend"]);
