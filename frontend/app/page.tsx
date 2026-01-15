@@ -2942,9 +2942,18 @@ const pauseSpeechToText = useCallback(() => {
           ) {
             void stopLiveAvatar();
           } else {
-            if (!sttEnabledRef.current) return;
+            void (async () => {
+              // Live Avatar requires microphone / STT. Start it automatically.
+              // If iOS audio-only backend STT is currently running, restart in browser STT for Live Avatar.
+              if (sttEnabledRef.current && useBackendStt) {
+                stopSpeechToText();
+              }
 
-            (async () => {
+              if (!sttEnabledRef.current) {
+                await startSpeechToText({ forceBrowser: true });
+              }
+
+              // If mic permission was denied, don't start Live Avatar.
               if (!sttEnabledRef.current) return;
 
               await startLiveAvatar();
