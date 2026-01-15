@@ -3045,9 +3045,6 @@ const pauseSpeechToText = useCallback(() => {
               }}
             />
 
-            {modePillControls}
-
-
             <button
               onClick={() => send()}
               disabled={loading}
@@ -3062,6 +3059,9 @@ const pauseSpeechToText = useCallback(() => {
             >
               Send
             </button>
+
+            {modePillControls}
+
           </div>
 
 	          {sttError ? (
