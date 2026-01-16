@@ -182,8 +182,6 @@ function formatDidError(err: any): string {
 
 const UPGRADE_URL = "https://www.aihaven4u.com/pricing-plans/list";
 
-const MEMORY_USER_KEY_STORAGE = "AIHAVEN_MEMORY_USER_KEY";
-
 const MODE_LABELS: Record<Mode, string> = {
   friend: "Friend",
   romantic: "Romantic",
@@ -1512,7 +1510,7 @@ const speakAssistantReply = useCallback(
   useEffect(() => {
     if (typeof window === "undefined") return;
     try {
-      const k = window.localStorage.getItem(MEMORY_USER_KEY_STORAGE);
+      const k = window.localStorage.getItem("AIHAVEN_MEMORY_USER_KEY");
       if (k) memoryUserKeyRef.current = k;
     } catch {}
   }, []);
@@ -1715,17 +1713,6 @@ useEffect(() => {
 
       const data = event.data;
       if (!data || data.type !== "WEEKLY_PLAN") return;
-
-      // If Wix passes a stable member id, use it as memory user_key so summaries sync across devices.
-      // (Requires adding memberId to the Wix Velo payload.)
-      const memberId = typeof (data as any).memberId === "string" ? (data as any).memberId.trim() : "";
-      if (memberId) {
-        memoryUserKeyRef.current = memberId;
-        try {
-          localStorage.setItem(MEMORY_USER_KEY_STORAGE, memberId);
-        } catch {}
-      }
-
 
       const incomingPlan = (data.planName ?? null) as PlanName;
       setPlanName(incomingPlan);
@@ -3041,7 +3028,7 @@ const speakGreetingIfNeeded = useCallback(
       userKey = String(gen);
       memoryUserKeyRef.current = userKey;
       try {
-        window.localStorage.setItem(MEMORY_USER_KEY_STORAGE, userKey);
+        window.localStorage.setItem("AIHAVEN_MEMORY_USER_KEY", userKey);
       } catch {}
     }
 
@@ -3055,7 +3042,7 @@ const speakGreetingIfNeeded = useCallback(
         session_id: sid,
         user_key: userKey,
         companion,
-        relationship_mode: sessionState.mode,
+        relationship_mode: relationshipMode,
         messages: trimmed,
       }),
     });
@@ -3066,7 +3053,7 @@ const speakGreetingIfNeeded = useCallback(
     }
 
     return (await res.json().catch(() => ({}))) as any;
-  }, [API_BASE, companionName, messages, sessionState.mode]);
+  }, [companionName, messages, relationshipMode]);
 
   // After the Clear Messages dialog is dismissed with NO, iOS can sometimes route
   // subsequent audio to the quiet receiver / low-volume path. We "nudge" the
