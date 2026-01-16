@@ -3576,6 +3576,8 @@ const speakGreetingIfNeeded = useCallback(
                   setMessages([]);
                   setInput("");
                   setShowClearMessagesConfirm(false);
+                  // Re-prime audio outputs after a hard stop so Audio TTS doesn't come back quiet (iOS/Safari).
+                  void restoreVolumesAfterClearCancel();
                 }}
                 style={{
                   padding: "10px 14px",
