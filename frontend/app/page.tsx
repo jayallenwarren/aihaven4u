@@ -1714,6 +1714,17 @@ useEffect(() => {
       const data = event.data;
       if (!data || data.type !== "WEEKLY_PLAN") return;
 
+      // If Wix passes a stable member id, use it as memory user_key so summaries sync across devices.
+      // (Requires adding memberId to the Wix Velo payload.)
+      const memberId = typeof (data as any).memberId === "string" ? (data as any).memberId.trim() : "";
+      if (memberId) {
+        memoryUserKeyRef.current = memberId;
+        try {
+          localStorage.setItem(MEMORY_USER_KEY_STORAGE, memberId);
+        } catch {}
+      }
+
+
       const incomingPlan = (data.planName ?? null) as PlanName;
       setPlanName(incomingPlan);
 
@@ -3042,7 +3053,7 @@ const speakGreetingIfNeeded = useCallback(
         session_id: sid,
         user_key: userKey,
         companion,
-        relationship_mode: relationshipMode,
+        relationship_mode: sessionState.mode,
         messages: trimmed,
       }),
     });
@@ -3053,7 +3064,7 @@ const speakGreetingIfNeeded = useCallback(
     }
 
     return (await res.json().catch(() => ({}))) as any;
-  }, [companionName, messages, relationshipMode]);
+  }, [API_BASE, companionName, messages, sessionState.mode]);
 
   // After the Clear Messages dialog is dismissed with NO, iOS can sometimes route
   // subsequent audio to the quiet receiver / low-volume path. We "nudge" the
