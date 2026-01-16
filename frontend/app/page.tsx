@@ -182,6 +182,8 @@ function formatDidError(err: any): string {
 
 const UPGRADE_URL = "https://www.aihaven4u.com/pricing-plans/list";
 
+const MEMORY_USER_KEY_STORAGE = "AIHAVEN_MEMORY_USER_KEY";
+
 const MODE_LABELS: Record<Mode, string> = {
   friend: "Friend",
   romantic: "Romantic",
@@ -1510,7 +1512,7 @@ const speakAssistantReply = useCallback(
   useEffect(() => {
     if (typeof window === "undefined") return;
     try {
-      const k = window.localStorage.getItem("AIHAVEN_MEMORY_USER_KEY");
+      const k = window.localStorage.getItem(MEMORY_USER_KEY_STORAGE);
       if (k) memoryUserKeyRef.current = k;
     } catch {}
   }, []);
@@ -3039,7 +3041,7 @@ const speakGreetingIfNeeded = useCallback(
       userKey = String(gen);
       memoryUserKeyRef.current = userKey;
       try {
-        window.localStorage.setItem("AIHAVEN_MEMORY_USER_KEY", userKey);
+        window.localStorage.setItem(MEMORY_USER_KEY_STORAGE, userKey);
       } catch {}
     }
 
