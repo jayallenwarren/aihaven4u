@@ -5,7 +5,6 @@ import time
 import re
 import uuid
 import hashlib
-import base64
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -31,6 +30,97 @@ except Exception:
 STATUS_SAFE = "safe"
 STATUS_BLOCKED = "explicit_blocked"
 STATUS_ALLOWED = "explicit_allowed"
+
+
+# ---------------------------------------------------------------------------
+# Saved chat summaries ("memory")
+# ---------------------------------------------------------------------------
+
+# In-memory cache to reduce blob reads. Keyed by f"{user_key}::{companion_slug}"
+_MEMORY_CACHE: dict[str, tuple[float, str]] = {}
+
+# Cache TTL in seconds (default 5 minutes)
+_MEMORY_CACHE_TTL_S = int(os.getenv("MEMORY_CACHE_TTL_S", "300"))
+
+def _slugify(val: str) -> str:
+    val = (val or "").strip().lower()
+    if not val:
+        return "unknown"
+    val = re.sub(r"[^a-z0-9]+", "-", val)
+    val = val.strip("-")
+    return val or "unknown"
+
+def _memory_blob_name(user_key: str, companion: str) -> str:
+    # Store JSON in the same container we already have access to (TTS container).
+    # Keeping a stable path makes it easy to recall per-user, per-companion.
+    return f"memory/{_slugify(user_key)}/{_slugify(companion)}/summary.json"
+
+def _memory_cache_key(user_key: str, companion: str) -> str:
+    return f"{user_key}::{_slugify(companion)}"
+
+def _get_memory_from_cache(user_key: str, companion: str) -> str | None:
+    k = _memory_cache_key(user_key, companion)
+    item = _MEMORY_CACHE.get(k)
+    if not item:
+        return None
+    ts, summary = item
+    if (time.time() - ts) > _MEMORY_CACHE_TTL_S:
+        _MEMORY_CACHE.pop(k, None)
+        return None
+    return summary
+
+def _set_memory_cache(user_key: str, companion: str, summary: str) -> None:
+    k = _memory_cache_key(user_key, companion)
+    _MEMORY_CACHE[k] = (time.time(), summary)
+
+def _azure_put_memory_json(blob_name: str, data: dict[str, Any]) -> None:
+    """Store summary JSON in Azure Blob Storage.
+
+    Uses the existing AZURE_STORAGE_CONNECTION_STRING + TTS_CONTAINER settings.
+    """
+    try:
+        from azure.storage.blob import BlobServiceClient, ContentSettings  # type: ignore
+    except Exception as e:
+        raise RuntimeError(f"azure-storage-blob missing: {e}")
+
+    conn = getattr(settings, "AZURE_STORAGE_CONNECTION_STRING", None) or os.getenv(
+        "AZURE_STORAGE_CONNECTION_STRING", ""
+    )
+    if not conn:
+        raise RuntimeError("AZURE_STORAGE_CONNECTION_STRING is not set")
+
+    container = getattr(settings, "TTS_CONTAINER", None) or os.getenv("TTS_CONTAINER", "tts")
+    svc = BlobServiceClient.from_connection_string(conn)
+    blob_client = svc.get_blob_client(container=container, blob=blob_name)
+    payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    blob_client.upload_blob(
+        payload,
+        overwrite=True,
+        content_settings=ContentSettings(content_type="application/json; charset=utf-8"),
+    )
+
+def _azure_get_memory_json(blob_name: str) -> dict[str, Any] | None:
+    try:
+        from azure.storage.blob import BlobServiceClient  # type: ignore
+    except Exception:
+        # If azure blob isn't installed, just treat as missing
+        return None
+
+    conn = getattr(settings, "AZURE_STORAGE_CONNECTION_STRING", None) or os.getenv(
+        "AZURE_STORAGE_CONNECTION_STRING", ""
+    )
+    if not conn:
+        return None
+
+    container = getattr(settings, "TTS_CONTAINER", None) or os.getenv("TTS_CONTAINER", "tts")
+    svc = BlobServiceClient.from_connection_string(conn)
+    blob_client = svc.get_blob_client(container=container, blob=blob_name)
+    try:
+        stream = blob_client.download_blob()
+        raw = stream.readall()
+        return json.loads(raw)
+    except Exception:
+        return None
 
 app = FastAPI(title="AIHaven4U API")
 
@@ -269,9 +359,13 @@ def _to_openai_messages(
     *,
     mode: str,
     intimate_allowed: bool,
-    debug: bool
+    debug: bool,
+    memory_summary: str | None = None,
 ):
     sys = _build_persona_system_prompt(session_state, mode=mode, intimate_allowed=intimate_allowed)
+
+    if memory_summary:
+        sys += "\n\n[SAVED CHAT SUMMARY]\n" + memory_summary + "\n[/SAVED CHAT SUMMARY]\n"
     _dbg(debug, "SYSTEM PROMPT:", sys)
 
     out = [{"role": "system", "content": sys}]
@@ -281,7 +375,7 @@ def _to_openai_messages(
     return out
 
 
-def _call_gpt4o(messages: List[Dict[str, str]]) -> str:
+def _call_gpt4o(messages: List[Dict[str, str]], *, temperature: float | None = None) -> str:
     from openai import OpenAI
 
     api_key = os.getenv("OPENAI_API_KEY")
@@ -289,10 +383,11 @@ def _call_gpt4o(messages: List[Dict[str, str]]) -> str:
         raise RuntimeError("OPENAI_API_KEY is not set")
 
     client = OpenAI(api_key=api_key)
+    temp = float(os.getenv("OPENAI_TEMPERATURE", "0.8")) if temperature is None else float(temperature)
     resp = client.chat.completions.create(
         model=os.getenv("OPENAI_MODEL", "gpt-4o"),
         messages=messages,
-        temperature=float(os.getenv("OPENAI_TEMPERATURE", "0.8")),
+        temperature=temp,
     )
     return (resp.choices[0].message.content or "").strip()
 
@@ -322,6 +417,71 @@ def _extract_voice_id(raw: Dict[str, Any]) -> str:
     ).strip()
 
 
+def _summarize_chat_for_memory(
+    *,
+    companion: str,
+    relationship_mode: str | None,
+    messages: List[Dict[str, str]],
+) -> str:
+    """Create a short 'memory' summary for future conversations.
+
+    This is called only when the user explicitly presses the Save button.
+    """
+
+    comp = (companion or "Assistant").strip() or "Assistant"
+    rel = (relationship_mode or "").strip()
+
+    # Keep only the last N turns to stay under token limits
+    trimmed = [m for m in messages if isinstance(m, dict) and m.get("role") in ("user", "assistant")]
+    trimmed = trimmed[-40:]
+
+    # Flatten into a compact transcript string
+    lines: list[str] = []
+    for m in trimmed:
+        role = m.get("role")
+        text = m.get("content")
+        if not isinstance(text, str):
+            continue
+        t = text.strip()
+        if not t:
+            continue
+        who = "User" if role == "user" else comp
+        # Avoid super-long single entries
+        if len(t) > 2000:
+            t = t[:2000] + "…"
+        lines.append(f"{who}: {t}")
+
+    transcript = "\n".join(lines)
+
+    sys = (
+        "You write a concise memory summary of a chat between a user and an AI companion.\n"
+        "Goal: help the companion personalize future conversations.\n"
+        "Rules:\n"
+        "- Keep it short (<= 900 characters)\n"
+        "- 1 short paragraph + up to 6 bullet points\n"
+        "- Capture stable user facts (preferences, goals, boundaries) and emotional tone\n"
+        "- Do NOT include private identifiers (emails, phone numbers, addresses, full names) even if present\n"
+        "- Do NOT include explicit content; keep it safe and general\n"
+    )
+
+    user_prompt = (
+        f"Companion name: {comp}\n"
+        + (f"Relationship mode: {rel}\n" if rel else "")
+        + "\nConversation (most recent last):\n"
+        + transcript
+        + "\n\nWrite the memory summary now."
+    )
+
+    summary = _call_gpt4o(
+        [
+            {"role": "system", "content": sys},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.2,
+    )
+    return summary.strip()
+
+
 # ----------------------------
 # TTS Helpers (ElevenLabs -> Azure Blob SAS)
 # ----------------------------
@@ -329,14 +489,6 @@ _TTS_CONTAINER = os.getenv("AZURE_TTS_CONTAINER", os.getenv("AZURE_STORAGE_CONTA
 _TTS_BLOB_PREFIX = os.getenv("TTS_BLOB_PREFIX", "audio") or "audio"
 _TTS_SAS_MINUTES = int(os.getenv("TTS_SAS_MINUTES", os.getenv("AZURE_BLOB_SAS_EXPIRY_MINUTES", "30")) or "30")
 
-
-
-# 235ms silent MP3 prefix used to prevent some clients (notably iOS/Safari in embedded contexts)
-# from clipping the first ~200ms of audio when switching from microphone capture to playback.
-# You can tune this without redeploying frontend by setting TTS_LEADING_SILENCE_COPIES (0,1,2...).
-_SILENT_MP3_PREFIX_B64 = "SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjU5LjI3LjEwMAAAAAAAAAAAAAAA//tAwAAAAAAAAAAAAAAAAAAAAAAASW5mbwAAAA8AAAAJAAAEXgBBQUFBQUFBQUFBQVlZWVlZWVlZWVlZcXFxcXFxcXFxcXGIiIiIiIiIiIiIiKCgoKCgoKCgoKCguLi4uLi4uLi4uLjQ0NDQ0NDQ0NDQ0Ojo6Ojo6Ojo6Ojo//////////////8AAAAATGF2YzU5LjM3AAAAAAAAAAAAAAAAJAPMAAAAAAAABF6gwS6ZAAAAAAD/+xDEAAPAAAGkAAAAIAAANIAAAARMQU1FMy4xMDBVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVTEFNRTMuMTAwVVVVVf/7EMQpg8AAAaQAAAAgAAA0gAAABFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVMQU1FMy4xMDBVVVVV//sQxFMDwAABpAAAACAAADSAAAAEVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVX/+xDEfIPAAAGkAAAAIAAANIAAAARVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVf/7EMSmA8AAAaQAAAAgAAA0gAAABFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV//sQxM+DwAABpAAAACAAADSAAAAEVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVX/+xDE1gPAAAGkAAAAIAAANIAAAARVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVf/7EMTWA8AAAaQAAAAgAAA0gAAABFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV//sQxNYDwAABpAAAACAAADSAAAAEVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU="
-_SILENT_MP3_PREFIX_BYTES = base64.b64decode(_SILENT_MP3_PREFIX_B64)
-_TTS_LEADING_SILENCE_COPIES = max(0, int(os.getenv("TTS_LEADING_SILENCE_COPIES", "1") or "1"))
 
 def _tts_blob_name(session_id: str, voice_id: str, text: str) -> str:
     safe_session = re.sub(r"[^A-Za-z0-9_-]", "_", (session_id or "session"))[:64]
@@ -371,10 +523,7 @@ def _elevenlabs_tts_mp3_bytes(voice_id: str, text: str) -> bytes:
         raise RuntimeError(f"ElevenLabs error {r.status_code}: {(r.text or '')[:400]}")
     if not r.content:
         raise RuntimeError("ElevenLabs returned empty audio")
-    audio_bytes = r.content
-    if _TTS_LEADING_SILENCE_COPIES:
-        audio_bytes = (_SILENT_MP3_PREFIX_BYTES * _TTS_LEADING_SILENCE_COPIES) + audio_bytes
-    return audio_bytes
+    return r.content
 
 
 def _azure_upload_mp3_and_get_sas_url(blob_name: str, mp3_bytes: bytes) -> str:
@@ -576,6 +725,25 @@ async def chat(request: Request):
         f"user_requesting_intimate={user_requesting_intimate} intimate_allowed={intimate_allowed} pending={pending} voice_id={'yes' if voice_id else 'no'}",
     )
 
+    # Load saved summary (memory) for this user+companion, if available.
+    user_key = (
+        str(raw.get("user_key") or raw.get("user_id") or raw.get("member_id") or raw.get("wix_user_id") or "").strip()
+        or session_id
+    )
+    companion_for_memory = (
+        str(
+            session_state.get("companion")
+            or session_state.get("companionName")
+            or session_state.get("companion_name")
+            or ""
+        ).strip()
+    )
+    memory_summary = None
+    if companion_for_memory:
+        memory_summary = _memory_load_summary(user_key, companion_for_memory)
+        if memory_summary:
+            _dbg(debug, f"Loaded saved summary for {companion_for_memory} ({len(memory_summary)} chars)")
+
     # call model
     try:
         assistant_reply = _call_gpt4o(
@@ -585,6 +753,7 @@ async def chat(request: Request):
                 mode=effective_mode,
                 intimate_allowed=intimate_allowed,
                 debug=debug,
+                memory_summary=memory_summary,
             )
         )
     except Exception as e:
@@ -703,3 +872,83 @@ async def stt_transcribe(request: Request):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"STT transcription failed: {e}")
+
+
+# --------------------------
+# Memory (Saved chat summaries)
+# --------------------------
+
+@app.post("/memory/save")
+async def memory_save(request: Request):
+    """Save a condensed summary of the current chat for future personalization.
+
+    This is keyed by:
+      - user_key (preferred) OR
+      - session_id (fallback)
+    plus the selected companion.
+
+    The frontend may omit user_key; in that case memory is scoped to the browser session_id.
+    """
+    raw = await request.json()
+
+    session_id = str(raw.get("session_id") or raw.get("sessionId") or "").strip()
+    user_key = str(
+        raw.get("user_key") or raw.get("userKey") or raw.get("user_id") or raw.get("userId") or session_id
+    ).strip()
+    companion = str(raw.get("companion") or raw.get("companionName") or "").strip()
+    relationship_mode = str(raw.get("relationship_mode") or raw.get("relationship") or "").strip() or None
+    messages = raw.get("messages") or []
+
+    if not user_key:
+        raise HTTPException(status_code=400, detail="user_key (or session_id) is required")
+    if not companion:
+        raise HTTPException(status_code=400, detail="companion is required")
+    if not isinstance(messages, list):
+        raise HTTPException(status_code=400, detail="messages must be a list")
+
+    # Sanitize / trim messages
+    safe_messages: List[Dict[str, str]] = []
+    for m in messages[-60:]:
+        if not isinstance(m, dict):
+            continue
+        role = str(m.get("role") or "").strip()
+        content = m.get("content")
+        if role not in ("user", "assistant"):
+            continue
+        if not isinstance(content, str):
+            continue
+        c = content.strip()
+        if not c:
+            continue
+        safe_messages.append({"role": role, "content": c})
+
+    if not safe_messages:
+        raise HTTPException(status_code=400, detail="No valid messages to summarize")
+
+    summary = _summarize_chat_for_memory(companion=companion, relationship_mode=relationship_mode, messages=safe_messages)
+    meta = {
+        "session_id": session_id,
+        "companion": companion,
+        "relationship_mode": relationship_mode,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    ok = _memory_save_summary(user_key=user_key, companion=companion, summary=summary, meta=meta)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to persist summary")
+
+    return {"ok": True, "user_key": user_key, "companion": companion, "summary": summary}
+
+
+@app.get("/memory/get")
+async def memory_get(session_id: str, companion: str, user_key: str | None = None):
+    key = (user_key or session_id or "").strip()
+    comp = (companion or "").strip()
+    if not key:
+        raise HTTPException(status_code=400, detail="session_id or user_key is required")
+    if not comp:
+        raise HTTPException(status_code=400, detail="companion is required")
+
+    summary = _memory_load_summary(user_key=key, companion=comp)
+    return {"ok": True, "user_key": key, "companion": comp, "summary": summary}
+
