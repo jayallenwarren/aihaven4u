@@ -2867,6 +2867,7 @@ const speakGreetingIfNeeded = useCallback(
   const startSpeechToText = useCallback(async (opts?: { forceBrowser?: boolean; suppressGreeting?: boolean }) => {
     const forceBrowser = !!opts?.forceBrowser;
     primeLocalTtsAudio();
+    void ensureIphoneAudioContextUnlocked();
 
     sttEnabledRef.current = true;
     sttPausedRef.current = false;
@@ -2931,6 +2932,7 @@ const speakGreetingIfNeeded = useCallback(
     liveAvatarActive,
     maybePlayPendingGreeting,
     primeLocalTtsAudio,
+    ensureIphoneAudioContextUnlocked,
     requestMicPermission,
     resumeSpeechToText,
     speakGreetingIfNeeded,
@@ -2986,6 +2988,10 @@ const speakGreetingIfNeeded = useCallback(
   // audio session back to normal playback volume and ensure our media elements
   // are not left muted/low.
   const restoreVolumesAfterClearCancel = useCallback(async () => {
+    // Re-prime audio routing on cancel (silent). Helps iOS recover speaker route/volume.
+    try { primeLocalTtsAudio(); } catch {}
+    try { void ensureIphoneAudioContextUnlocked(); } catch {}
+
     // Always ensure elements are at normal volume/mute state.
     try {
       if (avatarVideoRef.current) {
@@ -3041,7 +3047,7 @@ const speakGreetingIfNeeded = useCallback(
         src.stop(ctx.currentTime + dur);
       } catch {}
     } catch {}
-  }, [isIOS]);
+  }, [isIOS, primeLocalTtsAudio, ensureIphoneAudioContextUnlocked]);
 
 
   // Cleanup
