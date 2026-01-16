@@ -1506,6 +1506,8 @@ const speakAssistantReply = useCallback(
   const [input, setInput] = useState("");
   const [messages, setMessages] = useState<Msg[]>([]);
   const [loading, setLoading] = useState(false);
+  const [showClearMessagesConfirm, setShowClearMessagesConfirm] = useState(false);
+  const clearEpochRef = useRef(0);
 
   const [chatStatus, setChatStatus] = useState<ChatStatus>("safe");
 
@@ -1580,6 +1582,15 @@ const speakAssistantReply = useCallback(
   const [sttEnabled, setSttEnabled] = useState(false);
   const [sttRunning, setSttRunning] = useState(false);
   const [sttError, setSttError] = useState<string | null>(null);
+  // Track whether the user has already granted microphone access in this session.
+  // On iOS Web Speech, this becomes true on SpeechRecognition.onstart (after the permission prompt).
+  const [micGranted, setMicGranted] = useState(false);
+  const micGrantedRef = useRef<boolean>(false);
+
+  // If a voice greeting is requested before mic permission is granted, we queue it here and
+  // play it as soon as both mic permission + (for live) the avatar connection are ready.
+  const pendingGreetingModeRef = useRef<("live" | "audio") | null>(null);
+
 
   // iOS: prefer backend STT (MediaRecorder → /stt/transcribe) for **audio-only** mode.
   // Browser SpeechRecognition can be flaky on iOS (especially after auto-restarts).
@@ -1591,6 +1602,10 @@ const speakAssistantReply = useCallback(
   const [, setSttFinal] = useState<string>("");
 
   const sttEnabledRef = useRef<boolean>(false);
+  useEffect(() => {
+    micGrantedRef.current = micGranted;
+  }, [micGranted]);
+
   const sttPausedRef = useRef<boolean>(false);
   // Backend STT (iOS-safe): record mic audio via getUserMedia + MediaRecorder and transcribe server-side.
   const backendSttInFlightRef = useRef<boolean>(false);
@@ -1808,6 +1823,10 @@ const stateToSendWithCompanion: SessionState = {
     const rawText = (textOverride ?? input).trim();
     if (!rawText) return;
 
+    // If the user clears messages mid-flight, we "invalidate" any in-progress send()
+    // so the assistant reply doesn't append into a cleared chat.
+    const epochAtStart = clearEpochRef.current;
+
     // detect mode switch from prompt text
     const { mode: detectedMode, cleaned } = detectModeSwitchAndClean(rawText);
 
@@ -1872,6 +1891,10 @@ const stateToSendWithCompanion: SessionState = {
     try {
       const sendState: SessionState = { ...nextState, ...(stateOverride || {}) };
       const data = await callChat(nextMessages, sendState);
+
+      // If the user hit "Clear Messages" while we were waiting on the response,
+      // ignore this result and do not append it to a cleared chat.
+      if (epochAtStart !== clearEpochRef.current) return;
 
       // status from backend (safe/explicit_blocked/explicit_allowed)
       if (data.mode === "safe" || data.mode === "explicit_blocked" || data.mode === "explicit_allowed") {
@@ -2006,6 +2029,7 @@ const stateToSendWithCompanion: SessionState = {
         });
       }
     } catch (err: any) {
+      if (epochAtStart !== clearEpochRef.current) return;
       setMessages((prev) => [
         ...prev,
         { role: "assistant", content: `Error: ${err?.message ?? "Unknown error"}` },
@@ -2462,6 +2486,10 @@ const pauseSpeechToText = useCallback(() => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       stream.getTracks().forEach((t) => t.stop());
+
+      // Mic permission is granted once getUserMedia succeeds.
+      micGrantedRef.current = true;
+      setMicGranted(true);
       return true;
     } catch (e: any) {
       console.warn("Mic permission denied/unavailable:", e);
@@ -2518,6 +2546,9 @@ const pauseSpeechToText = useCallback(() => {
     rec.onstart = () => {
       setSttRunning(true);
       setSttError(null);
+
+      micGrantedRef.current = true;
+      setMicGranted(true);
       // reset audio-capture fail window on successful start
       sttAudioCaptureFailsRef.current = 0;
       sttLastAudioCaptureAtRef.current = 0;
@@ -2778,12 +2809,35 @@ const speakGreetingIfNeeded = useCallback(
   [companionName, phase1AvatarMedia, pauseSpeechToText, resumeSpeechToText, speakAssistantReply, speakLocalTtsReply],
 );
 
-  // Auto-play the greeting once the Live Avatar is connected.
+  const maybePlayPendingGreeting = useCallback(async () => {
+    const mode = pendingGreetingModeRef.current;
+    if (!mode) return;
+    if (!micGrantedRef.current) return;
+
+    // Live Avatar greeting must wait until the agent is fully connected.
+    if (mode === "live") {
+      if (avatarStatus !== "connected" || !didAgentMgrRef.current) return;
+    }
+
+    // Clear first so we don't re-enter if something throws.
+    pendingGreetingModeRef.current = null;
+    await speakGreetingIfNeeded(mode);
+  }, [avatarStatus, speakGreetingIfNeeded]);
+
+  // Auto-play the greeting once the Live Avatar is connected, but ONLY after the user has granted mic access.
   useEffect(() => {
     if (!liveAvatarActive) return;
     if (avatarStatus !== "connected") return;
-    void speakGreetingIfNeeded("live");
-  }, [avatarStatus, liveAvatarActive, speakGreetingIfNeeded]);
+
+    pendingGreetingModeRef.current = "live";
+    void maybePlayPendingGreeting();
+  }, [avatarStatus, liveAvatarActive, maybePlayPendingGreeting]);
+
+  // Play any queued greeting as soon as mic access is granted.
+  useEffect(() => {
+    if (!micGranted) return;
+    void maybePlayPendingGreeting();
+  }, [micGranted, maybePlayPendingGreeting]);
 
 
 
@@ -2831,7 +2885,10 @@ const speakGreetingIfNeeded = useCallback(
         return;
       }
       resumeSpeechToText();
-      if (!liveAvatarActive && !opts?.suppressGreeting) void speakGreetingIfNeeded("audio");
+      if (!liveAvatarActive && !opts?.suppressGreeting) {
+        pendingGreetingModeRef.current = "audio";
+        void maybePlayPendingGreeting();
+      }
       return;
     }
 
@@ -2845,7 +2902,14 @@ const speakGreetingIfNeeded = useCallback(
     // iOS/iPadOS: prefer backend STT recorder (more stable than Web Speech)
     // NOTE: When starting Live Avatar, we force browser STT so D-ID voice doesn't rely on backend recorder.
     if (usingBackend) {
-      kickBackendStt();
+      // Backend STT: if we need to play the audio greeting, do it first (after mic is granted),
+      // then resumeSpeechToText() will start the backend recorder.
+      if (!liveAvatarActive && !opts?.suppressGreeting) {
+        pendingGreetingModeRef.current = "audio";
+        void maybePlayPendingGreeting();
+      } else {
+        kickBackendStt();
+      }
       return;
     }
 
@@ -2857,11 +2921,15 @@ const speakGreetingIfNeeded = useCallback(
     }
 
     resumeSpeechToText();
-    if (!liveAvatarActive && !opts?.suppressGreeting) void speakGreetingIfNeeded("audio");
+    if (!liveAvatarActive && !opts?.suppressGreeting) {
+      pendingGreetingModeRef.current = "audio";
+      void maybePlayPendingGreeting();
+    }
   }, [
     ensureSpeechRecognition,
     kickBackendStt,
     liveAvatarActive,
+    maybePlayPendingGreeting,
     primeLocalTtsAudio,
     requestMicPermission,
     resumeSpeechToText,
@@ -2896,6 +2964,22 @@ const speakGreetingIfNeeded = useCallback(
       void stopLiveAvatar();
     }
   }, [liveAvatarActive, stopLiveAvatar, stopLocalTtsPlayback, stopSpeechToText]);
+
+  // Clear Messages (with confirmation)
+  const requestClearMessages = useCallback(() => {
+    // Stop all audio/video + STT immediately on click (even before the user confirms).
+    // This is an overt user action and prevents the assistant from continuing to speak.
+    clearEpochRef.current += 1;
+    setLoading(false);
+
+    try {
+      stopHandsFreeSTT();
+    } catch {
+      // ignore
+    }
+
+    setShowClearMessagesConfirm(true);
+  }, [stopHandsFreeSTT]);
 
   // Cleanup
   useEffect(() => {
@@ -3312,6 +3396,21 @@ const speakGreetingIfNeeded = useCallback(
 
           <div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap", alignItems: "center" }}>
             {/** Input line with mode pills moved to the right (layout-only). */}
+            <button
+              type="button"
+              onClick={requestClearMessages}
+              title="Clear the conversation on screen"
+              style={{
+                padding: "10px 12px",
+                borderRadius: 10,
+                border: "1px solid #bbb",
+                background: "#fff",
+                cursor: "pointer",
+              }}
+            >
+              Clear Messages
+            </button>
+
             <input
               value={input}
               onChange={(e) => setInput(e.target.value)}
@@ -3352,6 +3451,72 @@ const speakGreetingIfNeeded = useCallback(
 	          ) : null}
         </div>
       </section>
+
+      {/* Clear Messages confirmation overlay */}
+      {showClearMessagesConfirm && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.4)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: 16,
+            zIndex: 10000,
+          }}
+        >
+          <div
+            style={{
+              background: "#fff",
+              borderRadius: 12,
+              padding: 16,
+              maxWidth: 520,
+              width: "100%",
+              boxShadow: "0 8px 30px rgba(0,0,0,0.25)",
+            }}
+          >
+            <div style={{ fontSize: 18, fontWeight: 700, marginBottom: 8 }}>Clear messages?</div>
+            <div style={{ fontSize: 14, color: "#333", lineHeight: 1.4 }}>
+              This will clear the conversation on your screen. Audio and video have been stopped.
+            </div>
+
+            <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", marginTop: 14 }}>
+              <button
+                type="button"
+                onClick={() => setShowClearMessagesConfirm(false)}
+                style={{
+                  padding: "10px 14px",
+                  borderRadius: 10,
+                  border: "1px solid #bbb",
+                  background: "#fff",
+                  cursor: "pointer",
+                }}
+              >
+                No
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setMessages([]);
+                  setInput("");
+                  setShowClearMessagesConfirm(false);
+                }}
+                style={{
+                  padding: "10px 14px",
+                  borderRadius: 10,
+                  border: "1px solid #111",
+                  background: "#111",
+                  color: "#fff",
+                  cursor: "pointer",
+                }}
+              >
+                Yes, clear
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
 {/* Consent overlay */}
       {showConsentOverlay && (
