@@ -386,8 +386,6 @@ export default function Page() {
 
 
   const sessionIdRef = useRef<string | null>(null);
-  // Stable key used for saving/recalling chat summaries (stored in localStorage only after user opt-in).
-  const memoryUserKeyRef = useRef<string | null>(null);
 
   // -----------------------
   // Debug overlay (mobile-friendly)
@@ -1506,26 +1504,11 @@ const speakAssistantReply = useCallback(
     sessionIdRef.current = id;
   }, []);
 
-  // Load existing stable memory key (if the user has previously saved a summary on this device)
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    try {
-      const k = window.localStorage.getItem("AIHAVEN_MEMORY_USER_KEY");
-      if (k) memoryUserKeyRef.current = k;
-    } catch {}
-  }, []);
-
   const [input, setInput] = useState("");
   const [messages, setMessages] = useState<Msg[]>([]);
   const [loading, setLoading] = useState(false);
   const [showClearMessagesConfirm, setShowClearMessagesConfirm] = useState(false);
   const clearEpochRef = useRef(0);
-
-  // Save-summary consent modal + status
-  const [showSaveSummaryConfirm, setShowSaveSummaryConfirm] = useState(false);
-  const [isSavingSummary, setIsSavingSummary] = useState(false);
-  const [saveSummaryError, setSaveSummaryError] = useState<string | null>(null);
-  const [saveSummaryToast, setSaveSummaryToast] = useState<string | null>(null);
 
   const [chatStatus, setChatStatus] = useState<ChatStatus>("safe");
 
@@ -1792,7 +1775,6 @@ const stateToSendWithCompanion: SessionState = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         session_id,
-        ...(memoryUserKeyRef.current ? { user_key: memoryUserKeyRef.current } : {}),
         wants_explicit,
         session_state: stateToSendWithCompanion,
         messages: nextMessages.map((m) => ({ role: m.role, content: m.content })),
@@ -3004,57 +2986,6 @@ const speakGreetingIfNeeded = useCallback(
     setShowClearMessagesConfirm(true);
   }, [stopHandsFreeSTT]);
 
-  // Save Summary (with confirmation)
-  const requestSaveSummary = useCallback(() => {
-    setSaveSummaryError(null);
-    setSaveSummaryToast(null);
-    setShowSaveSummaryConfirm(true);
-  }, []);
-
-  const saveChatSummary = useCallback(async () => {
-    const sid = sessionIdRef.current || "anon";
-    const companion = (companionName || "").trim();
-    if (!companion) {
-      throw new Error("No companion is selected (nothing to save).");
-    }
-
-    // Create a stable, device-local key only when the user explicitly chooses to save.
-    let userKey = memoryUserKeyRef.current;
-    if (!userKey) {
-      const gen =
-        typeof crypto !== "undefined" && "randomUUID" in crypto
-          ? (crypto as any).randomUUID()
-          : `mem_${Date.now()}_${Math.random().toString(16).slice(2)}`;
-      userKey = String(gen);
-      memoryUserKeyRef.current = userKey;
-      try {
-        window.localStorage.setItem("AIHAVEN_MEMORY_USER_KEY", userKey);
-      } catch {}
-    }
-
-    // Keep payload small-ish (last ~80 turns) to avoid prompt limits.
-    const trimmed = messages.slice(Math.max(0, messages.length - 80));
-
-    const res = await fetch(`${API_BASE}/memory/save`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        session_id: sid,
-        user_key: userKey,
-        companion,
-        relationship_mode: relationshipMode,
-        messages: trimmed,
-      }),
-    });
-
-    if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      throw new Error(text || `Save failed (${res.status})`);
-    }
-
-    return (await res.json().catch(() => ({}))) as any;
-  }, [companionName, messages, relationshipMode]);
-
   // After the Clear Messages dialog is dismissed with NO, iOS can sometimes route
   // subsequent audio to the quiet receiver / low-volume path. We "nudge" the
   // audio session back to normal playback volume and ensure our media elements
@@ -3120,13 +3051,6 @@ const speakGreetingIfNeeded = useCallback(
       } catch {}
     } catch {}
   }, [isIOS, primeLocalTtsAudio, ensureIphoneAudioContextUnlocked]);
-
-  // Auto-hide save toast
-  useEffect(() => {
-    if (!saveSummaryToast) return;
-    const t = window.setTimeout(() => setSaveSummaryToast(null), 2500);
-    return () => window.clearTimeout(t);
-  }, [saveSummaryToast]);
 
 
   // Cleanup
@@ -3547,41 +3471,16 @@ const speakGreetingIfNeeded = useCallback(
             <button
               type="button"
               onClick={requestClearMessages}
-              title="Delete messages"
-              aria-label="Delete messages"
+              title="Clear the conversation on screen"
               style={{
-                width: 44,
-                height: 44,
-                padding: 0,
+                padding: "10px 12px",
                 borderRadius: 10,
                 border: "1px solid #bbb",
                 background: "#fff",
                 cursor: "pointer",
-                fontSize: 18,
               }}
             >
-              🗑️
-            </button>
-
-            <button
-              type="button"
-              onClick={requestSaveSummary}
-              title="Save chat summary"
-              aria-label="Save chat summary"
-              disabled={loading || isSavingSummary}
-              style={{
-                width: 44,
-                height: 44,
-                padding: 0,
-                borderRadius: 10,
-                border: "1px solid #bbb",
-                background: "#fff",
-                cursor: loading || isSavingSummary ? "not-allowed" : "pointer",
-                opacity: loading || isSavingSummary ? 0.6 : 1,
-                fontSize: 18,
-              }}
-            >
-              💾
+              Clear Messages
             </button>
 
             <input
@@ -3622,13 +3521,6 @@ const speakGreetingIfNeeded = useCallback(
 	          {sttError ? (
 	            <div style={{ marginTop: 6, fontSize: 12, color: "#b00020" }}>{sttError}</div>
 	          ) : null}
-
-          {saveSummaryToast ? (
-            <div style={{ marginTop: 6, fontSize: 12, color: "#0a7" }}>{saveSummaryToast}</div>
-          ) : null}
-          {saveSummaryError ? (
-            <div style={{ marginTop: 6, fontSize: 12, color: "#b00020" }}>{saveSummaryError}</div>
-          ) : null}
         </div>
       </section>
 
@@ -3697,99 +3589,6 @@ const speakGreetingIfNeeded = useCallback(
                 }}
               >
                 Yes, clear
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Save Summary confirm overlay */}
-      {showSaveSummaryConfirm && (
-        <div
-          style={{
-            position: "fixed",
-            inset: 0,
-            background: "rgba(0,0,0,0.4)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            padding: 16,
-            zIndex: 9999,
-          }}
-        >
-          <div
-            style={{
-              background: "#fff",
-              borderRadius: 12,
-              padding: 16,
-              maxWidth: 560,
-              width: "100%",
-            }}
-          >
-            <h3 style={{ marginTop: 0 }}>Save chat summary?</h3>
-            <p style={{ marginTop: 0 }}>
-              You are authorizing AI Haven 4U to save a <b>summary</b> of this chat for use in future
-              conversations with this companion.
-            </p>
-            <p style={{ marginTop: 0, color: "#555", fontSize: 13 }}>
-              Companion: <b>{companionName || "(unknown)"}</b>
-            </p>
-
-            {saveSummaryError ? (
-              <div style={{ marginTop: 8, fontSize: 12, color: "#b00020" }}>{saveSummaryError}</div>
-            ) : null}
-
-            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 12 }}>
-              <button
-                type="button"
-                disabled={isSavingSummary}
-                onClick={() => {
-                  setShowSaveSummaryConfirm(false);
-                  setSaveSummaryError(null);
-                  // Mimic the Clear-Messages cancel path: re-prime audio so volumes stay stable.
-                  void restoreVolumesAfterClearCancel();
-                }}
-                style={{
-                  padding: "10px 12px",
-                  borderRadius: 10,
-                  border: "1px solid #999",
-                  background: "#fff",
-                  cursor: isSavingSummary ? "not-allowed" : "pointer",
-                }}
-              >
-                No
-              </button>
-              <button
-                type="button"
-                disabled={isSavingSummary}
-                onClick={async () => {
-                  try {
-                    setIsSavingSummary(true);
-                    setSaveSummaryError(null);
-
-                    // Keep the audio chain healthy (same idea as the Clear-Messages flow),
-                    // but DO NOT stop media or clear messages.
-                    void restoreVolumesAfterClearCancel();
-
-                    await saveChatSummary();
-                    setShowSaveSummaryConfirm(false);
-                    setSaveSummaryToast("Saved summary.");
-                  } catch (e) {
-                    setSaveSummaryError(String(e));
-                  } finally {
-                    setIsSavingSummary(false);
-                  }
-                }}
-                style={{
-                  padding: "10px 12px",
-                  borderRadius: 10,
-                  border: "1px solid #111",
-                  background: "#111",
-                  color: "#fff",
-                  cursor: isSavingSummary ? "not-allowed" : "pointer",
-                }}
-              >
-                {isSavingSummary ? "Saving..." : "Yes, save"}
               </button>
             </div>
           </div>
