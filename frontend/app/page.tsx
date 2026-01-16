@@ -2981,6 +2981,69 @@ const speakGreetingIfNeeded = useCallback(
     setShowClearMessagesConfirm(true);
   }, [stopHandsFreeSTT]);
 
+  // After the Clear Messages dialog is dismissed with NO, iOS can sometimes route
+  // subsequent audio to the quiet receiver / low-volume path. We "nudge" the
+  // audio session back to normal playback volume and ensure our media elements
+  // are not left muted/low.
+  const restoreVolumesAfterClearCancel = useCallback(async () => {
+    // Always ensure elements are at normal volume/mute state.
+    try {
+      if (avatarVideoRef.current) {
+        avatarVideoRef.current.muted = false;
+        avatarVideoRef.current.volume = 1;
+      }
+    } catch {}
+
+    try {
+      if (localTtsAudioRef.current) {
+        localTtsAudioRef.current.muted = false;
+        localTtsAudioRef.current.volume = 1;
+      }
+    } catch {}
+
+    try {
+      if (localTtsVideoRef.current) {
+        localTtsVideoRef.current.muted = false;
+        localTtsVideoRef.current.volume = 1;
+        localTtsVideoRef.current.setAttribute?.("playsinline", "");
+        // @ts-ignore
+        localTtsVideoRef.current.playsInline = true;
+      }
+    } catch {}
+
+    if (!isIOS) return;
+
+    // iOS Safari: kick audio session back to normal playback (speaker) mode.
+    // This is a silent, ultra-short WebAudio buffer that runs only on user gesture.
+    try {
+      const AnyWin = window as any;
+      const Ctx = AnyWin.AudioContext || AnyWin.webkitAudioContext;
+      if (!Ctx) return;
+
+      let ctx = didIphoneAudioCtxRef.current as any;
+      if (!ctx || typeof ctx.createBuffer !== "function") {
+        ctx = new Ctx();
+        didIphoneAudioCtxRef.current = ctx;
+      }
+
+      if (ctx.state === "suspended") {
+        await ctx.resume();
+      }
+
+      const dur = 0.06;
+      const frames = Math.max(1, Math.floor(ctx.sampleRate * dur));
+      const buf = ctx.createBuffer(1, frames, ctx.sampleRate);
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.connect(ctx.destination);
+      src.start();
+      try {
+        src.stop(ctx.currentTime + dur);
+      } catch {}
+    } catch {}
+  }, [isIOS]);
+
+
   // Cleanup
   useEffect(() => {
     return () => {
@@ -3484,7 +3547,10 @@ const speakGreetingIfNeeded = useCallback(
             <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", marginTop: 14 }}>
               <button
                 type="button"
-                onClick={() => setShowClearMessagesConfirm(false)}
+                onClick={() => {
+                    setShowClearMessagesConfirm(false);
+                    void restoreVolumesAfterClearCancel();
+                  }}
                 style={{
                   padding: "10px 14px",
                   borderRadius: 10,
