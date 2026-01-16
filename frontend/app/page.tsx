@@ -529,6 +529,7 @@ export default function Page() {
   const localTtsAudioRef = useRef<HTMLAudioElement | null>(null);
   const localTtsVideoRef = useRef<HTMLVideoElement | null>(null);
   const localTtsUnlockedRef = useRef(false);
+  const localTtsStopFnRef = useRef<(() => void) | null>(null);
 
 
   // Companion identity (drives persona + Phase 1 live avatar mapping)
@@ -1187,6 +1188,11 @@ const playLocalTtsUrl = useCallback(
             if (done) return;
             done = true;
 
+            // If the Stop button was wired to this playback, clear it.
+            if (localTtsStopFnRef.current === cleanup) {
+              localTtsStopFnRef.current = null;
+            }
+
             m.onended = null;
             m.onerror = null;
             m.onabort = null;
@@ -1212,6 +1218,9 @@ const playLocalTtsUrl = useCallback(
 
             resolve();
           };
+
+          // Allow the Stop button to interrupt the currently playing local TTS.
+          localTtsStopFnRef.current = cleanup;
 
           m.onended = cleanup;
           m.onerror = cleanup;
@@ -1270,6 +1279,41 @@ const playLocalTtsUrl = useCallback(
     },
     [isIOS],
   );
+
+  // Stop any in-progress local (audio-only) TTS playback immediately.
+  // This is required so the Stop button can reliably interrupt audio-only conversations.
+  const stopLocalTtsPlayback = useCallback(() => {
+    try {
+      localTtsStopFnRef.current?.();
+    } catch {
+      // ignore
+    }
+    localTtsStopFnRef.current = null;
+
+    const a = localTtsAudioRef.current;
+    if (a) {
+      try {
+        a.pause();
+        a.currentTime = 0;
+      } catch {}
+      try {
+        a.removeAttribute("src");
+        (a as any).load?.();
+      } catch {}
+    }
+
+    const v = localTtsVideoRef.current;
+    if (v) {
+      try {
+        v.pause();
+        v.currentTime = 0;
+      } catch {}
+      try {
+        v.removeAttribute("src");
+        (v as any).load?.();
+      } catch {}
+    }
+  }, []);
 
   const speakLocalTtsReply = useCallback(
     async (replyText: string, voiceId: string, hooks?: SpeakAssistantHooks) => {
@@ -2686,7 +2730,9 @@ const speakGreetingIfNeeded = useCallback(
     if (greetInFlightRef.current) return;
     greetInFlightRef.current = true;
 
-    const greetText = `${name}: Hi, I'm ${name}. I'm here with you. How are you feeling today?`;
+    // IMPORTANT: do NOT prefix with "Name:"; the UI already labels the assistant bubble.
+    // Keeping the spoken text free of the prefix prevents the avatar from reading its own name like a script cue.
+    const greetText = `Hi, I'm ${name}. I'm here with you. How are you feeling today?`;
     const voiceId = phase1AvatarMedia?.elevenVoiceId || "rJ9XoWu8gbUhVKZnKY8X";
 
     // Belt & suspenders: avoid STT re-capturing the greeting audio.
@@ -2842,22 +2888,14 @@ const speakGreetingIfNeeded = useCallback(
     // Stop listening immediately
     stopSpeechToText();
 
-    // Stop any local audio-only playback
-    try {
-      const a = localTtsAudioRef.current;
-      if (a) {
-        a.pause();
-        a.currentTime = 0;
-      }
-    } catch {
-      // ignore
-    }
+    // Stop any local audio-only playback (audio OR video element).
+    stopLocalTtsPlayback();
 
     // If Live Avatar is running, stop it too (mic is required in Live Avatar mode)
     if (liveAvatarActive) {
       void stopLiveAvatar();
     }
-  }, [liveAvatarActive, stopLiveAvatar, stopSpeechToText]);
+  }, [liveAvatarActive, stopLiveAvatar, stopLocalTtsPlayback, stopSpeechToText]);
 
   // Cleanup
   useEffect(() => {
