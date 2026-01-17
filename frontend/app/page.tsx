@@ -489,7 +489,16 @@ export default function Page() {
     try {
       pushDebug("log", "Debug enabled", {
         href: window.location.href,
+        origin: window.location.origin,
+        referrer: document.referrer || null,
         embedded: isEmbedded,
+        topHref: (() => {
+          try {
+            return window.top?.location?.href ?? null;
+          } catch {
+            return null;
+          }
+        })(),
         ua: navigator.userAgent,
       });
     } catch {
@@ -3611,8 +3620,7 @@ const speakGreetingIfNeeded = useCallback(
           </div>
 
           <div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap", alignItems: "center" }}>
-            {/** Input line with mode pills moved to the right (layout-only). */}
-            <button
+            {/** Input line with mode pills moved to the right (layout-only). */}<button
               type="button"
               onClick={requestSaveSummary}
               title="Save chat summary"
@@ -3651,6 +3659,8 @@ const speakGreetingIfNeeded = useCallback(
             >
               🗑️
             </button>
+
+            
 
             <input
               value={input}
