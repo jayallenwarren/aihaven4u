@@ -6,11 +6,13 @@ import re
 import uuid
 import hashlib
 import base64
+import sqlite3
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 # Threadpool helper (prevents blocking the event loop on requests/azure upload)
 from starlette.concurrency import run_in_threadpool  # type: ignore
@@ -126,6 +128,231 @@ if consent_router is not None:
 @app.get("/health")
 def health():
     return {"ok": True}
+
+
+"""Chat summary sync (cross-device).
+
+This service persists *one* summary per unique (memberId, companion) pair.
+
+Important security note:
+  - This implementation assumes the caller provides a trustworthy memberId.
+  - In production, you should validate memberId using your auth system (e.g., Wix JWT/session)
+    and derive memberId from that verified identity.
+"""
+
+CHAT_SUMMARY_DB_PATH = os.getenv("CHAT_SUMMARY_DB_PATH", "/tmp/chat_summaries.sqlite3")
+
+
+def _db() -> sqlite3.Connection:
+    conn = sqlite3.connect(CHAT_SUMMARY_DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _init_chat_summary_db() -> None:
+    conn = _db()
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chat_summaries (
+              member_id TEXT NOT NULL,
+              companion TEXT NOT NULL,
+              created_at INTEGER NOT NULL,
+              updated_at INTEGER NOT NULL,
+              session_id TEXT NOT NULL,
+              message_count INTEGER NOT NULL,
+              summary TEXT NOT NULL,
+              PRIMARY KEY (member_id, companion)
+            );
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_summaries_member_updated ON chat_summaries(member_id, updated_at DESC);"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# Initialize on import (simple deployments). If you prefer, move this to a FastAPI startup event.
+_init_chat_summary_db()
+
+
+class ChatSummaryUpsertIn(BaseModel):
+    memberId: str
+    companion: str
+    sessionId: str
+    messageCount: int
+    summary: str
+
+
+class ChatSummaryOut(BaseModel):
+    memberId: str
+    companion: str
+    createdAt: int
+    updatedAt: int
+    sessionId: str
+    messageCount: int
+    summary: str
+
+
+def _norm_member_id(member_id: str) -> str:
+    m = (member_id or "").strip()
+    if not m:
+        raise HTTPException(status_code=400, detail="Missing memberId")
+    return m
+
+
+def _norm_companion(companion: str) -> str:
+    c = (companion or "").strip()
+    if not c:
+        raise HTTPException(status_code=400, detail="Missing companion")
+    return c
+
+
+def _get_member_and_companion(request: Request, member_id: Optional[str], companion: Optional[str]) -> Tuple[str, str]:
+    # Prefer explicit query params; fall back to headers.
+    mid = (member_id or request.headers.get("x-member-id") or request.headers.get("X-Member-Id") or "").strip()
+    comp = (companion or request.headers.get("x-companion") or request.headers.get("X-Companion") or "").strip()
+    return _norm_member_id(mid), _norm_companion(comp)
+
+
+@app.get("/chat_summaries", response_model=List[ChatSummaryOut])
+def list_chat_summaries(request: Request, memberId: Optional[str] = None, companion: Optional[str] = None, limit: int = 50):
+    member_id, comp = _get_member_and_companion(request, memberId, companion)
+
+    limit = max(1, min(int(limit or 50), 200))
+    conn = _db()
+    try:
+        if companion:
+            rows = conn.execute(
+                """
+                SELECT member_id, companion, created_at, updated_at, session_id, message_count, summary
+                FROM chat_summaries
+                WHERE member_id = ? AND companion = ?
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (member_id, comp, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT member_id, companion, created_at, updated_at, session_id, message_count, summary
+                FROM chat_summaries
+                WHERE member_id = ?
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (member_id, limit),
+            ).fetchall()
+
+        return [
+            ChatSummaryOut(
+                memberId=r["member_id"],
+                companion=r["companion"],
+                createdAt=int(r["created_at"]),
+                updatedAt=int(r["updated_at"]),
+                sessionId=r["session_id"],
+                messageCount=int(r["message_count"]),
+                summary=r["summary"],
+            )
+            for r in rows
+        ]
+    finally:
+        conn.close()
+
+
+@app.get("/chat_summary", response_model=ChatSummaryOut)
+def get_chat_summary(request: Request, memberId: Optional[str] = None, companion: Optional[str] = None):
+    member_id, comp = _get_member_and_companion(request, memberId, companion)
+    conn = _db()
+    try:
+        row = conn.execute(
+            """
+            SELECT member_id, companion, created_at, updated_at, session_id, message_count, summary
+            FROM chat_summaries
+            WHERE member_id = ? AND companion = ?
+            LIMIT 1
+            """,
+            (member_id, comp),
+        ).fetchone()
+
+        if not row:
+            raise HTTPException(status_code=404, detail="Not found")
+
+        return ChatSummaryOut(
+            memberId=row["member_id"],
+            companion=row["companion"],
+            createdAt=int(row["created_at"]),
+            updatedAt=int(row["updated_at"]),
+            sessionId=row["session_id"],
+            messageCount=int(row["message_count"]),
+            summary=row["summary"],
+        )
+    finally:
+        conn.close()
+
+
+@app.post("/chat_summary", response_model=ChatSummaryOut)
+def upsert_chat_summary(payload: ChatSummaryUpsertIn):
+    member_id = _norm_member_id(payload.memberId)
+    comp = _norm_companion(payload.companion)
+
+    session_id = (payload.sessionId or "").strip() or "unknown"
+    message_count = int(payload.messageCount or 0)
+    summary = (payload.summary or "").strip()
+    if not summary:
+        raise HTTPException(status_code=400, detail="Missing summary")
+
+    now = int(time.time() * 1000)
+
+    conn = _db()
+    try:
+        existing = conn.execute(
+            "SELECT created_at FROM chat_summaries WHERE member_id = ? AND companion = ? LIMIT 1",
+            (member_id, comp),
+        ).fetchone()
+
+        if existing:
+            created_at = int(existing["created_at"])
+            conn.execute(
+                """
+                UPDATE chat_summaries
+                SET updated_at = ?, session_id = ?, message_count = ?, summary = ?
+                WHERE member_id = ? AND companion = ?
+                """,
+                (now, session_id, message_count, summary, member_id, comp),
+            )
+        else:
+            created_at = now
+            conn.execute(
+                """
+                INSERT INTO chat_summaries (member_id, companion, created_at, updated_at, session_id, message_count, summary)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (member_id, comp, created_at, now, session_id, message_count, summary),
+            )
+
+        conn.commit()
+
+        return ChatSummaryOut(
+            memberId=member_id,
+            companion=comp,
+            createdAt=created_at,
+            updatedAt=now,
+            sessionId=session_id,
+            messageCount=message_count,
+            summary=summary,
+        )
+    finally:
+        conn.close()
+
+
+"""Legacy bearer-token chat summary routes removed.
+
+This server now persists exactly one summary per (memberId, companion) pair.
+"""
 
 
 # ----------------------------

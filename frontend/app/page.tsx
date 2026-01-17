@@ -34,10 +34,11 @@ type Role = "user" | "assistant";
 type Msg = { role: Role; content: string };
 
 type SavedChatSummary = {
-  id: string;
+  memberId: string;
+  companion: string;
   createdAt: number;
+  updatedAt: number;
   sessionId: string;
-  companionName: string;
   messageCount: number;
   summary: string;
 };
@@ -1517,25 +1518,81 @@ const speakAssistantReply = useCallback(
   const [input, setInput] = useState("");
   const [messages, setMessages] = useState<Msg[]>([]);
   const [loading, setLoading] = useState(false);
+  const [memberId, setMemberId] = useState<string | null>(null);
   const [showClearMessagesConfirm, setShowClearMessagesConfirm] = useState(false);
   const [showSaveSummaryConfirm, setShowSaveSummaryConfirm] = useState(false);
   const [savedSummaries, setSavedSummaries] = useState<SavedChatSummary[]>([]);
   const clearEpochRef = useRef(0);
 
-  // Load any previously saved chat summaries (local, per-browser).
+  const summaryScopeCompanion = useMemo(() => {
+    const raw = (companionKey || companionName || DEFAULT_COMPANION_NAME).trim();
+    return raw || DEFAULT_COMPANION_NAME;
+  }, [companionKey, companionName]);
+
+  const summaryStorageKey = useMemo(() => {
+    const mid = (memberId || "guest").trim() || "guest";
+    // Normalize companion to keep the key stable even if the display name changes.
+    const ck = normalizeKeyForFile(summaryScopeCompanion);
+    return `${CHAT_SUMMARIES_KEY}:${mid}:${ck}`;
+  }, [memberId, summaryScopeCompanion]);
+
+  // Load any previously saved chat summaries for the current (memberId, companion) scope.
+  // Server is the source of truth when API_BASE is configured and a memberId is present.
   useEffect(() => {
     if (typeof window === "undefined") return;
-    try {
-      const raw = window.localStorage.getItem(CHAT_SUMMARIES_KEY);
-      if (!raw) return;
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) {
-        setSavedSummaries(parsed as SavedChatSummary[]);
+
+    const loadLocal = () => {
+      try {
+        const raw = window.localStorage.getItem(summaryStorageKey);
+        if (!raw) return [] as SavedChatSummary[];
+        const parsed = JSON.parse(raw);
+        return Array.isArray(parsed) ? (parsed as SavedChatSummary[]) : ([] as SavedChatSummary[]);
+      } catch {
+        return [] as SavedChatSummary[];
       }
-    } catch {
-      // ignore
-    }
-  }, []);
+    };
+
+    // Always show local immediately (fast UI), then optionally refresh from server.
+    const local = loadLocal();
+    if (local.length) setSavedSummaries(local);
+    else setSavedSummaries([]);
+
+    if (!API_BASE || !memberId || !summaryScopeCompanion) return;
+
+    const ac = new AbortController();
+    (async () => {
+      try {
+        const url = `${API_BASE}/chat_summary?memberId=${encodeURIComponent(memberId)}&companion=${encodeURIComponent(summaryScopeCompanion)}`;
+        const res = await fetch(url, {
+          method: "GET",
+          headers: { "Content-Type": "application/json" },
+          signal: ac.signal,
+        });
+
+        if (!res.ok) return;
+        const one = (await res.json()) as SavedChatSummary;
+        if (!one || typeof (one as any).summary !== "string") return;
+
+        const list = [one];
+        setSavedSummaries(list);
+
+        // Cache scoped state locally for offline/fast loads.
+        try {
+          window.localStorage.setItem(summaryStorageKey, JSON.stringify(list));
+        } catch {
+          // ignore
+        }
+      } catch {
+        // ignore (offline, CORS, etc.)
+      }
+    })();
+
+    return () => ac.abort();
+  }, [API_BASE, memberId, summaryScopeCompanion, summaryStorageKey]);
+
+  const summarySyncEnabled = useMemo(() => {
+    return Boolean(API_BASE && memberId && summaryScopeCompanion);
+  }, [memberId, summaryScopeCompanion]);
 
   const [chatStatus, setChatStatus] = useState<ChatStatus>("safe");
 
@@ -1723,6 +1780,12 @@ useEffect(() => {
 
       const data = event.data;
       if (!data || data.type !== "WEEKLY_PLAN") return;
+
+      const incomingMemberId =
+        typeof (data as any).memberId === "string" && (data as any).memberId.trim()
+          ? (data as any).memberId.trim()
+          : null;
+      setMemberId(incomingMemberId);
 
       const incomingPlan = (data.planName ?? null) as PlanName;
       setPlanName(incomingPlan);
@@ -2991,11 +3054,41 @@ const speakGreetingIfNeeded = useCallback(
     // Force a fresh iOS audio-route prime next time the mic/audio starts (prevents low/silent volume after stop/cancel).
     localTtsUnlockedRef.current = false;
 
+    // IMPORTANT (iOS): stopping capture (mic/STT) can leave Safari's audio session routed to a quiet path.
+    // We immediately re-prime the playback route (silent) inside the same user gesture whenever possible.
+    // This is the key mitigation for the "low TTS volume after clear" regression.
+    try {
+      if (isIOS) {
+        // Ensure media elements are not left muted/low.
+        if (localTtsAudioRef.current) {
+          localTtsAudioRef.current.muted = false;
+          localTtsAudioRef.current.volume = 1;
+        }
+        if (localTtsVideoRef.current) {
+          localTtsVideoRef.current.muted = false;
+          localTtsVideoRef.current.volume = 1;
+          localTtsVideoRef.current.setAttribute?.("playsinline", "");
+          // @ts-ignore
+          localTtsVideoRef.current.playsInline = true;
+        }
+
+        // Resume/unlock WebAudio (no-op on non-iPhone). Safe to call.
+        try {
+          void ensureIphoneAudioContextUnlocked();
+        } catch {}
+
+        // Silent prime to nudge the audio route back to speaker.
+        primeLocalTtsAudio(true);
+      }
+    } catch {
+      // ignore
+    }
+
     // If Live Avatar is running, stop it too (mic is required in Live Avatar mode)
     if (liveAvatarActive) {
       void stopLiveAvatar();
     }
-  }, [liveAvatarActive, stopLiveAvatar, stopLocalTtsPlayback, stopSpeechToText]);
+  }, [ensureIphoneAudioContextUnlocked, isIOS, liveAvatarActive, primeLocalTtsAudio, stopLiveAvatar, stopLocalTtsPlayback, stopSpeechToText]);
 
   // Build a lightweight local summary for future reference.
   // NOTE: This is intentionally deterministic and runs fully client-side.
@@ -3016,28 +3109,62 @@ const speakGreetingIfNeeded = useCallback(
     return joined.length > maxChars ? joined.slice(0, maxChars - 1) + "…" : joined;
   }, [companionName]);
 
-  const persistChatSummary = useCallback((summaryText: string) => {
+  const persistChatSummary = useCallback(async (summaryText: string) => {
     if (typeof window === "undefined") return;
+
     const sessionId = String(sessionIdRef.current || "").trim();
-    const rec: SavedChatSummary = {
-      id: (crypto as any).randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    const mid = (memberId || "").trim();
+    const comp = (summaryScopeCompanion || "").trim();
+
+    // One-record-per-(memberId, companion) cache for offline/fast loads.
+    const localRec: SavedChatSummary = {
+      memberId: mid || "guest",
+      companion: comp || DEFAULT_COMPANION_NAME,
       createdAt: Date.now(),
+      updatedAt: Date.now(),
       sessionId,
-      companionName: companionName || DEFAULT_COMPANION_NAME,
       messageCount: messages.length,
       summary: summaryText,
     };
 
-    setSavedSummaries((prev) => {
-      const next = [rec, ...(prev || [])].slice(0, 50);
+    const writeLocalList = (list: SavedChatSummary[]) => {
+      setSavedSummaries(list);
       try {
-        window.localStorage.setItem(CHAT_SUMMARIES_KEY, JSON.stringify(next));
+        window.localStorage.setItem(summaryStorageKey, JSON.stringify(list));
       } catch {
         // ignore
       }
-      return next;
-    });
-  }, [companionName, messages.length]);
+    };
+
+    // Optimistic local write for snappy UX.
+    writeLocalList([localRec]);
+
+    // Server sync (cross-device): upsert exactly one record per (memberId, companion).
+    if (API_BASE && mid && comp) {
+      try {
+        const res = await fetch(`${API_BASE}/chat_summary`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            memberId: mid,
+            companion: comp,
+            sessionId: localRec.sessionId,
+            messageCount: localRec.messageCount,
+            summary: localRec.summary,
+          }),
+        });
+
+        if (res.ok) {
+          const saved = (await res.json()) as SavedChatSummary;
+          if (saved && typeof (saved as any).summary === "string") {
+            writeLocalList([saved]);
+          }
+        }
+      } catch {
+        // ignore (offline, CORS, server down). Local cache remains.
+      }
+    }
+  }, [API_BASE, memberId, messages.length, summaryScopeCompanion, summaryStorageKey]);
 
   // Save Chat Summary (with confirmation)
   const requestSaveSummary = useCallback(() => {
@@ -3651,7 +3778,7 @@ const speakGreetingIfNeeded = useCallback(
           >
             <div style={{ fontSize: 18, fontWeight: 700, marginBottom: 8 }}>Save chat summary?</div>
             <div style={{ fontSize: 14, color: "#333", lineHeight: 1.4 }}>
-              This will save a local summary of the conversation in your browser for future reference.
+              {summarySyncEnabled ? "This will save a summary to your account and sync it across devices." : "This will save a local summary of the conversation in your browser for future reference."}
               By continuing, you authorize saving this chat summary data.
               Audio and video have been stopped.
             </div>
