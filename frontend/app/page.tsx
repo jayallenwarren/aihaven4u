@@ -1727,6 +1727,7 @@ const speakAssistantReply = useCallback(
   }, []);
 
   const [input, setInput] = useState("");
+  const inputElRef = useRef<HTMLInputElement | null>(null);
   const [messages, setMessages] = useState<Msg[]>([]);
   const [loading, setLoading] = useState(false);
   const [showClearMessagesConfirm, setShowClearMessagesConfirm] = useState(false);
@@ -3749,6 +3750,7 @@ const speakGreetingIfNeeded = useCallback(
             </button>
 
             <input
+              ref={inputElRef}
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => {
@@ -3843,6 +3845,7 @@ const speakGreetingIfNeeded = useCallback(
                 onClick={() => {
                   setMessages([]);
                   setInput("");
+                  try { if (inputElRef.current) inputElRef.current.value = ""; } catch {}
                   setShowClearMessagesConfirm(false);
                   // User gesture: restore boosted routing so subsequent TTS isn't quiet.
                   try { boostAllTtsVolumes(); } catch {}
