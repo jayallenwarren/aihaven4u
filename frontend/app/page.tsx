@@ -568,6 +568,9 @@ export default function Page() {
   const localTtsVideoRef = useRef<HTMLVideoElement | null>(null);
   const localTtsUnlockedRef = useRef(false);
   const localTtsStopFnRef = useRef<(() => void) | null>(null);
+  // Guards to cancel/ignore in-flight local TTS work when user stops communications mid-stream.
+  const localTtsEpochRef = useRef(0);
+  const localTtsAbortRef = useRef<AbortController | null>(null);
 
   // Live Avatar element ref is declared early so it can be used by the global TTS volume booster.
   const avatarVideoRef = useRef<HTMLVideoElement | null>(null);
@@ -1137,11 +1140,12 @@ useEffect(() => {
   void stopLiveAvatar();
 }, [companionKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
-const getTtsAudioUrl = useCallback(async (text: string, voiceId: string): Promise<string | null> => {
+const getTtsAudioUrl = useCallback(async (text: string, voiceId: string, signal?: AbortSignal): Promise<string | null> => {
   try {
     const res = await fetch(`${API_BASE}/tts/audio-url`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      signal,
       body: JSON.stringify({
         session_id: sessionIdRef.current || "anon",
         voice_id: voiceId,
@@ -1551,8 +1555,27 @@ const playLocalTtsUrl = useCallback(
         return;
       }
 
-      const audioUrl = await getTtsAudioUrl(clean, voiceId);
+      // Guard against mid-stream Stop/Save/Clear: cancel any in-flight request and ignore late results.
+      const epoch = localTtsEpochRef.current;
+      try {
+        localTtsAbortRef.current?.abort();
+      } catch {}
+      const controller = new AbortController();
+      localTtsAbortRef.current = controller;
+
+      const audioUrl = await getTtsAudioUrl(clean, voiceId, controller.signal);
+      if (controller.signal.aborted || localTtsEpochRef.current != epoch) {
+        // Stop/Save/Clear happened while we were generating the audio URL.
+        hooks?.onDidNotSpeak?.();
+        return;
+      }
       if (!audioUrl) {
+        hooks?.onDidNotSpeak?.();
+        return;
+      }
+
+      // If a stop happens during playback start, playLocalTtsUrl will be interrupted by stopLocalTtsPlayback().
+      if (localTtsEpochRef.current != epoch) {
         hooks?.onDidNotSpeak?.();
         return;
       }
@@ -3288,6 +3311,12 @@ const speakGreetingIfNeeded = useCallback(
   }, [liveAvatarActive, startSpeechToText, stopSpeechToText]);
 
   const stopHandsFreeSTT = useCallback(() => {
+    // Cancel any in-flight local TTS work and advance epoch so late callbacks are ignored.
+    localTtsEpochRef.current += 1;
+    try {
+      localTtsAbortRef.current?.abort();
+    } catch {}
+    localTtsAbortRef.current = null;
     // Stop listening immediately
     stopSpeechToText();
 
@@ -3338,16 +3367,15 @@ const speakGreetingIfNeeded = useCallback(
 
   // Save Chat Summary (with confirmation)
   const requestSaveChatSummary = useCallback(() => {
-    // Same safety posture as Clear Messages:
-    // Stop all audio/video + STT immediately on click, then the user manually chooses what to resume.
-    clearEpochRef.current += 1;
-    setLoading(false);
+    // REQUIREMENT: behave like Clear Messages with respect to media stability.
+    // We halt all communication immediately using the Stop button logic.
+    // The user will manually choose what to resume after selecting Yes/No.
+    // IMPORTANT: Unlike Clear, do NOT bump clearEpochRef or change loading state here;
+    // doing so can interfere with subsequent reply speaking.
 
     try {
       stopHandsFreeSTT();
-    } catch {
-      // ignore
-    }
+    } catch {}
 
     // User gesture: re-assert boosted audio routing and nudge audio session back to playback mode.
     try {
