@@ -665,22 +665,12 @@ export default function Page() {
       }
 
       try {
-        // If the underlying media element instance changed (common when Live Avatar is stopped/started
-        // or when hidden TTS elements are re-mounted), we must recreate the MediaElementSourceNode.
-        // Source nodes are permanently bound to a single element.
-        if (kind === "audio" && ttsAudioBoundElRef.current !== media) {
-          try { ttsAudioMediaSrcRef.current?.disconnect(); } catch {}
-          ttsAudioMediaSrcRef.current = null;
-          ttsAudioBoundElRef.current = media;
-          ttsAudioChainConnectedRef.current = false;
-        }
-        if (kind === "video" && ttsVideoBoundElRef.current !== media) {
-          try { ttsVideoMediaSrcRef.current?.disconnect(); } catch {}
-          ttsVideoMediaSrcRef.current = null;
-          ttsVideoBoundElRef.current = media;
-          ttsVideoChainConnectedRef.current = false;
-        }
-        if (kind === "avatar" && avatarVideoBoundElRef.current !== media) {
+        // From here on, we only handle the non-iPhone Live Avatar <video> element.
+        // (Audio-only TTS elements return early above to avoid WebAudio routing issues.)
+
+        // If the underlying media element instance changed (common when Live Avatar is stopped/started),
+        // we must recreate the MediaElementSourceNode. Source nodes are permanently bound to a single element.
+        if (avatarVideoBoundElRef.current !== media) {
           try { avatarVideoMediaSrcRef.current?.disconnect(); } catch {}
           avatarVideoMediaSrcRef.current = null;
           avatarVideoBoundElRef.current = media;
@@ -692,29 +682,8 @@ export default function Page() {
         let src: MediaElementAudioSourceNode | null = null;
         let gain: GainNode | null = null;
 
-        if (kind === "audio") {
-          src = ttsAudioMediaSrcRef.current;
-          gain = ttsAudioGainRef.current;
-          if (!src) {
-            src = ctx.createMediaElementSource(media);
-            ttsAudioMediaSrcRef.current = src;
-          }
-          if (!gain) {
-            gain = ctx.createGain();
-            ttsAudioGainRef.current = gain;
-          }
-        } else if (kind === "video") {
-          src = ttsVideoMediaSrcRef.current;
-          gain = ttsVideoGainRef.current;
-          if (!src) {
-            src = ctx.createMediaElementSource(media);
-            ttsVideoMediaSrcRef.current = src;
-          }
-          if (!gain) {
-            gain = ctx.createGain();
-            ttsVideoGainRef.current = gain;
-          }
-        } else {
+        // Avatar routing
+        {
           src = avatarVideoMediaSrcRef.current;
           gain = avatarVideoGainRef.current;
           if (!src) {
@@ -739,10 +708,8 @@ export default function Page() {
           } catch {}
           connectedRef.current = true;
         };
-
-        if (kind === "audio") connectOnce(ttsAudioChainConnectedRef);
-        else if (kind === "video") connectOnce(ttsVideoChainConnectedRef);
-        else connectOnce(avatarVideoChainConnectedRef);
+        // kind is narrowed to "avatar" here (audio/video returned early above).
+        connectOnce(avatarVideoChainConnectedRef);
 
         gain.gain.value = TTS_GAIN;
 
