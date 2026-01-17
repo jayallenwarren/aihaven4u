@@ -3568,7 +3568,7 @@ const requestClearMessages = useCallback(() => {
               </button>
               <button
                 onClick={requestClearMessages}
-                disabled={loading || !!pendingStopReasonRef.current || isClearingMessagesRef.current}
+                disabled={loading || savingSummary || showClearMessagesConfirm || showSaveSummaryConfirm}
                 title="Clear messages"
                 aria-label="Clear messages"
                 style={{
