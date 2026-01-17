@@ -578,7 +578,7 @@ export default function Page() {
   // iPhone Live Avatar already routes MediaStream audio through WebAudio (see applyIphoneLiveAvatarAudioBoost).
   // Volume boost for audio-only TTS and non-iPhone Live Avatar.
   // Note: We intentionally use WebAudio gain to exceed HTMLMediaElement.volume (max 1.0).
-  const TTS_GAIN = 6.0;
+  const TTS_GAIN = 12.0;
   const ttsAudioCtxRef = useRef<AudioContext | null>(null);
   const ttsAudioMediaSrcRef = useRef<MediaElementAudioSourceNode | null>(null);
   const ttsAudioGainRef = useRef<GainNode | null>(null);
@@ -605,6 +605,40 @@ export default function Page() {
       return null;
     }
   }, []);
+
+  // "Audio session nudge" (runs on a user gesture):
+  // iOS Safari can remain in a low/communications-volume route after mic capture or modal dialogs.
+  // Emitting a very short, near-inaudible tone through the WebAudio graph helps re-establish
+  // the normal playback route so subsequent TTS is not feeble or silent.
+  const nudgeAudioSession = useCallback(async () => {
+    const ctx = ensureTtsAudioContext();
+    if (!ctx) return;
+    try {
+      if (ctx.state === "suspended") {
+        await ctx.resume();
+      }
+
+      const osc = ctx.createOscillator();
+      const g = ctx.createGain();
+      // Very low amplitude; intended to be imperceptible but non-zero.
+      g.gain.value = 0.004;
+      osc.frequency.value = 32; // sub-bass; typically not heard on phone speakers
+      osc.connect(g);
+      g.connect(ctx.destination);
+      const stopAt = ctx.currentTime + 0.08;
+      osc.start();
+      osc.stop(stopAt);
+
+      // Cleanup connections shortly after stop.
+      window.setTimeout(() => {
+        try { osc.disconnect(); } catch {}
+        try { g.disconnect(); } catch {}
+      }, 120);
+    } catch {
+      // ignore
+    }
+  }, [ensureTtsAudioContext]);
+
 
   const applyTtsGainRouting = useCallback(
     (media: HTMLMediaElement | null, kind: "audio" | "video" | "avatar") => {
@@ -840,7 +874,7 @@ const applyIphoneLiveAvatarAudioBoost = useCallback(
 
       // Boost amount tuned for iPhone; iPad/Desktop already fine.
       // Use a higher gain because iPhone often routes WebRTC audio at a receiver-like level.
-      gain.gain.value = 4.5;
+      gain.gain.value = 10.0;
 
       source.connect(gain);
       gain.connect(ctx.destination);
@@ -1478,7 +1512,7 @@ const playLocalTtsUrl = useCallback(
         hooks?.onDidNotSpeak?.();
       } catch {}
     },
-    [isIOS],
+    [isIOS, applyTtsGainRouting],
   );
 
   // Stop any in-progress local (audio-only) TTS playback immediately.
@@ -3196,13 +3230,17 @@ const speakGreetingIfNeeded = useCallback(
       // ignore
     }
 
-    // User gesture: re-assert boosted audio routing so TTS doesn't become feeble after the first conversation.
+    // User gesture: re-assert boosted audio routing and nudge audio session back to playback mode.
     try {
       boostAllTtsVolumes();
     } catch {}
+    try {
+      void nudgeAudioSession();
+    } catch {}
+
 
     setShowClearMessagesConfirm(true);
-  }, [stopHandsFreeSTT, boostAllTtsVolumes]);
+  }, [stopHandsFreeSTT, boostAllTtsVolumes, nudgeAudioSession]);
 
   // After the Clear Messages dialog is dismissed with NO, iOS can sometimes route
   // subsequent audio to the quiet receiver / low-volume path. We "nudge" the
@@ -3211,6 +3249,9 @@ const speakGreetingIfNeeded = useCallback(
   const restoreVolumesAfterClearCancel = useCallback(async () => {
     // Ensure our boost routing is re-established immediately after the dialog is dismissed.
     try { boostAllTtsVolumes(); } catch {}
+    // User gesture (Yes/No click): nudge audio session so local TTS does not become silent/feeble.
+    try { await nudgeAudioSession(); } catch {}
+
 
     // Re-prime audio routing on cancel (silent). Helps iOS recover speaker route/volume.
     try { primeLocalTtsAudio(true); } catch {}
@@ -3274,7 +3315,7 @@ const speakGreetingIfNeeded = useCallback(
         src.stop(ctx.currentTime + dur);
       } catch {}
     } catch {}
-  }, [isIOS, primeLocalTtsAudio, ensureIphoneAudioContextUnlocked, boostAllTtsVolumes]);
+  }, [isIOS, primeLocalTtsAudio, ensureIphoneAudioContextUnlocked, boostAllTtsVolumes, nudgeAudioSession]);
 
 
   // Cleanup
