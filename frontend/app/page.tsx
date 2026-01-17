@@ -30,43 +30,6 @@ const PauseIcon = ({ size = 18 }: { size?: number }) => (
   </svg>
 );
 
-const SaveIcon = ({ size = 18 }: { size?: number }) => (
-  <svg
-    width={size}
-    height={size}
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    strokeWidth="2"
-    strokeLinecap="round"
-    strokeLinejoin="round"
-  >
-    <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" />
-    <polyline points="17 21 17 13 7 13 7 21" />
-    <polyline points="7 3 7 8 15 8" />
-  </svg>
-);
-
-const TrashIcon = ({ size = 18 }: { size?: number }) => (
-  <svg
-    width={size}
-    height={size}
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    strokeWidth="2"
-    strokeLinecap="round"
-    strokeLinejoin="round"
-  >
-    <polyline points="3 6 5 6 21 6" />
-    <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
-    <path d="M10 11v6" />
-    <path d="M14 11v6" />
-    <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
-  </svg>
-);
-
-
 type Role = "user" | "assistant";
 type Msg = { role: Role; content: string };
 
@@ -423,7 +386,6 @@ export default function Page() {
 
 
   const sessionIdRef = useRef<string | null>(null);
-  const toastTimerRef = useRef<number | null>(null);
 
   // -----------------------
   // Debug overlay (mobile-friendly)
@@ -1319,17 +1281,6 @@ const playLocalTtsUrl = useCallback(
     [isIOS],
   );
 
-  const showToast = useCallback((msg: string) => {
-    setToastMessage(msg);
-    if (toastTimerRef.current) {
-      window.clearTimeout(toastTimerRef.current);
-    }
-    toastTimerRef.current = window.setTimeout(() => {
-      setToastMessage(null);
-    }, 2500);
-  }, []);
-
-
   // Stop any in-progress local (audio-only) TTS playback immediately.
   // This is required so the Stop button can reliably interrupt audio-only conversations.
   const stopLocalTtsPlayback = useCallback(() => {
@@ -1557,11 +1508,6 @@ const speakAssistantReply = useCallback(
   const [messages, setMessages] = useState<Msg[]>([]);
   const [loading, setLoading] = useState(false);
   const [showClearMessagesConfirm, setShowClearMessagesConfirm] = useState(false);
-
-  const [showSaveSummaryConfirm, setShowSaveSummaryConfirm] = useState(false);
-  const [toastMessage, setToastMessage] = useState<string | null>(null);
-  const [savingSummary, setSavingSummary] = useState(false);
-
   const clearEpochRef = useRef(0);
 
   const [chatStatus, setChatStatus] = useState<ChatStatus>("safe");
@@ -3025,31 +2971,7 @@ const speakGreetingIfNeeded = useCallback(
   }, [liveAvatarActive, stopLiveAvatar, stopLocalTtsPlayback, stopSpeechToText]);
 
   // Clear Messages (with confirmation)
-  
-
-  const requestSaveSummary = useCallback(() => {
-    setShowSaveSummaryConfirm(true);
-  }, []);
-
-  const cancelSaveSummary = useCallback(() => {
-    setShowSaveSummaryConfirm(false);
-  }, []);
-
-  const confirmSaveSummary = useCallback(async () => {
-    setShowSaveSummaryConfirm(false);
-
-    // Step 1 (UI-only): don't call backend yet. This is just to prove the UI change
-    // does NOT introduce the /chat "Load failed" error.
-    setSavingSummary(true);
-    try {
-      pushDebug("log", "saveSummary:stub");
-      showToast('Save Summary (stub): UI is wired. Backend call disabled in this step.');
-    } finally {
-      setSavingSummary(false);
-    }
-  }, [pushDebug, showToast]);
-
-const requestClearMessages = useCallback(() => {
+  const requestClearMessages = useCallback(() => {
     // Stop all audio/video + STT immediately on click (even before the user confirms).
     // This is an overt user action and prevents the assistant from continuing to speak.
     clearEpochRef.current += 1;
@@ -3547,45 +3469,19 @@ const requestClearMessages = useCallback(() => {
           <div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap", alignItems: "center" }}>
             {/** Input line with mode pills moved to the right (layout-only). */}
             <button
-                onClick={requestSaveSummary}
-                disabled={loading || savingSummary || !messages.length}
-                title="Save chat summary"
-                aria-label="Save chat summary"
-                style={{
-                  marginRight: 8,
-                  border: "1px solid #d1d5db",
-                  borderRadius: 8,
-                  padding: "10px 12px",
-                  fontSize: 13,
-                  background: "#f9fafb",
-                  cursor: "pointer",
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                }}
-              >
-                <SaveIcon size={18} />
-              </button>
-              <button
-                onClick={requestClearMessages}
-                disabled={loading || savingSummary || showClearMessagesConfirm || showSaveSummaryConfirm}
-                title="Clear messages"
-                aria-label="Clear messages"
-                style={{
-                  marginRight: 8,
-                  border: "1px solid #d1d5db",
-                  borderRadius: 8,
-                  padding: "10px 12px",
-                  fontSize: 13,
-                  background: "#f9fafb",
-                  cursor: "pointer",
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                }}
-              >
-                <TrashIcon size={18} />
-              </button>
+              type="button"
+              onClick={requestClearMessages}
+              title="Clear the conversation on screen"
+              style={{
+                padding: "10px 12px",
+                borderRadius: 10,
+                border: "1px solid #bbb",
+                background: "#fff",
+                cursor: "pointer",
+              }}
+            >
+              Clear Messages
+            </button>
 
             <input
               value={input}
@@ -3698,70 +3594,6 @@ const requestClearMessages = useCallback(() => {
           </div>
         </div>
       )}
-
-      {showSaveSummaryConfirm && (
-        <div
-          style={{
-            position: "fixed",
-            left: 0,
-            top: 0,
-            right: 0,
-            bottom: 0,
-            background: "rgba(0,0,0,0.55)",
-            zIndex: 9999,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            padding: 16,
-          }}
-        >
-          <div
-            style={{
-              width: "min(520px, 100%)",
-              background: "#fff",
-              borderRadius: 12,
-              border: "1px solid #e5e7eb",
-              padding: 16,
-            }}
-          >
-            <h3 style={{ marginTop: 0 }}>Save Chat Summary?</h3>
-            <p style={{ marginBottom: 12, lineHeight: 1.4 }}>
-              This will save a short summary of your conversation so this companion can remember it in future sessions.
-              <br />
-              (Step 1: UI wiring only — backend call is intentionally disabled.)
-            </p>
-            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
-              <button
-                onClick={cancelSaveSummary}
-                style={{
-                  padding: "10px 12px",
-                  borderRadius: 10,
-                  border: "1px solid #d1d5db",
-                  background: "#fff",
-                  cursor: "pointer",
-                }}
-              >
-                Cancel
-              </button>
-              <button
-                onClick={confirmSaveSummary}
-                disabled={savingSummary}
-                style={{
-                  padding: "10px 12px",
-                  borderRadius: 10,
-                  border: "1px solid #111827",
-                  background: savingSummary ? "#9ca3af" : "#111827",
-                  color: "#fff",
-                  cursor: savingSummary ? "not-allowed" : "pointer",
-                }}
-              >
-                Save
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
 
 {/* Consent overlay */}
       {showConsentOverlay && (
@@ -3965,28 +3797,6 @@ const requestClearMessages = useCallback(() => {
           <div style={{ marginTop: 8, fontSize: 11, opacity: 0.85 }}>
             Tip: Tap the avatar image 5 times to toggle this overlay.
           </div>
-        </div>
-      )}
-
-
-      {toastMessage && (
-        <div
-          style={{
-            position: "fixed",
-            bottom: 20,
-            left: "50%",
-            transform: "translateX(-50%)",
-            background: "rgba(0,0,0,0.85)",
-            color: "#fff",
-            padding: "10px 14px",
-            borderRadius: 12,
-            fontSize: 13,
-            zIndex: 10001,
-            maxWidth: "90%",
-            textAlign: "center",
-          }}
-        >
-          {toastMessage}
         </div>
       )}
 
