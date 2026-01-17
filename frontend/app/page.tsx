@@ -221,6 +221,11 @@ const MODE_LABELS: Record<Mode, string> = {
   intimate: "Intimate (18+)",
 };
 
+// Plan → mode availability mapping (UI pills)
+// Requirements:
+// - Friend or Test - Friend Plan: Friend only
+// - Romantic or Test - Romantic Plan: Friend + Romantic
+// - Intimate (18+) or Test - Intimate (18+) Plan: Friend + Romantic + Intimate (18+)
 const ROMANTIC_ALLOWED_PLANS: PlanName[] = [
   "Trial",
   "Romantic",
@@ -1753,6 +1758,32 @@ const speakAssistantReply = useCallback(
 
   const goToMyHaven = useCallback(() => {
     const url = "https://www.aihaven4u.com/myhaven";
+
+    // If running inside an iframe, attempt to navigate the *top* browsing context
+    // so we leave the embed and avoid “stacked headers”.
+    try {
+      if (window.top && window.top !== window.self) {
+        window.top.location.href = url;
+        return;
+      }
+    } catch {
+      // Cross-origin access to window.top can throw.
+    }
+
+    // Alternate attempt that may still target the top browsing context.
+    try {
+      window.open(url, "_top");
+      return;
+    } catch {
+      // ignore
+    }
+
+    // Fallback: navigate the current frame.
+    window.location.href = url;
+  }, []);
+
+  const goToUpgrade = useCallback(() => {
+    const url = UPGRADE_URL;
 
     // If running inside an iframe, attempt to navigate the *top* browsing context
     // so we leave the embed and avoid “stacked headers”.
@@ -3373,6 +3404,18 @@ const speakGreetingIfNeeded = useCallback(
   );
 
   
+  const visibleModePills = useMemo(() => {
+    // Keep stable ordering regardless of allowedModes ordering.
+    const ordered: Mode[] = ["friend", "romantic", "intimate"];
+    return ordered.filter((m) => allowedModes.includes(m));
+  }, [allowedModes]);
+
+  const showUpgradePill = useMemo(() => {
+    // Requirement: show Upgrade whenever Friend and/or Romantic pills are available,
+    // except when Intimate (18+) is available (no further upgrade path).
+    return !allowedModes.includes("intimate") && (allowedModes.includes("friend") || allowedModes.includes("romantic"));
+  }, [allowedModes]);
+
   const modePillControls = (
     <div style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "flex-end" }}>
       {!showModePicker ? (
@@ -3429,36 +3472,52 @@ const speakGreetingIfNeeded = useCallback(
           </button>
         </div>
       ) : (
-        modePills.map((m) => {
-          const active = effectiveActiveMode === m;
-          const disabled = !allowedModes.includes(m);
-          return (
-            <button
-              key={m}
-              disabled={disabled}
-              onClick={() => {
-                if (disabled) {
-                  showUpgradeMessage(m);
-                } else {
+        <>
+          {visibleModePills.map((m) => {
+            const active = effectiveActiveMode === m;
+            return (
+              <button
+                key={m}
+                onClick={() => {
                   setModeFromPill(m);
-                }
+                  setShowModePicker(false);
+                }}
+                style={{
+                  padding: "8px 12px",
+                  borderRadius: 999,
+                  border: "1px solid #ddd",
+                  background: active ? "#111" : "#fff",
+                  color: active ? "#fff" : "#111",
+                  cursor: "pointer",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                {MODE_LABELS[m]}
+              </button>
+            );
+          })}
+
+          {showUpgradePill ? (
+            <button
+              key="upgrade"
+              onClick={() => {
                 setShowModePicker(false);
+                goToUpgrade();
               }}
               style={{
                 padding: "8px 12px",
                 borderRadius: 999,
                 border: "1px solid #ddd",
-                background: active ? "#111" : "#fff",
-                color: active ? "#fff" : "#111",
-                opacity: disabled ? 0.45 : 1,
-                cursor: disabled ? "not-allowed" : "pointer",
+                background: "#fff",
+                color: "#111",
+                cursor: "pointer",
                 whiteSpace: "nowrap",
               }}
             >
-              {MODE_LABELS[m]}
+              Upgrade
             </button>
-          );
-        })
+          ) : null}
+        </>
       )}
     </div>
   );
