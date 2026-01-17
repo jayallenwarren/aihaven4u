@@ -30,6 +30,43 @@ const PauseIcon = ({ size = 18 }: { size?: number }) => (
   </svg>
 );
 
+const SaveIcon = ({ size = 18 }: { size?: number }) => (
+  <svg
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="2"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+  >
+    <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" />
+    <polyline points="17 21 17 13 7 13 7 21" />
+    <polyline points="7 3 7 8 15 8" />
+  </svg>
+);
+
+const TrashIcon = ({ size = 18 }: { size?: number }) => (
+  <svg
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="2"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+  >
+    <polyline points="3 6 5 6 21 6" />
+    <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+    <path d="M10 11v6" />
+    <path d="M14 11v6" />
+    <path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
+  </svg>
+);
+
+
 type Role = "user" | "assistant";
 type Msg = { role: Role; content: string };
 
@@ -181,8 +218,6 @@ function formatDidError(err: any): string {
 }
 
 const UPGRADE_URL = "https://www.aihaven4u.com/pricing-plans/list";
-
-const MEMORY_USER_KEY_STORAGE = "AIHAVEN_MEMORY_USER_KEY";
 
 const MODE_LABELS: Record<Mode, string> = {
   friend: "Friend",
@@ -388,8 +423,7 @@ export default function Page() {
 
 
   const sessionIdRef = useRef<string | null>(null);
-  // Stable key used for saving/recalling chat summaries (stored in localStorage only after user opt-in).
-  const memoryUserKeyRef = useRef<string | null>(null);
+  const toastTimerRef = useRef<number | null>(null);
 
   // -----------------------
   // Debug overlay (mobile-friendly)
@@ -489,16 +523,7 @@ export default function Page() {
     try {
       pushDebug("log", "Debug enabled", {
         href: window.location.href,
-        origin: window.location.origin,
-        referrer: document.referrer || null,
         embedded: isEmbedded,
-        topHref: (() => {
-          try {
-            return window.top?.location?.href ?? null;
-          } catch {
-            return null;
-          }
-        })(),
         ua: navigator.userAgent,
       });
     } catch {
@@ -1294,6 +1319,17 @@ const playLocalTtsUrl = useCallback(
     [isIOS],
   );
 
+  const showToast = useCallback((msg: string) => {
+    setToastMessage(msg);
+    if (toastTimerRef.current) {
+      window.clearTimeout(toastTimerRef.current);
+    }
+    toastTimerRef.current = window.setTimeout(() => {
+      setToastMessage(null);
+    }, 2500);
+  }, []);
+
+
   // Stop any in-progress local (audio-only) TTS playback immediately.
   // This is required so the Stop button can reliably interrupt audio-only conversations.
   const stopLocalTtsPlayback = useCallback(() => {
@@ -1517,26 +1553,16 @@ const speakAssistantReply = useCallback(
     sessionIdRef.current = id;
   }, []);
 
-  // Load existing stable memory key (if the user has previously saved a summary on this device)
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    try {
-      const k = window.localStorage.getItem(MEMORY_USER_KEY_STORAGE);
-      if (k) memoryUserKeyRef.current = k;
-    } catch {}
-  }, []);
-
   const [input, setInput] = useState("");
   const [messages, setMessages] = useState<Msg[]>([]);
   const [loading, setLoading] = useState(false);
   const [showClearMessagesConfirm, setShowClearMessagesConfirm] = useState(false);
-  const clearEpochRef = useRef(0);
 
-  // Save-summary consent modal + status
   const [showSaveSummaryConfirm, setShowSaveSummaryConfirm] = useState(false);
-  const [isSavingSummary, setIsSavingSummary] = useState(false);
-  const [saveSummaryError, setSaveSummaryError] = useState<string | null>(null);
-  const [saveSummaryToast, setSaveSummaryToast] = useState<string | null>(null);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [savingSummary, setSavingSummary] = useState(false);
+
+  const clearEpochRef = useRef(0);
 
   const [chatStatus, setChatStatus] = useState<ChatStatus>("safe");
 
@@ -1725,17 +1751,6 @@ useEffect(() => {
       const data = event.data;
       if (!data || data.type !== "WEEKLY_PLAN") return;
 
-      // If Wix passes a stable member id, use it as memory user_key so summaries sync across devices.
-      // (Requires adding memberId to the Wix Velo payload.)
-      const memberId = typeof (data as any).memberId === "string" ? (data as any).memberId.trim() : "";
-      if (memberId) {
-        memoryUserKeyRef.current = memberId;
-        try {
-          localStorage.setItem(MEMORY_USER_KEY_STORAGE, memberId);
-        } catch {}
-      }
-
-
       const incomingPlan = (data.planName ?? null) as PlanName;
       setPlanName(incomingPlan);
 
@@ -1809,60 +1824,23 @@ const stateToSendWithCompanion: SessionState = {
   companion_name: companionForBackend,
 };
 
-    const url = `${API_BASE}/chat`;
-    console.log("callChat:request", {
-      url,
-      wants_explicit,
-      msgCount: nextMessages.length,
-      companion: companionForBackend,
-      hasUserKey: Boolean(memoryUserKeyRef.current),
+    const res = await fetch(`${API_BASE}/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id,
+        wants_explicit,
+        session_state: stateToSendWithCompanion,
+        messages: nextMessages.map((m) => ({ role: m.role, content: m.content })),
+      }),
     });
 
-    try {
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          session_id,
-          ...(memoryUserKeyRef.current ? { user_key: memoryUserKeyRef.current } : {}),
-          wants_explicit,
-          session_state: stateToSendWithCompanion,
-          messages: nextMessages.map((m) => ({ role: m.role, content: m.content })),
-        }),
-      });
-
-      console.log("callChat:response", { url, status: res.status, ok: res.ok });
-
-      if (!res.ok) {
-        const errText = await res.text().catch(() => "");
-        throw new Error(`Backend error ${res.status}: ${errText}`);
-      }
-
-      return (await res.json()) as ChatApiResponse;
-    } catch (err) {
-      console.warn("callChat:fetch_failed", {
-        url,
-        err: String(err),
-        name: (err as any)?.name,
-        message: (err as any)?.message,
-      });
-
-      // Probe reachability without CORS, to help distinguish network vs CORS/preflight failures.
-      try {
-        const probeUrl = `${API_BASE}/health?cb=${Date.now()}`;
-        await fetch(probeUrl, { mode: "no-cors" });
-        console.warn("callChat:health_probe_no_cors_resolved", { probeUrl });
-      } catch (e2) {
-        console.warn("callChat:health_probe_no_cors_failed", {
-          probeUrl: `${API_BASE}/health`,
-          err: String(e2),
-          name: (e2 as any)?.name,
-          message: (e2 as any)?.message,
-        });
-      }
-
-      throw err;
+    if (!res.ok) {
+      const errText = await res.text().catch(() => "");
+      throw new Error(`Backend error ${res.status}: ${errText}`);
     }
+
+    return (await res.json()) as ChatApiResponse;
   }
 
   // This is the mode that drives the UI highlight:
@@ -2107,13 +2085,6 @@ const stateToSendWithCompanion: SessionState = {
       }
     } catch (err: any) {
       if (epochAtStart !== clearEpochRef.current) return;
-
-      console.warn("send:failed", {
-        err: String(err),
-        name: err?.name,
-        message: err?.message,
-      });
-
       setMessages((prev) => [
         ...prev,
         { role: "assistant", content: `Error: ${err?.message ?? "Unknown error"}` },
@@ -3054,7 +3025,31 @@ const speakGreetingIfNeeded = useCallback(
   }, [liveAvatarActive, stopLiveAvatar, stopLocalTtsPlayback, stopSpeechToText]);
 
   // Clear Messages (with confirmation)
-  const requestClearMessages = useCallback(() => {
+  
+
+  const requestSaveSummary = useCallback(() => {
+    setShowSaveSummaryConfirm(true);
+  }, []);
+
+  const cancelSaveSummary = useCallback(() => {
+    setShowSaveSummaryConfirm(false);
+  }, []);
+
+  const confirmSaveSummary = useCallback(async () => {
+    setShowSaveSummaryConfirm(false);
+
+    // Step 1 (UI-only): don't call backend yet. This is just to prove the UI change
+    // does NOT introduce the /chat "Load failed" error.
+    setSavingSummary(true);
+    try {
+      pushDebug('saveSummary:stub');
+      showToast('Save Summary (stub): UI is wired. Backend call disabled in this step.');
+    } finally {
+      setSavingSummary(false);
+    }
+  }, [pushDebug, showToast]);
+
+const requestClearMessages = useCallback(() => {
     // Stop all audio/video + STT immediately on click (even before the user confirms).
     // This is an overt user action and prevents the assistant from continuing to speak.
     clearEpochRef.current += 1;
@@ -3068,69 +3063,6 @@ const speakGreetingIfNeeded = useCallback(
 
     setShowClearMessagesConfirm(true);
   }, [stopHandsFreeSTT]);
-
-  // Save Summary (with confirmation)
-  const requestSaveSummary = useCallback(() => {
-    setSaveSummaryError(null);
-    setSaveSummaryToast(null);
-    setShowSaveSummaryConfirm(true);
-  }, []);
-
-  const saveChatSummary = useCallback(async () => {
-    const sid = sessionIdRef.current || "anon";
-    const companion = (companionName || "").trim();
-    if (!companion) {
-      throw new Error("No companion is selected (nothing to save).");
-    }
-
-    // Create a stable, device-local key only when the user explicitly chooses to save.
-    let userKey = memoryUserKeyRef.current;
-    if (!userKey) {
-      const gen =
-        typeof crypto !== "undefined" && "randomUUID" in crypto
-          ? (crypto as any).randomUUID()
-          : `mem_${Date.now()}_${Math.random().toString(16).slice(2)}`;
-      userKey = String(gen);
-      memoryUserKeyRef.current = userKey;
-      try {
-        window.localStorage.setItem(MEMORY_USER_KEY_STORAGE, userKey);
-      } catch {}
-    }
-
-    // Keep payload small-ish (last ~80 turns) to avoid prompt limits.
-    const trimmed = messages.slice(Math.max(0, messages.length - 80));
-
-    const saveUrl = `${API_BASE}/memory/save`;
-    console.log("memory:save.request", {
-      url: saveUrl,
-      session_id: sid,
-      companion,
-      relationship_mode: sessionState.mode,
-      msgCount: trimmed.length,
-      hasUserKey: Boolean(userKey),
-    });
-
-    const res = await fetch(saveUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        session_id: sid,
-        user_key: userKey,
-        companion,
-        relationship_mode: sessionState.mode,
-        messages: trimmed,
-      }),
-    });
-
-    console.log("memory:save.response", { url: saveUrl, status: res.status, ok: res.ok });
-
-    if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      throw new Error(text || `Save failed (${res.status})`);
-    }
-
-    return (await res.json().catch(() => ({}))) as any;
-  }, [API_BASE, companionName, messages, sessionState.mode]);
 
   // After the Clear Messages dialog is dismissed with NO, iOS can sometimes route
   // subsequent audio to the quiet receiver / low-volume path. We "nudge" the
@@ -3197,13 +3129,6 @@ const speakGreetingIfNeeded = useCallback(
       } catch {}
     } catch {}
   }, [isIOS, primeLocalTtsAudio, ensureIphoneAudioContextUnlocked]);
-
-  // Auto-hide save toast
-  useEffect(() => {
-    if (!saveSummaryToast) return;
-    const t = window.setTimeout(() => setSaveSummaryToast(null), 2500);
-    return () => window.clearTimeout(t);
-  }, [saveSummaryToast]);
 
 
   // Cleanup
@@ -3620,47 +3545,47 @@ const speakGreetingIfNeeded = useCallback(
           </div>
 
           <div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap", alignItems: "center" }}>
-            {/** Input line with mode pills moved to the right (layout-only). */}<button
-              type="button"
-              onClick={requestSaveSummary}
-              title="Save chat summary"
-              aria-label="Save chat summary"
-              disabled={loading || isSavingSummary}
-              style={{
-                width: 44,
-                height: 44,
-                padding: 0,
-                borderRadius: 10,
-                border: "1px solid #bbb",
-                background: "#fff",
-                cursor: loading || isSavingSummary ? "not-allowed" : "pointer",
-                opacity: loading || isSavingSummary ? 0.6 : 1,
-                fontSize: 18,
-              }}
-            >
-              💾
-            </button>
-
+            {/** Input line with mode pills moved to the right (layout-only). */}
             <button
-              type="button"
-              onClick={requestClearMessages}
-              title="Delete messages"
-              aria-label="Delete messages"
-              style={{
-                width: 44,
-                height: 44,
-                padding: 0,
-                borderRadius: 10,
-                border: "1px solid #bbb",
-                background: "#fff",
-                cursor: "pointer",
-                fontSize: 18,
-              }}
-            >
-              🗑️
-            </button>
-
-            
+                onClick={requestSaveSummary}
+                disabled={loading || savingSummary || !messages.length}
+                title="Save chat summary"
+                aria-label="Save chat summary"
+                style={{
+                  marginRight: 8,
+                  border: "1px solid #d1d5db",
+                  borderRadius: 8,
+                  padding: "10px 12px",
+                  fontSize: 13,
+                  background: "#f9fafb",
+                  cursor: "pointer",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                }}
+              >
+                <SaveIcon size={18} />
+              </button>
+              <button
+                onClick={requestClearMessages}
+                disabled={loading || !!pendingStopReasonRef.current || isClearingMessagesRef.current}
+                title="Clear messages"
+                aria-label="Clear messages"
+                style={{
+                  marginRight: 8,
+                  border: "1px solid #d1d5db",
+                  borderRadius: 8,
+                  padding: "10px 12px",
+                  fontSize: 13,
+                  background: "#f9fafb",
+                  cursor: "pointer",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                }}
+              >
+                <TrashIcon size={18} />
+              </button>
 
             <input
               value={input}
@@ -3700,13 +3625,6 @@ const speakGreetingIfNeeded = useCallback(
 	          {sttError ? (
 	            <div style={{ marginTop: 6, fontSize: 12, color: "#b00020" }}>{sttError}</div>
 	          ) : null}
-
-          {saveSummaryToast ? (
-            <div style={{ marginTop: 6, fontSize: 12, color: "#0a7" }}>{saveSummaryToast}</div>
-          ) : null}
-          {saveSummaryError ? (
-            <div style={{ marginTop: 6, fontSize: 12, color: "#b00020" }}>{saveSummaryError}</div>
-          ) : null}
         </div>
       </section>
 
@@ -3781,98 +3699,69 @@ const speakGreetingIfNeeded = useCallback(
         </div>
       )}
 
-      {/* Save Summary confirm overlay */}
       {showSaveSummaryConfirm && (
         <div
           style={{
             position: "fixed",
-            inset: 0,
-            background: "rgba(0,0,0,0.4)",
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+            background: "rgba(0,0,0,0.55)",
+            zIndex: 9999,
             display: "flex",
             alignItems: "center",
             justifyContent: "center",
             padding: 16,
-            zIndex: 9999,
           }}
         >
           <div
             style={{
+              width: "min(520px, 100%)",
               background: "#fff",
               borderRadius: 12,
+              border: "1px solid #e5e7eb",
               padding: 16,
-              maxWidth: 560,
-              width: "100%",
             }}
           >
-            <h3 style={{ marginTop: 0 }}>Save chat summary?</h3>
-            <p style={{ marginTop: 0 }}>
-              You are authorizing AI Haven 4U to save a <b>summary</b> of this chat for use in future
-              conversations with this companion.
+            <h3 style={{ marginTop: 0 }}>Save Chat Summary?</h3>
+            <p style={{ marginBottom: 12, lineHeight: 1.4 }}>
+              This will save a short summary of your conversation so this companion can remember it in future sessions.
+              <br />
+              (Step 1: UI wiring only — backend call is intentionally disabled.)
             </p>
-            <p style={{ marginTop: 0, color: "#555", fontSize: 13 }}>
-              Companion: <b>{companionName || "(unknown)"}</b>
-            </p>
-
-            {saveSummaryError ? (
-              <div style={{ marginTop: 8, fontSize: 12, color: "#b00020" }}>{saveSummaryError}</div>
-            ) : null}
-
-            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 12 }}>
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
               <button
-                type="button"
-                disabled={isSavingSummary}
-                onClick={() => {
-                  setShowSaveSummaryConfirm(false);
-                  setSaveSummaryError(null);
-                  // Mimic the Clear-Messages cancel path: re-prime audio so volumes stay stable.
-                  void restoreVolumesAfterClearCancel();
-                }}
+                onClick={cancelSaveSummary}
                 style={{
                   padding: "10px 12px",
                   borderRadius: 10,
-                  border: "1px solid #999",
+                  border: "1px solid #d1d5db",
                   background: "#fff",
-                  cursor: isSavingSummary ? "not-allowed" : "pointer",
+                  cursor: "pointer",
                 }}
               >
-                No
+                Cancel
               </button>
               <button
-                type="button"
-                disabled={isSavingSummary}
-                onClick={async () => {
-                  try {
-                    setIsSavingSummary(true);
-                    setSaveSummaryError(null);
-
-                    // Keep the audio chain healthy (same idea as the Clear-Messages flow),
-                    // but DO NOT stop media or clear messages.
-                    void restoreVolumesAfterClearCancel();
-
-                    await saveChatSummary();
-                    setShowSaveSummaryConfirm(false);
-                    setSaveSummaryToast("Saved summary.");
-                  } catch (e) {
-                    setSaveSummaryError(String(e));
-                  } finally {
-                    setIsSavingSummary(false);
-                  }
-                }}
+                onClick={confirmSaveSummary}
+                disabled={savingSummary}
                 style={{
                   padding: "10px 12px",
                   borderRadius: 10,
-                  border: "1px solid #111",
-                  background: "#111",
+                  border: "1px solid #111827",
+                  background: savingSummary ? "#9ca3af" : "#111827",
                   color: "#fff",
-                  cursor: isSavingSummary ? "not-allowed" : "pointer",
+                  cursor: savingSummary ? "not-allowed" : "pointer",
                 }}
               >
-                {isSavingSummary ? "Saving..." : "Yes, save"}
+                Save
               </button>
             </div>
           </div>
         </div>
       )}
+
 
 {/* Consent overlay */}
       {showConsentOverlay && (
@@ -4076,6 +3965,28 @@ const speakGreetingIfNeeded = useCallback(
           <div style={{ marginTop: 8, fontSize: 11, opacity: 0.85 }}>
             Tip: Tap the avatar image 5 times to toggle this overlay.
           </div>
+        </div>
+      )}
+
+
+      {toastMessage && (
+        <div
+          style={{
+            position: "fixed",
+            bottom: 20,
+            left: "50%",
+            transform: "translateX(-50%)",
+            background: "rgba(0,0,0,0.85)",
+            color: "#fff",
+            padding: "10px 14px",
+            borderRadius: 12,
+            fontSize: 13,
+            zIndex: 10001,
+            maxWidth: "90%",
+            textAlign: "center",
+          }}
+        >
+          {toastMessage}
         </div>
       )}
 
