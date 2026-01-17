@@ -33,6 +33,15 @@ const PauseIcon = ({ size = 18 }: { size?: number }) => (
 type Role = "user" | "assistant";
 type Msg = { role: Role; content: string };
 
+type SavedChatSummary = {
+  id: string;
+  createdAt: number;
+  sessionId: string;
+  companionName: string;
+  messageCount: number;
+  summary: string;
+};
+
 type Mode = "friend" | "romantic" | "intimate";
 type ChatStatus = "safe" | "explicit_blocked" | "explicit_allowed";
 
@@ -74,6 +83,7 @@ type CompanionMeta = {
 const DEFAULT_COMPANION_NAME = "Haven";
 const HEADSHOT_DIR = "/companion/headshot";
 const GREET_ONCE_KEY = "AIHAVEN_GREETED";
+const CHAT_SUMMARIES_KEY = "AIHAVEN_CHAT_SUMMARIES";
 const DEFAULT_AVATAR = havenHeart.src;
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
@@ -1508,7 +1518,24 @@ const speakAssistantReply = useCallback(
   const [messages, setMessages] = useState<Msg[]>([]);
   const [loading, setLoading] = useState(false);
   const [showClearMessagesConfirm, setShowClearMessagesConfirm] = useState(false);
+  const [showSaveSummaryConfirm, setShowSaveSummaryConfirm] = useState(false);
+  const [savedSummaries, setSavedSummaries] = useState<SavedChatSummary[]>([]);
   const clearEpochRef = useRef(0);
+
+  // Load any previously saved chat summaries (local, per-browser).
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      const raw = window.localStorage.getItem(CHAT_SUMMARIES_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        setSavedSummaries(parsed as SavedChatSummary[]);
+      }
+    } catch {
+      // ignore
+    }
+  }, []);
 
   const [chatStatus, setChatStatus] = useState<ChatStatus>("safe");
 
@@ -2970,6 +2997,61 @@ const speakGreetingIfNeeded = useCallback(
     }
   }, [liveAvatarActive, stopLiveAvatar, stopLocalTtsPlayback, stopSpeechToText]);
 
+  // Build a lightweight local summary for future reference.
+  // NOTE: This is intentionally deterministic and runs fully client-side.
+  const buildChatSummary = useCallback((msgs: Msg[]) => {
+    const take = 24;
+    const recent = (msgs || []).slice(-take);
+    const lines = recent
+      .map((m) => {
+        const who = m.role === "assistant" ? (companionName || DEFAULT_COMPANION_NAME) : "You";
+        const text = String(m.content || "").replace(/\s+/g, " ").trim();
+        return `${who}: ${text}`;
+      })
+      .filter(Boolean);
+
+    const joined = lines.join("\n");
+    // Keep saved payload small and predictable.
+    const maxChars = 4000;
+    return joined.length > maxChars ? joined.slice(0, maxChars - 1) + "…" : joined;
+  }, [companionName]);
+
+  const persistChatSummary = useCallback((summaryText: string) => {
+    if (typeof window === "undefined") return;
+    const sessionId = String(sessionIdRef.current || "").trim();
+    const rec: SavedChatSummary = {
+      id: (crypto as any).randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      createdAt: Date.now(),
+      sessionId,
+      companionName: companionName || DEFAULT_COMPANION_NAME,
+      messageCount: messages.length,
+      summary: summaryText,
+    };
+
+    setSavedSummaries((prev) => {
+      const next = [rec, ...(prev || [])].slice(0, 50);
+      try {
+        window.localStorage.setItem(CHAT_SUMMARIES_KEY, JSON.stringify(next));
+      } catch {
+        // ignore
+      }
+      return next;
+    });
+  }, [companionName, messages.length]);
+
+  // Save Chat Summary (with confirmation)
+  const requestSaveSummary = useCallback(() => {
+    // Match the Clear Messages safety behavior: stop all audio/video + STT immediately
+    // (even before the user confirms) so nothing continues speaking while the user is in a modal.
+    setLoading(false);
+    try {
+      stopHandsFreeSTT();
+    } catch {
+      // ignore
+    }
+    setShowSaveSummaryConfirm(true);
+  }, [stopHandsFreeSTT]);
+
   // Clear Messages (with confirmation)
   const requestClearMessages = useCallback(() => {
     // Stop all audio/video + STT immediately on click (even before the user confirms).
@@ -3470,6 +3552,23 @@ const speakGreetingIfNeeded = useCallback(
             {/** Input line with mode pills moved to the right (layout-only). */}
             <button
               type="button"
+              onClick={requestSaveSummary}
+              title="Save a summary of this conversation for future reference"
+              style={{
+                padding: "10px 12px",
+                borderRadius: 10,
+                border: "1px solid #bbb",
+                background: "#fff",
+                cursor: "pointer",
+                minWidth: 44,
+              }}
+              aria-label="Save chat summary"
+            >
+              💾
+            </button>
+
+            <button
+              type="button"
               onClick={requestClearMessages}
               title="Clear the conversation on screen"
               style={{
@@ -3478,9 +3577,11 @@ const speakGreetingIfNeeded = useCallback(
                 border: "1px solid #bbb",
                 background: "#fff",
                 cursor: "pointer",
+                minWidth: 44,
               }}
+              aria-label="Delete / clear messages"
             >
-              Clear Messages
+              🗑️
             </button>
 
             <input
@@ -3523,6 +3624,91 @@ const speakGreetingIfNeeded = useCallback(
 	          ) : null}
         </div>
       </section>
+
+      {/* Save Summary confirmation overlay */}
+      {showSaveSummaryConfirm && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.4)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: 16,
+            zIndex: 10001,
+          }}
+        >
+          <div
+            style={{
+              background: "#fff",
+              borderRadius: 12,
+              padding: 16,
+              maxWidth: 520,
+              width: "100%",
+              boxShadow: "0 8px 30px rgba(0,0,0,0.25)",
+            }}
+          >
+            <div style={{ fontSize: 18, fontWeight: 700, marginBottom: 8 }}>Save chat summary?</div>
+            <div style={{ fontSize: 14, color: "#333", lineHeight: 1.4 }}>
+              This will save a local summary of the conversation in your browser for future reference.
+              By continuing, you authorize saving this chat summary data.
+              Audio and video have been stopped.
+            </div>
+
+            <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", marginTop: 14 }}>
+              <button
+                type="button"
+                onClick={() => {
+                  setShowSaveSummaryConfirm(false);
+                  void restoreVolumesAfterClearCancel();
+                }}
+                style={{
+                  padding: "10px 14px",
+                  borderRadius: 10,
+                  border: "1px solid #bbb",
+                  background: "#fff",
+                  cursor: "pointer",
+                }}
+              >
+                No
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  try {
+                    const summary = buildChatSummary(messages);
+                    if (summary && summary.trim()) {
+                      persistChatSummary(summary);
+                      setMessages((prev) => [
+                        ...prev,
+                        {
+                          role: "assistant",
+                          content: "Saved a summary of this conversation for future reference.",
+                        },
+                      ]);
+                    }
+                  } catch {
+                    // ignore
+                  }
+                  setShowSaveSummaryConfirm(false);
+                  void restoreVolumesAfterClearCancel();
+                }}
+                style={{
+                  padding: "10px 14px",
+                  borderRadius: 10,
+                  border: "1px solid #111",
+                  background: "#111",
+                  color: "#fff",
+                  cursor: "pointer",
+                }}
+              >
+                Yes, save
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Clear Messages confirmation overlay */}
       {showClearMessagesConfirm && (
