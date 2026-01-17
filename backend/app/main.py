@@ -10,6 +10,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from urllib.parse import urlparse
+from starlette.responses import Response
+from starlette.types import ASGIApp, Receive, Send, Scope
 
 # Threadpool helper (prevents blocking the event loop on requests/azure upload)
 from starlette.concurrency import run_in_threadpool  # type: ignore
@@ -137,23 +140,6 @@ cors_env = (
     or ""
 ).strip()
 
-# Safe fallback: if CORS_ALLOW_ORIGINS is missing/empty in the runtime environment,
-# still allow the known production origins so browser calls don’t hard-fail with
-# Safari’s "TypeError: Load failed". This keeps behavior consistent across deploys
-# without opening CORS to every domain (no wildcard).
-DEFAULT_CORS_ALLOW_ORIGINS: list[str] = [
-    "https://aihaven4u.com",
-    "https://www.aihaven4u.com",
-    "https://editor.wix.com",
-    "https://manage.wix.com",
-    "https://yellow-hill-0a40ae30f.3.azurestaticapps.net",
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-]
-
-if not cors_env:
-    cors_env = ",".join(DEFAULT_CORS_ALLOW_ORIGINS)
-
 def _split_cors_origins(raw: str) -> list[str]:
     """Split + normalize CORS origins from an env var.
 
@@ -169,8 +155,7 @@ def _split_cors_origins(raw: str) -> list[str]:
     for t in tokens:
         if not t:
             continue
-        # Allow portal/appsettings values wrapped in quotes.
-        t = t.strip().strip("\"").strip("'")
+        t = t.strip()
         if not t:
             continue
         if t != "*" and t.endswith("/"):
@@ -179,6 +164,117 @@ def _split_cors_origins(raw: str) -> list[str]:
             out.append(t)
             seen.add(t)
     return out
+
+
+
+class NullOriginRefererCORSMiddleware:
+    """Handle Safari/Wix embedded cases where the browser sends Origin: "null".
+
+    We do NOT allow all "null" origins. We only allow Origin:"null" when the
+    Referer origin (scheme://host) is in the allowed CORS origins list (or matches
+    the allowed origin regex).
+
+    This preserves the security model of exact allow-lists while unblocking
+    sandboxed iframe requests.
+    """
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        allow_origins: list[str] | None = None,
+        allow_origin_regex: str | None = None,
+        allow_credentials: bool = True,
+    ) -> None:
+        self.app = app
+        self._allow_origins = set(allow_origins or [])
+        self._allow_origin_regex_raw = allow_origin_regex
+        self._allow_origin_regex = re.compile(allow_origin_regex) if allow_origin_regex else None
+        self._allow_credentials = allow_credentials
+
+    def _referer_origin_allowed(self, referer: str | None) -> bool:
+        if not referer:
+            return False
+        try:
+            u = urlparse(referer)
+            if not u.scheme or not u.netloc:
+                return False
+            ref_origin = f"{u.scheme}://{u.netloc}"
+        except Exception:
+            return False
+
+        if ref_origin in self._allow_origins:
+            return True
+        if self._allow_origin_regex and self._allow_origin_regex.match(ref_origin):
+            return True
+        return False
+
+    def _add_header(self, headers: list[tuple[bytes, bytes]], name: str, value: str) -> None:
+        headers.append((name.encode("latin-1"), value.encode("latin-1")))
+
+    def _upsert_vary(self, headers: list[tuple[bytes, bytes]], value: str) -> None:
+        # Ensure 'Vary: Origin' is present (append if Vary already exists).
+        name_b = b"vary"
+        existing_idx = None
+        existing_val = None
+        for i, (k, v) in enumerate(headers):
+            if k.lower() == name_b:
+                existing_idx = i
+                existing_val = v.decode("latin-1")
+                break
+        if existing_idx is None:
+            self._add_header(headers, "Vary", value)
+            return
+        parts = [p.strip() for p in existing_val.split(",") if p.strip()]
+        if value not in parts:
+            parts.append(value)
+            headers[existing_idx] = (headers[existing_idx][0], ", ".join(parts).encode("latin-1"))
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        # Build a case-insensitive headers dict
+        hdrs = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
+        origin = hdrs.get("origin")
+        if origin != "null":
+            await self.app(scope, receive, send)
+            return
+
+        # Only allow Origin:"null" when Referer origin is allowed.
+        if not self._referer_origin_allowed(hdrs.get("referer")):
+            await self.app(scope, receive, send)
+            return
+
+        # Handle preflight locally
+        if scope.get("method") == "OPTIONS":
+            acrm = hdrs.get("access-control-request-method") or "POST"
+            acrh = hdrs.get("access-control-request-headers") or ""
+            resp_headers = {
+                "Access-Control-Allow-Origin": "null",
+                "Access-Control-Allow-Methods": acrm,
+                "Access-Control-Allow-Headers": acrh if acrh else "*",
+                "Access-Control-Max-Age": "86400",
+                "Vary": "Origin",
+            }
+            if self._allow_credentials:
+                resp_headers["Access-Control-Allow-Credentials"] = "true"
+
+            response = Response(status_code=200, content=b"", headers=resp_headers)
+            await response(scope, receive, send)
+            return
+
+        async def send_wrapper(message):
+            if message.get("type") == "http.response.start":
+                headers = list(message.get("headers", []))
+                self._add_header(headers, "Access-Control-Allow-Origin", "null")
+                if self._allow_credentials:
+                    self._add_header(headers, "Access-Control-Allow-Credentials", "true")
+                self._upsert_vary(headers, "Origin")
+                message["headers"] = headers
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
 
 raw_items = _split_cors_origins(cors_env)
 allow_all = (len(raw_items) == 1 and raw_items[0] == "*")
@@ -216,6 +312,13 @@ else:
         print("[CORS] WARNING: CORS_ALLOW_ORIGINS is empty. Browser requests from other origins will be blocked.")
 
 app.add_middleware(
+    NullOriginRefererCORSMiddleware,
+    allow_origins=allow_origins,
+    allow_origin_regex=allow_origin_regex,
+    allow_credentials=allow_credentials,
+)
+
+app.add_middleware(
     CORSMiddleware,
     allow_origins=allow_origins,
     allow_origin_regex=allow_origin_regex,
@@ -223,16 +326,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-@app.exception_handler(Exception)
-async def _unhandled_exception_handler(request: Request, exc: Exception):
-    # Ensure we always return a proper JSON response (and therefore CORS headers)
-    # instead of crashing the connection, which Safari reports as "Load failed".
-    try:
-        print(f"[ERROR] Unhandled exception at {request.url.path}: {exc}")
-    except Exception:
-        pass
-    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
 # ----------------------------
 # Routes
