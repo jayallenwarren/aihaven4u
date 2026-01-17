@@ -576,7 +576,9 @@ export default function Page() {
   // - Local TTS <audio>/<video> playback (hands-free STT mode)
   // - Live Avatar <video> element playback (non-iPhone)
   // iPhone Live Avatar already routes MediaStream audio through WebAudio (see applyIphoneLiveAvatarAudioBoost).
-  const TTS_GAIN = 3.0;
+  // Volume boost for audio-only TTS and non-iPhone Live Avatar.
+  // Note: We intentionally use WebAudio gain to exceed HTMLMediaElement.volume (max 1.0).
+  const TTS_GAIN = 6.0;
   const ttsAudioCtxRef = useRef<AudioContext | null>(null);
   const ttsAudioMediaSrcRef = useRef<MediaElementAudioSourceNode | null>(null);
   const ttsAudioGainRef = useRef<GainNode | null>(null);
@@ -613,12 +615,9 @@ export default function Page() {
       // iPhone Live Avatar uses MediaStream routing; do not double-route the <video> element.
       if (kind === "avatar" && isIphone) return;
 
-      // IMPORTANT: Once a MediaElementAudioSourceNode is created for an element, that element's audio is
-      // routed through the AudioContext graph. If we ever disconnect without successfully reconnecting,
-      // playback can become silent. Therefore we make routing "fail-open" and always ensure a path to
-      // ctx.destination even if something throws.
       try {
-        // If the underlying media element instance changed, recreate its MediaElementSourceNode.
+        // If the underlying media element instance changed (common when Live Avatar is stopped/started
+        // or when hidden TTS elements are re-mounted), we must recreate the MediaElementSourceNode.
         // Source nodes are permanently bound to a single element.
         if (kind === "audio" && ttsAudioBoundElRef.current !== media) {
           try { ttsAudioMediaSrcRef.current?.disconnect(); } catch {}
@@ -636,6 +635,8 @@ export default function Page() {
           avatarVideoBoundElRef.current = media;
         }
 
+        // If we already created a MediaElementSourceNode for this media element, reuse it.
+        // (Browsers throw if you call createMediaElementSource() more than once per element.)
         let src: MediaElementAudioSourceNode | null = null;
         let gain: GainNode | null = null;
 
@@ -674,32 +675,25 @@ export default function Page() {
           }
         }
 
-        // Set element properties first.
+        // Defensive: ensure we only connect once.
+        try {
+          src.disconnect();
+        } catch {}
+        try {
+          gain.disconnect();
+        } catch {}
+
+        gain.gain.value = TTS_GAIN;
+        src.connect(gain);
+        gain.connect(ctx.destination);
+
+        // Keep element volume at max so the gain node is the only limiter.
         try {
           media.muted = false;
           media.volume = 1;
         } catch {}
-
-        // Configure gain.
-        try {
-          gain.gain.value = TTS_GAIN;
-        } catch {}
-
-        // Reconnect defensively: if anything fails, connect src directly to destination.
-        try {
-          try { src.disconnect(); } catch {}
-          try { gain.disconnect(); } catch {}
-
-          src.connect(gain);
-          gain.connect(ctx.destination);
-        } catch {
-          try {
-            try { src.disconnect(); } catch {}
-            src.connect(ctx.destination);
-          } catch {}
-        }
-      } catch {
-        // If routing fails (e.g., CORS restrictions), keep normal element playback path enabled.
+      } catch (e) {
+        // If this fails (e.g., cross-origin media restrictions), we still keep media.volume at 1.
         try {
           media.muted = false;
           media.volume = 1;
@@ -845,7 +839,8 @@ const applyIphoneLiveAvatarAudioBoost = useCallback(
       const gain = ctx.createGain();
 
       // Boost amount tuned for iPhone; iPad/Desktop already fine.
-      gain.gain.value = 2.6;
+      // Use a higher gain because iPhone often routes WebRTC audio at a receiver-like level.
+      gain.gain.value = 4.5;
 
       source.connect(gain);
       gain.connect(ctx.destination);
@@ -1713,7 +1708,6 @@ const speakAssistantReply = useCallback(
   const [messages, setMessages] = useState<Msg[]>([]);
   const [loading, setLoading] = useState(false);
   const [showClearMessagesConfirm, setShowClearMessagesConfirm] = useState(false);
-  const clearDialogPrevStateRef = useRef<{ sttEnabled: boolean; liveAvatarActive: boolean } | null>(null);
   const clearEpochRef = useRef(0);
 
   const [chatStatus, setChatStatus] = useState<ChatStatus>("safe");
@@ -3191,17 +3185,6 @@ const speakGreetingIfNeeded = useCallback(
 
   // Clear Messages (with confirmation)
   const requestClearMessages = useCallback(() => {
-    // Capture current runtime state so we can restore it if the user cancels.
-    // (We still stop playback immediately to respect the explicit user action.)
-    try {
-      clearDialogPrevStateRef.current = {
-        sttEnabled: Boolean(sttEnabledRef.current),
-        liveAvatarActive: Boolean(liveAvatarActive),
-      };
-    } catch {
-      clearDialogPrevStateRef.current = null;
-    }
-
     // Stop all audio/video + STT immediately on click (even before the user confirms).
     // This is an overt user action and prevents the assistant from continuing to speak.
     clearEpochRef.current += 1;
@@ -3219,7 +3202,7 @@ const speakGreetingIfNeeded = useCallback(
     } catch {}
 
     setShowClearMessagesConfirm(true);
-  }, [stopHandsFreeSTT, boostAllTtsVolumes, liveAvatarActive]);
+  }, [stopHandsFreeSTT, boostAllTtsVolumes]);
 
   // After the Clear Messages dialog is dismissed with NO, iOS can sometimes route
   // subsequent audio to the quiet receiver / low-volume path. We "nudge" the
@@ -3819,7 +3802,7 @@ const speakGreetingIfNeeded = useCallback(
           >
             <div style={{ fontSize: 18, fontWeight: 700, marginBottom: 8 }}>Clear messages?</div>
             <div style={{ fontSize: 14, color: "#333", lineHeight: 1.4 }}>
-              This will clear the conversation on your screen. Audio and video have been stopped.
+              This will clear the conversation on your screen. All audio, video, and mic listening have been stopped. You can resume manually using the controls after closing this dialog.
             </div>
 
             <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", marginTop: 14 }}>
@@ -3831,21 +3814,6 @@ const speakGreetingIfNeeded = useCallback(
                     try { boostAllTtsVolumes(); } catch {}
                     // Restore audio routing/volume immediately.
                     void restoreVolumesAfterClearCancel();
-
-                    // If the user cancels, restore the prior mic/live-avatar state.
-                    // (We stopped them optimistically when the dialog opened.)
-                    const prev = clearDialogPrevStateRef.current;
-                    clearDialogPrevStateRef.current = null;
-                    if (prev?.liveAvatarActive) {
-                      void startLiveAvatar().finally(() => {
-                        try { boostAllTtsVolumes(); } catch {}
-                      });
-                    }
-                    if (prev?.sttEnabled) {
-                      void startSpeechToText({ forceBrowser: true, suppressGreeting: true }).finally(() => {
-                        try { boostAllTtsVolumes(); } catch {}
-                      });
-                    }
                   }}
                 style={{
                   padding: "10px 14px",
@@ -3863,7 +3831,6 @@ const speakGreetingIfNeeded = useCallback(
                   setMessages([]);
                   setInput("");
                   setShowClearMessagesConfirm(false);
-                  clearDialogPrevStateRef.current = null;
                   // User gesture: restore boosted routing so subsequent TTS isn't quiet.
                   try { boostAllTtsVolumes(); } catch {}
                   // Re-prime audio outputs after a hard stop so Audio TTS doesn't come back quiet (iOS/Safari).
