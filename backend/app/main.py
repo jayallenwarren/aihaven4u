@@ -137,6 +137,23 @@ cors_env = (
     or ""
 ).strip()
 
+# Safe fallback: if CORS_ALLOW_ORIGINS is missing/empty in the runtime environment,
+# still allow the known production origins so browser calls don’t hard-fail with
+# Safari’s "TypeError: Load failed". This keeps behavior consistent across deploys
+# without opening CORS to every domain (no wildcard).
+DEFAULT_CORS_ALLOW_ORIGINS: list[str] = [
+    "https://aihaven4u.com",
+    "https://www.aihaven4u.com",
+    "https://editor.wix.com",
+    "https://manage.wix.com",
+    "https://yellow-hill-0a40ae30f.3.azurestaticapps.net",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+
+if not cors_env:
+    cors_env = ",".join(DEFAULT_CORS_ALLOW_ORIGINS)
+
 def _split_cors_origins(raw: str) -> list[str]:
     """Split + normalize CORS origins from an env var.
 
@@ -152,7 +169,8 @@ def _split_cors_origins(raw: str) -> list[str]:
     for t in tokens:
         if not t:
             continue
-        t = t.strip()
+        # Allow portal/appsettings values wrapped in quotes.
+        t = t.strip().strip("\"").strip("'")
         if not t:
             continue
         if t != "*" and t.endswith("/"):
@@ -205,6 +223,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception):
+    # Ensure we always return a proper JSON response (and therefore CORS headers)
+    # instead of crashing the connection, which Safari reports as "Load failed".
+    try:
+        print(f"[ERROR] Unhandled exception at {request.url.path}: {exc}")
+    except Exception:
+        pass
+    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
 # ----------------------------
 # Routes

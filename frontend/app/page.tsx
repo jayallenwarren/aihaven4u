@@ -3614,25 +3614,6 @@ const speakGreetingIfNeeded = useCallback(
             {/** Input line with mode pills moved to the right (layout-only). */}
             <button
               type="button"
-              onClick={requestClearMessages}
-              title="Delete messages"
-              aria-label="Delete messages"
-              style={{
-                width: 44,
-                height: 44,
-                padding: 0,
-                borderRadius: 10,
-                border: "1px solid #bbb",
-                background: "#fff",
-                cursor: "pointer",
-                fontSize: 18,
-              }}
-            >
-              🗑️
-            </button>
-
-            <button
-              type="button"
               onClick={requestSaveSummary}
               title="Save chat summary"
               aria-label="Save chat summary"
@@ -3650,6 +3631,25 @@ const speakGreetingIfNeeded = useCallback(
               }}
             >
               💾
+            </button>
+
+            <button
+              type="button"
+              onClick={requestClearMessages}
+              title="Delete messages"
+              aria-label="Delete messages"
+              style={{
+                width: 44,
+                height: 44,
+                padding: 0,
+                borderRadius: 10,
+                border: "1px solid #bbb",
+                background: "#fff",
+                cursor: "pointer",
+                fontSize: 18,
+              }}
+            >
+              🗑️
             </button>
 
             <input
