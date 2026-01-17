@@ -655,6 +655,15 @@ export default function Page() {
       // iPhone Live Avatar uses MediaStream routing; do not double-route the <video> element.
       if (kind === "avatar" && isIphone) return;
 
+      // IMPORTANT: Audio-only TTS must remain on the hidden <video> path, but routing
+      // cross-origin media through WebAudio can result in silence on some browsers (notably iOS Safari)
+      // if the media response is not CORS-enabled. To guarantee audibility, we do NOT route
+      // local (audio-only) TTS through WebAudio GainNodes. (We still keep the hidden VIDEO element.)
+      if (kind === "audio" || kind === "video") {
+        try { media.muted = false; media.volume = 1; } catch {}
+        return;
+      }
+
       try {
         // If the underlying media element instance changed (common when Live Avatar is stopped/started
         // or when hidden TTS elements are re-mounted), we must recreate the MediaElementSourceNode.
@@ -755,9 +764,7 @@ export default function Page() {
 
   const boostAllTtsVolumes = useCallback(() => {
     try {
-      // Local TTS elements
-      applyTtsGainRouting(localTtsAudioRef.current, "audio");
-      applyTtsGainRouting(localTtsVideoRef.current, "video");
+      // Local (audio-only) TTS elements intentionally NOT routed through WebAudio.
       // Live avatar video element (non-iPhone)
       applyTtsGainRouting(avatarVideoRef.current, "avatar");
     } catch {
@@ -1345,11 +1352,9 @@ const playLocalTtsUrl = useCallback(
           m.volume = 1;
         } catch {}
 
-        // Route through WebAudio gain to boost loudness beyond HTMLMediaElement volume limits.
-        try {
-          if (useVideo) applyTtsGainRouting(m, "video");
-          else applyTtsGainRouting(m, "audio");
-        } catch {}
+        // Local (audio-only) TTS stays on the hidden VIDEO element, but we do not
+        // route it through WebAudio (can cause silence with non-CORS media).
+        try { m.muted = false; m.volume = 1; } catch {}
 
         try {
           (m as any).preload = "auto";
