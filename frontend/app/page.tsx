@@ -33,16 +33,6 @@ const PauseIcon = ({ size = 18 }: { size?: number }) => (
 type Role = "user" | "assistant";
 type Msg = { role: Role; content: string };
 
-type SavedChatSummary = {
-  memberId: string;
-  companion: string;
-  createdAt: number;
-  updatedAt: number;
-  sessionId: string;
-  messageCount: number;
-  summary: string;
-};
-
 type Mode = "friend" | "romantic" | "intimate";
 type ChatStatus = "safe" | "explicit_blocked" | "explicit_allowed";
 
@@ -84,7 +74,6 @@ type CompanionMeta = {
 const DEFAULT_COMPANION_NAME = "Haven";
 const HEADSHOT_DIR = "/companion/headshot";
 const GREET_ONCE_KEY = "AIHAVEN_GREETED";
-const CHAT_SUMMARIES_KEY = "AIHAVEN_CHAT_SUMMARIES";
 const DEFAULT_AVATAR = havenHeart.src;
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
@@ -292,6 +281,11 @@ function isAllowedOrigin(origin: string) {
     if (host.endsWith("aihaven4u.com")) return true;
     if (host.endsWith("wix.com")) return true;
     if (host.endsWith("wixsite.com")) return true;
+    // Wix infrastructure/CDN origins commonly used by HtmlComponents in preview/editor.
+    if (host.endsWith("wixstatic.com")) return true;
+    if (host.endsWith("parastorage.com")) return true;
+    if (host.endsWith("wix-code.com")) return true;
+    if (host.endsWith("editorx.com")) return true;
     return false;
   } catch {
     return false;
@@ -544,6 +538,9 @@ export default function Page() {
 
 
   // Companion identity (drives persona + Phase 1 live avatar mapping)
+  // memberId is provided by Wix (or other host) and is used to scope saved summaries
+  // on the backend by (memberId, companion).
+  const [memberId, setMemberId] = useState<string | null>(null);
   const [companionName, setCompanionName] = useState<string>(DEFAULT_COMPANION_NAME);
   const [avatarSrc, setAvatarSrc] = useState<string>(DEFAULT_AVATAR);
   const [companionKey, setCompanionKey] = useState<string>("");
@@ -1518,81 +1515,8 @@ const speakAssistantReply = useCallback(
   const [input, setInput] = useState("");
   const [messages, setMessages] = useState<Msg[]>([]);
   const [loading, setLoading] = useState(false);
-  const [memberId, setMemberId] = useState<string | null>(null);
   const [showClearMessagesConfirm, setShowClearMessagesConfirm] = useState(false);
-  const [showSaveSummaryConfirm, setShowSaveSummaryConfirm] = useState(false);
-  const [savedSummaries, setSavedSummaries] = useState<SavedChatSummary[]>([]);
   const clearEpochRef = useRef(0);
-
-  const summaryScopeCompanion = useMemo(() => {
-    const raw = (companionKey || companionName || DEFAULT_COMPANION_NAME).trim();
-    return raw || DEFAULT_COMPANION_NAME;
-  }, [companionKey, companionName]);
-
-  const summaryStorageKey = useMemo(() => {
-    const mid = (memberId || "guest").trim() || "guest";
-    // Normalize companion to keep the key stable even if the display name changes.
-    const ck = normalizeKeyForFile(summaryScopeCompanion);
-    return `${CHAT_SUMMARIES_KEY}:${mid}:${ck}`;
-  }, [memberId, summaryScopeCompanion]);
-
-  // Load any previously saved chat summaries for the current (memberId, companion) scope.
-  // Server is the source of truth when API_BASE is configured and a memberId is present.
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-
-    const loadLocal = () => {
-      try {
-        const raw = window.localStorage.getItem(summaryStorageKey);
-        if (!raw) return [] as SavedChatSummary[];
-        const parsed = JSON.parse(raw);
-        return Array.isArray(parsed) ? (parsed as SavedChatSummary[]) : ([] as SavedChatSummary[]);
-      } catch {
-        return [] as SavedChatSummary[];
-      }
-    };
-
-    // Always show local immediately (fast UI), then optionally refresh from server.
-    const local = loadLocal();
-    if (local.length) setSavedSummaries(local);
-    else setSavedSummaries([]);
-
-    if (!API_BASE || !memberId || !summaryScopeCompanion) return;
-
-    const ac = new AbortController();
-    (async () => {
-      try {
-        const url = `${API_BASE}/chat_summary?memberId=${encodeURIComponent(memberId)}&companion=${encodeURIComponent(summaryScopeCompanion)}`;
-        const res = await fetch(url, {
-          method: "GET",
-          headers: { "Content-Type": "application/json" },
-          signal: ac.signal,
-        });
-
-        if (!res.ok) return;
-        const one = (await res.json()) as SavedChatSummary;
-        if (!one || typeof (one as any).summary !== "string") return;
-
-        const list = [one];
-        setSavedSummaries(list);
-
-        // Cache scoped state locally for offline/fast loads.
-        try {
-          window.localStorage.setItem(summaryStorageKey, JSON.stringify(list));
-        } catch {
-          // ignore
-        }
-      } catch {
-        // ignore (offline, CORS, etc.)
-      }
-    })();
-
-    return () => ac.abort();
-  }, [API_BASE, memberId, summaryScopeCompanion, summaryStorageKey]);
-
-  const summarySyncEnabled = useMemo(() => {
-    return Boolean(API_BASE && memberId && summaryScopeCompanion);
-  }, [memberId, summaryScopeCompanion]);
 
   const [chatStatus, setChatStatus] = useState<ChatStatus>("safe");
 
@@ -1776,20 +1700,43 @@ useEffect(() => {
   // Receive plan + companion from Wix postMessage
   useEffect(() => {
     function onMessage(event: MessageEvent) {
-      if (!isAllowedOrigin(event.origin)) return;
+      // Wix HTML components can postMessage from a variety of origins depending on
+      // editor/preview/live hosting. We keep a conservative allowlist, but also
+      // tolerate "null" origins (sandboxed iframes) and structured wrappers.
+      const origin = typeof event.origin === "string" ? event.origin : "";
+      const originAllowed = origin === "null" || isAllowedOrigin(origin);
 
-      const data = event.data;
-      if (!data || data.type !== "WEEKLY_PLAN") return;
+      // Some Wix contexts wrap the payload or send it as a JSON string.
+      let data: any = event.data;
+      if (typeof data === "string") {
+        try {
+          data = JSON.parse(data);
+        } catch {
+          // Ignore non-JSON string messages.
+          return;
+        }
+      }
 
-      const incomingMemberId =
-        typeof (data as any).memberId === "string" && (data as any).memberId.trim()
-          ? (data as any).memberId.trim()
-          : null;
-      setMemberId(incomingMemberId);
+      // Wrapper shapes we have seen: { data: payload } or { message: payload }
+      const candidate = (data && (data.type ? data : data.data || data.message)) || null;
+
+      if (!candidate || candidate.type !== "WEEKLY_PLAN") return;
+      if (!originAllowed) return;
+
+      data = candidate;
 
       const incomingPlan = (data.planName ?? null) as PlanName;
       setPlanName(incomingPlan);
 
+      // Capture memberId from Wix so summaries can be scoped correctly server-side.
+      if (typeof (data as any).memberId === "string") {
+        const mid = (data as any).memberId.trim();
+        setMemberId(mid || null);
+      }
+
+      // Wix sends the selected companion in `companion`. It may be empty briefly
+      // while the session storage is populating; in that case we keep the existing
+      // selection rather than snapping back to Haven.
       const incomingCompanion =
         typeof (data as any).companion === "string" ? (data as any).companion.trim() : "";
       const resolvedCompanionKey = incomingCompanion || "";
@@ -1807,18 +1754,29 @@ useEffect(() => {
           companion_name: parsed.key,
         }));
       } else {
-        setCompanionKey("");
-        setCompanionName(DEFAULT_COMPANION_NAME);
-
-        setSessionState((prev) => ({
-          ...prev,
-          companion: DEFAULT_COMPANION_NAME,
-          companionName: DEFAULT_COMPANION_NAME,
-          companion_name: DEFAULT_COMPANION_NAME,
-        }));
+        // IMPORTANT: Wix can transiently send an empty companion in some
+        // preview/editor flows. Do NOT snap back to Haven in that case; keep the
+        // current selection. Only apply the default if we truly have no selection.
+        setCompanionKey((prevKey) => prevKey);
+        setCompanionName((prevName) => prevName || DEFAULT_COMPANION_NAME);
+        setSessionState((prev) => {
+          const existing =
+            (prev.companion || "").trim() ||
+            (prev.companionName || "").trim() ||
+            (prev.companion_name || "").trim();
+          if (existing) return prev;
+          return {
+            ...prev,
+            companion: DEFAULT_COMPANION_NAME,
+            companionName: DEFAULT_COMPANION_NAME,
+            companion_name: DEFAULT_COMPANION_NAME,
+          };
+        });
       }
 
-      const avatarCandidates = buildAvatarCandidates(resolvedCompanionKey || DEFAULT_COMPANION_NAME);
+      const avatarCandidates = buildAvatarCandidates(
+        resolvedCompanionKey || companionKey || companionName || DEFAULT_COMPANION_NAME
+      );
       pickFirstExisting(avatarCandidates).then((picked) => setAvatarSrc(picked));
 
       const nextAllowed = allowedModesForPlan(incomingPlan);
@@ -3054,130 +3012,11 @@ const speakGreetingIfNeeded = useCallback(
     // Force a fresh iOS audio-route prime next time the mic/audio starts (prevents low/silent volume after stop/cancel).
     localTtsUnlockedRef.current = false;
 
-    // IMPORTANT (iOS): stopping capture (mic/STT) can leave Safari's audio session routed to a quiet path.
-    // We immediately re-prime the playback route (silent) inside the same user gesture whenever possible.
-    // This is the key mitigation for the "low TTS volume after clear" regression.
-    try {
-      if (isIOS) {
-        // Ensure media elements are not left muted/low.
-        if (localTtsAudioRef.current) {
-          localTtsAudioRef.current.muted = false;
-          localTtsAudioRef.current.volume = 1;
-        }
-        if (localTtsVideoRef.current) {
-          localTtsVideoRef.current.muted = false;
-          localTtsVideoRef.current.volume = 1;
-          localTtsVideoRef.current.setAttribute?.("playsinline", "");
-          // @ts-ignore
-          localTtsVideoRef.current.playsInline = true;
-        }
-
-        // Resume/unlock WebAudio (no-op on non-iPhone). Safe to call.
-        try {
-          void ensureIphoneAudioContextUnlocked();
-        } catch {}
-
-        // Silent prime to nudge the audio route back to speaker.
-        primeLocalTtsAudio(true);
-      }
-    } catch {
-      // ignore
-    }
-
     // If Live Avatar is running, stop it too (mic is required in Live Avatar mode)
     if (liveAvatarActive) {
       void stopLiveAvatar();
     }
-  }, [ensureIphoneAudioContextUnlocked, isIOS, liveAvatarActive, primeLocalTtsAudio, stopLiveAvatar, stopLocalTtsPlayback, stopSpeechToText]);
-
-  // Build a lightweight local summary for future reference.
-  // NOTE: This is intentionally deterministic and runs fully client-side.
-  const buildChatSummary = useCallback((msgs: Msg[]) => {
-    const take = 24;
-    const recent = (msgs || []).slice(-take);
-    const lines = recent
-      .map((m) => {
-        const who = m.role === "assistant" ? (companionName || DEFAULT_COMPANION_NAME) : "You";
-        const text = String(m.content || "").replace(/\s+/g, " ").trim();
-        return `${who}: ${text}`;
-      })
-      .filter(Boolean);
-
-    const joined = lines.join("\n");
-    // Keep saved payload small and predictable.
-    const maxChars = 4000;
-    return joined.length > maxChars ? joined.slice(0, maxChars - 1) + "…" : joined;
-  }, [companionName]);
-
-  const persistChatSummary = useCallback(async (summaryText: string) => {
-    if (typeof window === "undefined") return;
-
-    const sessionId = String(sessionIdRef.current || "").trim();
-    const mid = (memberId || "").trim();
-    const comp = (summaryScopeCompanion || "").trim();
-
-    // One-record-per-(memberId, companion) cache for offline/fast loads.
-    const localRec: SavedChatSummary = {
-      memberId: mid || "guest",
-      companion: comp || DEFAULT_COMPANION_NAME,
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-      sessionId,
-      messageCount: messages.length,
-      summary: summaryText,
-    };
-
-    const writeLocalList = (list: SavedChatSummary[]) => {
-      setSavedSummaries(list);
-      try {
-        window.localStorage.setItem(summaryStorageKey, JSON.stringify(list));
-      } catch {
-        // ignore
-      }
-    };
-
-    // Optimistic local write for snappy UX.
-    writeLocalList([localRec]);
-
-    // Server sync (cross-device): upsert exactly one record per (memberId, companion).
-    if (API_BASE && mid && comp) {
-      try {
-        const res = await fetch(`${API_BASE}/chat_summary`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            memberId: mid,
-            companion: comp,
-            sessionId: localRec.sessionId,
-            messageCount: localRec.messageCount,
-            summary: localRec.summary,
-          }),
-        });
-
-        if (res.ok) {
-          const saved = (await res.json()) as SavedChatSummary;
-          if (saved && typeof (saved as any).summary === "string") {
-            writeLocalList([saved]);
-          }
-        }
-      } catch {
-        // ignore (offline, CORS, server down). Local cache remains.
-      }
-    }
-  }, [API_BASE, memberId, messages.length, summaryScopeCompanion, summaryStorageKey]);
-
-  // Save Chat Summary (with confirmation)
-  const requestSaveSummary = useCallback(() => {
-    // Match the Clear Messages safety behavior: stop all audio/video + STT immediately
-    // (even before the user confirms) so nothing continues speaking while the user is in a modal.
-    setLoading(false);
-    try {
-      stopHandsFreeSTT();
-    } catch {
-      // ignore
-    }
-    setShowSaveSummaryConfirm(true);
-  }, [stopHandsFreeSTT]);
+  }, [liveAvatarActive, stopLiveAvatar, stopLocalTtsPlayback, stopSpeechToText]);
 
   // Clear Messages (with confirmation)
   const requestClearMessages = useCallback(() => {
@@ -3679,23 +3518,6 @@ const speakGreetingIfNeeded = useCallback(
             {/** Input line with mode pills moved to the right (layout-only). */}
             <button
               type="button"
-              onClick={requestSaveSummary}
-              title="Save a summary of this conversation for future reference"
-              style={{
-                padding: "10px 12px",
-                borderRadius: 10,
-                border: "1px solid #bbb",
-                background: "#fff",
-                cursor: "pointer",
-                minWidth: 44,
-              }}
-              aria-label="Save chat summary"
-            >
-              💾
-            </button>
-
-            <button
-              type="button"
               onClick={requestClearMessages}
               title="Clear the conversation on screen"
               style={{
@@ -3704,11 +3526,9 @@ const speakGreetingIfNeeded = useCallback(
                 border: "1px solid #bbb",
                 background: "#fff",
                 cursor: "pointer",
-                minWidth: 44,
               }}
-              aria-label="Delete / clear messages"
             >
-              🗑️
+              Clear Messages
             </button>
 
             <input
@@ -3751,91 +3571,6 @@ const speakGreetingIfNeeded = useCallback(
 	          ) : null}
         </div>
       </section>
-
-      {/* Save Summary confirmation overlay */}
-      {showSaveSummaryConfirm && (
-        <div
-          style={{
-            position: "fixed",
-            inset: 0,
-            background: "rgba(0,0,0,0.4)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            padding: 16,
-            zIndex: 10001,
-          }}
-        >
-          <div
-            style={{
-              background: "#fff",
-              borderRadius: 12,
-              padding: 16,
-              maxWidth: 520,
-              width: "100%",
-              boxShadow: "0 8px 30px rgba(0,0,0,0.25)",
-            }}
-          >
-            <div style={{ fontSize: 18, fontWeight: 700, marginBottom: 8 }}>Save chat summary?</div>
-            <div style={{ fontSize: 14, color: "#333", lineHeight: 1.4 }}>
-              {summarySyncEnabled ? "This will save a summary to your account and sync it across devices." : "This will save a local summary of the conversation in your browser for future reference."}
-              By continuing, you authorize saving this chat summary data.
-              Audio and video have been stopped.
-            </div>
-
-            <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", marginTop: 14 }}>
-              <button
-                type="button"
-                onClick={() => {
-                  setShowSaveSummaryConfirm(false);
-                  void restoreVolumesAfterClearCancel();
-                }}
-                style={{
-                  padding: "10px 14px",
-                  borderRadius: 10,
-                  border: "1px solid #bbb",
-                  background: "#fff",
-                  cursor: "pointer",
-                }}
-              >
-                No
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  try {
-                    const summary = buildChatSummary(messages);
-                    if (summary && summary.trim()) {
-                      persistChatSummary(summary);
-                      setMessages((prev) => [
-                        ...prev,
-                        {
-                          role: "assistant",
-                          content: "Saved a summary of this conversation for future reference.",
-                        },
-                      ]);
-                    }
-                  } catch {
-                    // ignore
-                  }
-                  setShowSaveSummaryConfirm(false);
-                  void restoreVolumesAfterClearCancel();
-                }}
-                style={{
-                  padding: "10px 14px",
-                  borderRadius: 10,
-                  border: "1px solid #111",
-                  background: "#111",
-                  color: "#fff",
-                  cursor: "pointer",
-                }}
-              >
-                Yes, save
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
 
       {/* Clear Messages confirmation overlay */}
       {showClearMessagesConfirm && (
