@@ -608,8 +608,11 @@ export default function Page() {
 
   // "Audio session nudge" (runs on a user gesture):
   // iOS Safari can remain in a low/communications-volume route after mic capture or modal dialogs.
-  // Emitting a very short, near-inaudible tone through the WebAudio graph helps re-establish
-  // the normal playback route so subsequent TTS is not feeble or silent.
+  // A short, low-frequency, low-amplitude burst through WebAudio helps re-establish the normal
+  // playback route so subsequent audio-only TTS (hidden VIDEO path) is not silent/feeble.
+  //
+  // NOTE: This is intentionally slightly stronger than "inaudible" because the user's report
+  // indicates iOS can otherwise remain stuck after the Clear Messages modal.
   const nudgeAudioSession = useCallback(async () => {
     const ctx = ensureTtsAudioContext();
     if (!ctx) return;
@@ -620,24 +623,27 @@ export default function Page() {
 
       const osc = ctx.createOscillator();
       const g = ctx.createGain();
-      // Very low amplitude; intended to be imperceptible but non-zero.
-      g.gain.value = 0.004;
-      osc.frequency.value = 32; // sub-bass; typically not heard on phone speakers
+      g.gain.value = 0.02;
+      osc.frequency.value = 40;
       osc.connect(g);
       g.connect(ctx.destination);
-      const stopAt = ctx.currentTime + 0.08;
+      const stopAt = ctx.currentTime + 0.12;
       osc.start();
       osc.stop(stopAt);
 
-      // Cleanup connections shortly after stop.
       window.setTimeout(() => {
         try { osc.disconnect(); } catch {}
         try { g.disconnect(); } catch {}
-      }, 120);
+      }, 180);
     } catch {
       // ignore
     }
   }, [ensureTtsAudioContext]);
+
+  // Track whether we have already connected each gain routing chain.
+  const ttsAudioChainConnectedRef = useRef<boolean>(false);
+  const ttsVideoChainConnectedRef = useRef<boolean>(false);
+  const avatarVideoChainConnectedRef = useRef<boolean>(false);
 
 
   const applyTtsGainRouting = useCallback(
@@ -657,16 +663,19 @@ export default function Page() {
           try { ttsAudioMediaSrcRef.current?.disconnect(); } catch {}
           ttsAudioMediaSrcRef.current = null;
           ttsAudioBoundElRef.current = media;
+          ttsAudioChainConnectedRef.current = false;
         }
         if (kind === "video" && ttsVideoBoundElRef.current !== media) {
           try { ttsVideoMediaSrcRef.current?.disconnect(); } catch {}
           ttsVideoMediaSrcRef.current = null;
           ttsVideoBoundElRef.current = media;
+          ttsVideoChainConnectedRef.current = false;
         }
         if (kind === "avatar" && avatarVideoBoundElRef.current !== media) {
           try { avatarVideoMediaSrcRef.current?.disconnect(); } catch {}
           avatarVideoMediaSrcRef.current = null;
           avatarVideoBoundElRef.current = media;
+          avatarVideoChainConnectedRef.current = false;
         }
 
         // If we already created a MediaElementSourceNode for this media element, reuse it.
@@ -709,17 +718,24 @@ export default function Page() {
           }
         }
 
-        // Defensive: ensure we only connect once.
-        try {
-          src.disconnect();
-        } catch {}
-        try {
-          gain.disconnect();
-        } catch {}
+        // Connect once and then only update gain. Repeated disconnect/reconnect can leave
+        // iOS Safari in a bad route after modal dialogs.
+        const connectOnce = (connectedRef: React.MutableRefObject<boolean>) => {
+          if (connectedRef.current) return;
+          try {
+            src!.connect(gain!);
+          } catch {}
+          try {
+            gain!.connect(ctx.destination);
+          } catch {}
+          connectedRef.current = true;
+        };
+
+        if (kind === "audio") connectOnce(ttsAudioChainConnectedRef);
+        else if (kind === "video") connectOnce(ttsVideoChainConnectedRef);
+        else connectOnce(avatarVideoChainConnectedRef);
 
         gain.gain.value = TTS_GAIN;
-        src.connect(gain);
-        gain.connect(ctx.destination);
 
         // Keep element volume at max so the gain node is the only limiter.
         try {
@@ -3238,82 +3254,66 @@ const speakGreetingIfNeeded = useCallback(
       void nudgeAudioSession();
     } catch {}
 
+    // Strong iOS recovery: prime the hidden VIDEO element on this user gesture so audio-only TTS
+    // is not left in a silent/receiver route after the confirmation modal.
+    try {
+      primeLocalTtsAudio(true);
+    } catch {}
+    try {
+      void ensureIphoneAudioContextUnlocked();
+    } catch {}
+
 
     setShowClearMessagesConfirm(true);
-  }, [stopHandsFreeSTT, boostAllTtsVolumes, nudgeAudioSession]);
+  }, [stopHandsFreeSTT, boostAllTtsVolumes, nudgeAudioSession, primeLocalTtsAudio, ensureIphoneAudioContextUnlocked]);
 
   // After the Clear Messages dialog is dismissed with NO, iOS can sometimes route
   // subsequent audio to the quiet receiver / low-volume path. We "nudge" the
   // audio session back to normal playback volume and ensure our media elements
   // are not left muted/low.
   const restoreVolumesAfterClearCancel = useCallback(async () => {
-    // Ensure our boost routing is re-established immediately after the dialog is dismissed.
+    // This function runs on a user gesture (Yes/No click). Its job is purely to ensure
+    // that *future* manual resumption of TTS is not routed to a silent/receiver path.
+
+    // Re-assert boosted routing first.
     try { boostAllTtsVolumes(); } catch {}
-    // User gesture (Yes/No click): nudge audio session so local TTS does not become silent/feeble.
+
+    // iOS route recovery: nudge the audio session back to normal playback.
     try { await nudgeAudioSession(); } catch {}
 
-
-    // Re-prime audio routing on cancel (silent). Helps iOS recover speaker route/volume.
+    // Prime the hidden VIDEO element (required by your constraint) so the next audio-only
+    // TTS playback is unlocked and uses the correct output route.
     try { primeLocalTtsAudio(true); } catch {}
+
+    // If Live Avatar is used on iPhone, ensure its audio context is also unlocked.
     try { void ensureIphoneAudioContextUnlocked(); } catch {}
 
-    // Always ensure elements are at normal volume/mute state.
+    // Ensure element mute/volume flags are sane (gain routing provides the loudness).
     try {
-      if (avatarVideoRef.current) {
-        avatarVideoRef.current.muted = false;
-        avatarVideoRef.current.volume = 1;
-      }
-    } catch {}
-
-    try {
-      if (localTtsAudioRef.current) {
-        localTtsAudioRef.current.muted = false;
-        localTtsAudioRef.current.volume = 1;
-      }
-    } catch {}
-
-    try {
-      if (localTtsVideoRef.current) {
-        localTtsVideoRef.current.muted = false;
-        localTtsVideoRef.current.volume = 1;
-        localTtsVideoRef.current.setAttribute?.("playsinline", "");
+      const v = localTtsVideoRef.current;
+      if (v) {
+        v.muted = false;
+        v.volume = 1;
+        v.setAttribute?.("playsinline", "");
         // @ts-ignore
-        localTtsVideoRef.current.playsInline = true;
+        v.playsInline = true;
       }
     } catch {}
 
-    // Re-apply gain routing after we reset element properties.
-    try { boostAllTtsVolumes(); } catch {}
-
-    if (!isIOS) return;
-
-    // iOS Safari: kick audio session back to normal playback (speaker) mode.
-    // This is a silent, ultra-short WebAudio buffer that runs only on user gesture.
     try {
-      const AnyWin = window as any;
-      const Ctx = AnyWin.AudioContext || AnyWin.webkitAudioContext;
-      if (!Ctx) return;
-
-      let ctx = didIphoneAudioCtxRef.current as any;
-      if (!ctx || typeof ctx.createBuffer !== "function") {
-        ctx = new Ctx();
-        didIphoneAudioCtxRef.current = ctx;
+      const a = localTtsAudioRef.current;
+      if (a) {
+        a.muted = false;
+        a.volume = 1;
       }
+    } catch {}
 
-      if (ctx.state === "suspended") {
-        await ctx.resume();
+    try {
+      const av = avatarVideoRef.current;
+      if (av) {
+        av.muted = false;
+        av.volume = 1;
       }
-
-      const dur = 0.06;
-      const frames = Math.max(1, Math.floor(ctx.sampleRate * dur));
-      const buf = ctx.createBuffer(1, frames, ctx.sampleRate);
-      const src = ctx.createBufferSource();
-      src.buffer = buf;
-      src.connect(ctx.destination);
-      src.start();
-      try {
-        src.stop(ctx.currentTime + dur);
-      } catch {}
     } catch {}
   }, [isIOS, primeLocalTtsAudio, ensureIphoneAudioContextUnlocked, boostAllTtsVolumes, nudgeAudioSession]);
 
