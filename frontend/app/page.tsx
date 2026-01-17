@@ -564,6 +564,133 @@ export default function Page() {
   const localTtsUnlockedRef = useRef(false);
   const localTtsStopFnRef = useRef<(() => void) | null>(null);
 
+  // Live Avatar element ref is declared early so it can be used by the global TTS volume booster.
+  const avatarVideoRef = useRef<HTMLVideoElement | null>(null);
+
+  // ----------------------------
+  // Global TTS volume boost
+  // ----------------------------
+  // HTMLMediaElement.volume tops out at 1.0. To reliably boost perceived loudness—especially
+  // on iOS after an audio-capture session—we route TTS playback through WebAudio GainNodes.
+  // This applies to:
+  // - Local TTS <audio>/<video> playback (hands-free STT mode)
+  // - Live Avatar <video> element playback (non-iPhone)
+  // iPhone Live Avatar already routes MediaStream audio through WebAudio (see applyIphoneLiveAvatarAudioBoost).
+  const TTS_GAIN = 3.0;
+  const ttsAudioCtxRef = useRef<AudioContext | null>(null);
+  const ttsAudioMediaSrcRef = useRef<MediaElementAudioSourceNode | null>(null);
+  const ttsAudioGainRef = useRef<GainNode | null>(null);
+  const ttsVideoMediaSrcRef = useRef<MediaElementAudioSourceNode | null>(null);
+  const ttsVideoGainRef = useRef<GainNode | null>(null);
+  const avatarVideoMediaSrcRef = useRef<MediaElementAudioSourceNode | null>(null);
+  const avatarVideoGainRef = useRef<GainNode | null>(null);
+
+  const ensureTtsAudioContext = useCallback((): AudioContext | null => {
+    if (typeof window === "undefined") return null;
+    try {
+      const AudioCtx = (window as any).AudioContext || (window as any).webkitAudioContext;
+      if (!AudioCtx) return null;
+      if (!ttsAudioCtxRef.current) ttsAudioCtxRef.current = new AudioCtx();
+      const ctx = ttsAudioCtxRef.current;
+      if (ctx?.state === "suspended" && ctx.resume) {
+        ctx.resume().catch(() => {});
+      }
+      return ctx;
+    } catch {
+      return null;
+    }
+  }, []);
+
+  const applyTtsGainRouting = useCallback(
+    (media: HTMLMediaElement | null, kind: "audio" | "video" | "avatar") => {
+      if (!media) return;
+      const ctx = ensureTtsAudioContext();
+      if (!ctx) return;
+
+      // iPhone Live Avatar uses MediaStream routing; do not double-route the <video> element.
+      if (kind === "avatar" && isIphone) return;
+
+      try {
+        // If we already created a MediaElementSourceNode for this media element, reuse it.
+        // (Browsers throw if you call createMediaElementSource() more than once per element.)
+        let src: MediaElementAudioSourceNode | null = null;
+        let gain: GainNode | null = null;
+
+        if (kind === "audio") {
+          src = ttsAudioMediaSrcRef.current;
+          gain = ttsAudioGainRef.current;
+          if (!src) {
+            src = ctx.createMediaElementSource(media);
+            ttsAudioMediaSrcRef.current = src;
+          }
+          if (!gain) {
+            gain = ctx.createGain();
+            ttsAudioGainRef.current = gain;
+          }
+        } else if (kind === "video") {
+          src = ttsVideoMediaSrcRef.current;
+          gain = ttsVideoGainRef.current;
+          if (!src) {
+            src = ctx.createMediaElementSource(media);
+            ttsVideoMediaSrcRef.current = src;
+          }
+          if (!gain) {
+            gain = ctx.createGain();
+            ttsVideoGainRef.current = gain;
+          }
+        } else {
+          src = avatarVideoMediaSrcRef.current;
+          gain = avatarVideoGainRef.current;
+          if (!src) {
+            src = ctx.createMediaElementSource(media);
+            avatarVideoMediaSrcRef.current = src;
+          }
+          if (!gain) {
+            gain = ctx.createGain();
+            avatarVideoGainRef.current = gain;
+          }
+        }
+
+        // Defensive: ensure we only connect once.
+        try {
+          src.disconnect();
+        } catch {}
+        try {
+          gain.disconnect();
+        } catch {}
+
+        gain.gain.value = TTS_GAIN;
+        src.connect(gain);
+        gain.connect(ctx.destination);
+
+        // Keep element volume at max so the gain node is the only limiter.
+        try {
+          media.muted = false;
+          media.volume = 1;
+        } catch {}
+      } catch (e) {
+        // If this fails (e.g., cross-origin media restrictions), we still keep media.volume at 1.
+        try {
+          media.muted = false;
+          media.volume = 1;
+        } catch {}
+      }
+    },
+    [ensureTtsAudioContext, isIphone]
+  );
+
+  const boostAllTtsVolumes = useCallback(() => {
+    try {
+      // Local TTS elements
+      applyTtsGainRouting(localTtsAudioRef.current, "audio");
+      applyTtsGainRouting(localTtsVideoRef.current, "video");
+      // Live avatar video element (non-iPhone)
+      applyTtsGainRouting(avatarVideoRef.current, "avatar");
+    } catch {
+      // ignore
+    }
+  }, [applyTtsGainRouting]);
+
 
   // Companion identity (drives persona + Phase 1 live avatar mapping)
   const [companionName, setCompanionName] = useState<string>(DEFAULT_COMPANION_NAME);
@@ -574,7 +701,6 @@ export default function Page() {
 // ----------------------------
 // Phase 1: Live Avatar (D-ID) + TTS (ElevenLabs -> Azure Blob)
 // ----------------------------
-const avatarVideoRef = useRef<HTMLVideoElement | null>(null);
 const didSrcObjectRef = useRef<any | null>(null);
 const didAgentMgrRef = useRef<any | null>(null);
 const didReconnectInFlightRef = useRef<boolean>(false);
@@ -876,6 +1002,11 @@ const startLiveAvatar = useCallback(async () => {
             vid.play().catch(() => {});
             // iPhone: route WebRTC audio through WebAudio gain so volume is audible
             applyIphoneLiveAvatarAudioBoost(value);
+
+            // Non-iPhone: also route the <video> element through a gain node to ensure robust volume.
+            try {
+              applyTtsGainRouting(vid, "avatar");
+            } catch {}
           }
           return value;
         },
@@ -1055,6 +1186,11 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string): Promis
     prime(localTtsVideoRef.current, "video");
     prime(localTtsAudioRef.current, "audio");
 
+    // Ensure boosted routing is in place after priming.
+    try {
+      boostAllTtsVolumes();
+    } catch {}
+
     // If neither succeeds, localTtsUnlockedRef remains false and we'll retry on the next user gesture.
   }, []);
 
@@ -1132,6 +1268,12 @@ const playLocalTtsUrl = useCallback(
         try {
           m.muted = false;
           m.volume = 1;
+        } catch {}
+
+        // Route through WebAudio gain to boost loudness beyond HTMLMediaElement volume limits.
+        try {
+          if (useVideo) applyTtsGainRouting(m, "video");
+          else applyTtsGainRouting(m, "audio");
         } catch {}
 
         try {
@@ -3029,14 +3171,22 @@ const speakGreetingIfNeeded = useCallback(
       // ignore
     }
 
+    // User gesture: re-assert boosted audio routing so TTS doesn't become feeble after the first conversation.
+    try {
+      boostAllTtsVolumes();
+    } catch {}
+
     setShowClearMessagesConfirm(true);
-  }, [stopHandsFreeSTT]);
+  }, [stopHandsFreeSTT, boostAllTtsVolumes]);
 
   // After the Clear Messages dialog is dismissed with NO, iOS can sometimes route
   // subsequent audio to the quiet receiver / low-volume path. We "nudge" the
   // audio session back to normal playback volume and ensure our media elements
   // are not left muted/low.
   const restoreVolumesAfterClearCancel = useCallback(async () => {
+    // Ensure our boost routing is re-established immediately after the dialog is dismissed.
+    try { boostAllTtsVolumes(); } catch {}
+
     // Re-prime audio routing on cancel (silent). Helps iOS recover speaker route/volume.
     try { primeLocalTtsAudio(true); } catch {}
     try { void ensureIphoneAudioContextUnlocked(); } catch {}
@@ -3065,6 +3215,9 @@ const speakGreetingIfNeeded = useCallback(
         localTtsVideoRef.current.playsInline = true;
       }
     } catch {}
+
+    // Re-apply gain routing after we reset element properties.
+    try { boostAllTtsVolumes(); } catch {}
 
     if (!isIOS) return;
 
@@ -3096,7 +3249,7 @@ const speakGreetingIfNeeded = useCallback(
         src.stop(ctx.currentTime + dur);
       } catch {}
     } catch {}
-  }, [isIOS, primeLocalTtsAudio, ensureIphoneAudioContextUnlocked]);
+  }, [isIOS, primeLocalTtsAudio, ensureIphoneAudioContextUnlocked, boostAllTtsVolumes]);
 
 
   // Cleanup
@@ -3632,6 +3785,8 @@ const speakGreetingIfNeeded = useCallback(
                 type="button"
                 onClick={() => {
                     setShowClearMessagesConfirm(false);
+                    // User gesture: restore boosted routing so subsequent TTS isn't quiet.
+                    try { boostAllTtsVolumes(); } catch {}
                     void restoreVolumesAfterClearCancel();
                   }}
                 style={{
@@ -3650,6 +3805,8 @@ const speakGreetingIfNeeded = useCallback(
                   setMessages([]);
                   setInput("");
                   setShowClearMessagesConfirm(false);
+                  // User gesture: restore boosted routing so subsequent TTS isn't quiet.
+                  try { boostAllTtsVolumes(); } catch {}
                   // Re-prime audio outputs after a hard stop so Audio TTS doesn't come back quiet (iOS/Safari).
                   void restoreVolumesAfterClearCancel();
                 }}
