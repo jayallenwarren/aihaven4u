@@ -613,9 +613,12 @@ export default function Page() {
       // iPhone Live Avatar uses MediaStream routing; do not double-route the <video> element.
       if (kind === "avatar" && isIphone) return;
 
+      // IMPORTANT: Once a MediaElementAudioSourceNode is created for an element, that element's audio is
+      // routed through the AudioContext graph. If we ever disconnect without successfully reconnecting,
+      // playback can become silent. Therefore we make routing "fail-open" and always ensure a path to
+      // ctx.destination even if something throws.
       try {
-        // If the underlying media element instance changed (common when Live Avatar is stopped/started
-        // or when hidden TTS elements are re-mounted), we must recreate the MediaElementSourceNode.
+        // If the underlying media element instance changed, recreate its MediaElementSourceNode.
         // Source nodes are permanently bound to a single element.
         if (kind === "audio" && ttsAudioBoundElRef.current !== media) {
           try { ttsAudioMediaSrcRef.current?.disconnect(); } catch {}
@@ -633,8 +636,6 @@ export default function Page() {
           avatarVideoBoundElRef.current = media;
         }
 
-        // If we already created a MediaElementSourceNode for this media element, reuse it.
-        // (Browsers throw if you call createMediaElementSource() more than once per element.)
         let src: MediaElementAudioSourceNode | null = null;
         let gain: GainNode | null = null;
 
@@ -673,25 +674,32 @@ export default function Page() {
           }
         }
 
-        // Defensive: ensure we only connect once.
-        try {
-          src.disconnect();
-        } catch {}
-        try {
-          gain.disconnect();
-        } catch {}
-
-        gain.gain.value = TTS_GAIN;
-        src.connect(gain);
-        gain.connect(ctx.destination);
-
-        // Keep element volume at max so the gain node is the only limiter.
+        // Set element properties first.
         try {
           media.muted = false;
           media.volume = 1;
         } catch {}
-      } catch (e) {
-        // If this fails (e.g., cross-origin media restrictions), we still keep media.volume at 1.
+
+        // Configure gain.
+        try {
+          gain.gain.value = TTS_GAIN;
+        } catch {}
+
+        // Reconnect defensively: if anything fails, connect src directly to destination.
+        try {
+          try { src.disconnect(); } catch {}
+          try { gain.disconnect(); } catch {}
+
+          src.connect(gain);
+          gain.connect(ctx.destination);
+        } catch {
+          try {
+            try { src.disconnect(); } catch {}
+            src.connect(ctx.destination);
+          } catch {}
+        }
+      } catch {
+        // If routing fails (e.g., CORS restrictions), keep normal element playback path enabled.
         try {
           media.muted = false;
           media.volume = 1;
