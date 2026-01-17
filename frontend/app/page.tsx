@@ -30,6 +30,41 @@ const PauseIcon = ({ size = 18 }: { size?: number }) => (
   </svg>
 );
 
+// International-style action icons (Save / Delete)
+const SaveIcon = ({ size = 18 }: { size?: number }) => (
+  <svg
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    aria-hidden="true"
+    focusable="false"
+    style={{ display: "block" }}
+  >
+    {/* Floppy disk icon */}
+    <path
+      d="M17 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7l-4-4zM12 19a3 3 0 1 1 0-6 3 3 0 0 1 0 6zM6 5h9v4H6V5z"
+      fill="currentColor"
+    />
+  </svg>
+);
+
+const DeleteIcon = ({ size = 18 }: { size?: number }) => (
+  <svg
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    aria-hidden="true"
+    focusable="false"
+    style={{ display: "block" }}
+  >
+    {/* Trash can icon */}
+    <path
+      d="M6 7h12l-1 14H7L6 7zm3-3h6l1 2H8l1-2z"
+      fill="currentColor"
+    />
+  </svg>
+);
+
 type Role = "user" | "assistant";
 type Msg = { role: Role; content: string };
 
@@ -77,6 +112,9 @@ const GREET_ONCE_KEY = "AIHAVEN_GREETED";
 const DEFAULT_AVATAR = havenHeart.src;
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
+
+// Save Summary persists a per-(memberId, companion) summary for cross-device reference.
+const ENABLE_SAVE_SUMMARY = true;
 
 type Phase1AvatarMedia = {
   didAgentId: string;
@@ -1516,6 +1554,9 @@ const speakAssistantReply = useCallback(
   const [messages, setMessages] = useState<Msg[]>([]);
   const [loading, setLoading] = useState(false);
   const [showClearMessagesConfirm, setShowClearMessagesConfirm] = useState(false);
+  const [showSaveSummaryConfirm, setShowSaveSummaryConfirm] = useState(false);
+  const [saveSummaryBusy, setSaveSummaryBusy] = useState(false);
+  const [saveSummaryError, setSaveSummaryError] = useState<string | null>(null);
   const clearEpochRef = useRef(0);
 
   const [chatStatus, setChatStatus] = useState<ChatStatus>("safe");
@@ -1700,19 +1741,59 @@ useEffect(() => {
   // Receive plan + companion from Wix postMessage
   useEffect(() => {
     function onMessage(event: MessageEvent) {
+      // DEBUG: capture exactly what the embedded Wix page is sending.
+      // This is intentionally verbose, but only emits when the debug overlay is enabled.
+      if (debugEnabledRef.current) {
+        try {
+          const raw = (event as any)?.data;
+          console.log("[Wix postMessage] raw event", {
+            origin: (event as any)?.origin,
+            dataType: typeof raw,
+            data: raw,
+          });
+        } catch {
+          // ignore
+        }
+      }
+
       // Wix HTML components can postMessage from a variety of origins depending on
       // editor/preview/live hosting. We keep a conservative allowlist, but also
       // tolerate "null" origins (sandboxed iframes) and structured wrappers.
       const origin = typeof event.origin === "string" ? event.origin : "";
       const originAllowed = origin === "null" || isAllowedOrigin(origin);
 
+      if (debugEnabledRef.current) {
+        try {
+          console.log("[Wix postMessage] origin evaluation", {
+            origin,
+            originAllowed,
+          });
+        } catch {
+          // ignore
+        }
+      }
+
       // Some Wix contexts wrap the payload or send it as a JSON string.
       let data: any = event.data;
       if (typeof data === "string") {
         try {
           data = JSON.parse(data);
+          if (debugEnabledRef.current) {
+            try {
+              console.log("[Wix postMessage] parsed JSON string", data);
+            } catch {
+              // ignore
+            }
+          }
         } catch {
           // Ignore non-JSON string messages.
+          if (debugEnabledRef.current) {
+            try {
+              console.log("[Wix postMessage] ignored non-JSON string message", data);
+            } catch {
+              // ignore
+            }
+          }
           return;
         }
       }
@@ -1720,10 +1801,49 @@ useEffect(() => {
       // Wrapper shapes we have seen: { data: payload } or { message: payload }
       const candidate = (data && (data.type ? data : data.data || data.message)) || null;
 
-      if (!candidate || candidate.type !== "WEEKLY_PLAN") return;
-      if (!originAllowed) return;
+      if (debugEnabledRef.current) {
+        try {
+          console.log("[Wix postMessage] candidate extracted", {
+            candidateType: typeof candidate,
+            candidate,
+          });
+        } catch {
+          // ignore
+        }
+      }
+
+      if (!candidate || candidate.type !== "WEEKLY_PLAN") {
+        if (debugEnabledRef.current) {
+          try {
+            console.log("[Wix postMessage] ignored: wrong type", {
+              gotType: candidate?.type,
+            });
+          } catch {
+            // ignore
+          }
+        }
+        return;
+      }
+      if (!originAllowed) {
+        if (debugEnabledRef.current) {
+          try {
+            console.log("[Wix postMessage] ignored: origin not allowed", { origin });
+          } catch {
+            // ignore
+          }
+        }
+        return;
+      }
 
       data = candidate;
+
+      if (debugEnabledRef.current) {
+        try {
+          console.log("[Wix postMessage] accepted WEEKLY_PLAN payload", data);
+        } catch {
+          // ignore
+        }
+      }
 
       const incomingPlan = (data.planName ?? null) as PlanName;
       setPlanName(incomingPlan);
@@ -3034,6 +3154,113 @@ const speakGreetingIfNeeded = useCallback(
     setShowClearMessagesConfirm(true);
   }, [stopHandsFreeSTT]);
 
+  // Save Summary (with confirmation)
+  const requestSaveSummary = useCallback(() => {
+    // Match the Clear Messages behavior: stop audio/video + STT immediately on click.
+    setLoading(false);
+    try {
+      stopHandsFreeSTT();
+    } catch {
+      // ignore
+    }
+    setSaveSummaryError(null);
+    setShowSaveSummaryConfirm(true);
+  }, [stopHandsFreeSTT]);
+
+  const companionForPersistence = useMemo(() => {
+    const c = (companionKey || "").trim() || (companionName || "").trim();
+    return c || DEFAULT_COMPANION_NAME;
+  }, [companionKey, companionName]);
+
+  function buildFullTranscript(msgs: Msg[]): { text: string; trimmed: Msg[] } {
+    const trimmed = (msgs || []).filter((m) => (m?.content || "").trim());
+    const lines: string[] = [];
+    for (const m of trimmed) {
+      const who = m.role === "user" ? "You" : companionForPersistence;
+      const body = String(m.content || "").trim();
+      if (!body) continue;
+      lines.push(`${who}: ${body}`);
+    }
+    return { text: lines.join("\n\n"), trimmed };
+  }
+
+  function buildConversationSummaryFromFullTranscript(msgs: Msg[]): { summary: string; transcriptText: string } {
+    // Deterministic, on-device synopsis that is derived from the FULL transcript.
+    // We also persist the full transcript server-side so future summarizers can re-summarize accurately.
+    const { text: transcriptText, trimmed } = buildFullTranscript(msgs);
+    if (!trimmed.length) return { summary: "(No messages to summarize.)", transcriptText: "" };
+
+    const total = trimmed.length;
+    const userTurns = trimmed.filter((m) => m.role === "user").length;
+    const assistantTurns = total - userTurns;
+
+    const firstUser = trimmed.find((m) => m.role === "user")?.content?.trim() || "";
+    const firstAssistant = trimmed.find((m) => m.role === "assistant")?.content?.trim() || "";
+    const lastUser = [...trimmed].reverse().find((m) => m.role === "user")?.content?.trim() || "";
+    const lastAssistant = [...trimmed].reverse().find((m) => m.role === "assistant")?.content?.trim() || "";
+
+    // Keep a small “recent context” section for fast human scanning, but the summary is derived
+    // from the whole transcript via the included first + last turn anchors.
+    const recent = trimmed.slice(-12);
+    const bullets: string[] = [];
+    for (const m of recent) {
+      const who = m.role === "user" ? "You" : companionForPersistence;
+      const line = (m.content || "").trim().replace(/\s+/g, " ");
+      if (!line) continue;
+      bullets.push(`- ${who}: ${line.length > 180 ? line.slice(0, 177) + "…" : line}`);
+      if (bullets.length >= 10) break;
+    }
+
+    const header = [
+      `Companion: ${companionForPersistence}`,
+      `Turns: ${total} (You: ${userTurns}, ${companionForPersistence}: ${assistantTurns})`,
+      firstUser
+        ? `First you: ${firstUser.replace(/\s+/g, " ").slice(0, 220)}${firstUser.length > 220 ? "…" : ""}`
+        : "",
+      firstAssistant
+        ? `First ${companionForPersistence}: ${firstAssistant.replace(/\s+/g, " ").slice(0, 220)}${firstAssistant.length > 220 ? "…" : ""}`
+        : "",
+      lastUser
+        ? `Last you: ${lastUser.replace(/\s+/g, " ").slice(0, 220)}${lastUser.length > 220 ? "…" : ""}`
+        : "",
+      lastAssistant
+        ? `Last ${companionForPersistence}: ${lastAssistant.replace(/\s+/g, " ").slice(0, 220)}${lastAssistant.length > 220 ? "…" : ""}`
+        : "",
+    ].filter(Boolean);
+
+    const summary = `${header.join("\n")}\n\nRecent context:\n${bullets.join("\n")}`;
+    return { summary, transcriptText };
+  }
+
+  const persistConversationSummary = useCallback(async () => {
+    if (!API_BASE) throw new Error("NEXT_PUBLIC_API_BASE_URL is not set");
+    if (!memberId) throw new Error("Missing memberId (user not identified)");
+    if (!companionForPersistence) throw new Error("Missing companion");
+
+    const { summary, transcriptText } = buildConversationSummaryFromFullTranscript(messages);
+    const payload = {
+      memberId,
+      companion: companionForPersistence,
+      summary,
+      transcriptText,
+      transcriptMessages: messages,
+      messageCount: messages.length,
+      sessionId: sessionIdRef.current || null,
+      createdAt: new Date().toISOString(),
+    };
+
+    const res = await fetch(`${API_BASE}/chat_summary`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      throw new Error(txt || `Save failed (${res.status})`);
+    }
+    return await res.json();
+  }, [API_BASE, memberId, companionForPersistence, messages]);
+
   // After the Clear Messages dialog is dismissed with NO, iOS can sometimes route
   // subsequent audio to the quiet receiver / low-volume path. We "nudge" the
   // audio session back to normal playback volume and ensure our media elements
@@ -3518,6 +3745,35 @@ const speakGreetingIfNeeded = useCallback(
             {/** Input line with mode pills moved to the right (layout-only). */}
             <button
               type="button"
+              onClick={requestSaveSummary}
+              disabled={!ENABLE_SAVE_SUMMARY || !memberId || saveSummaryBusy}
+              title={
+                !ENABLE_SAVE_SUMMARY
+                  ? "Save a summary of this chat for future reference"
+                  : !memberId
+                    ? "Sign in to save summaries across devices"
+                    : saveSummaryBusy
+                      ? "Saving summary…"
+                      : "Save a summary of this chat for future reference"
+              }
+              style={{
+                padding: "10px 12px",
+                borderRadius: 10,
+                border: "1px solid #bbb",
+                background: "#fff",
+                cursor: (!ENABLE_SAVE_SUMMARY || !memberId || saveSummaryBusy) ? "not-allowed" : "pointer",
+                opacity: (!ENABLE_SAVE_SUMMARY || !memberId || saveSummaryBusy) ? 0.45 : 1,
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
+                width: 44,
+              }}
+            >
+              <SaveIcon size={18} />
+            </button>
+
+            <button
+              type="button"
               onClick={requestClearMessages}
               title="Clear the conversation on screen"
               style={{
@@ -3526,9 +3782,13 @@ const speakGreetingIfNeeded = useCallback(
                 border: "1px solid #bbb",
                 background: "#fff",
                 cursor: "pointer",
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
+                width: 44,
               }}
             >
-              Clear Messages
+              <DeleteIcon size={18} />
             </button>
 
             <input
