@@ -113,6 +113,9 @@ const DEFAULT_AVATAR = havenHeart.src;
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
 
+// Helps distinguish deployed builds when page.tsx filenames are identical.
+const BUILD_TAG = "page.tsx build 2026-01-17.1";
+
 // Save Summary persists a per-(memberId, companion) summary for cross-device reference.
 const ENABLE_SAVE_SUMMARY = true;
 
@@ -527,6 +530,7 @@ export default function Page() {
 
     try {
       pushDebug("log", "Debug enabled", {
+        build: BUILD_TAG,
         href: window.location.href,
         embedded: isEmbedded,
         ua: navigator.userAgent,
@@ -3163,9 +3167,25 @@ const speakGreetingIfNeeded = useCallback(
     } catch {
       // ignore
     }
+
+    // Graceful preflight errors (shown in the same dialog shell as Clear Messages).
+    if (!ENABLE_SAVE_SUMMARY) return;
+
+    if (!API_BASE) {
+      setSaveSummaryError("Save is not configured (missing NEXT_PUBLIC_API_BASE_URL). Please contact support.");
+      setShowSaveSummaryConfirm(true);
+      return;
+    }
+
+    if (!memberId) {
+      setSaveSummaryError("Save is unavailable because memberId is not present. Please sign in and reload this page.");
+      setShowSaveSummaryConfirm(true);
+      return;
+    }
+
     setSaveSummaryError(null);
     setShowSaveSummaryConfirm(true);
-  }, [stopHandsFreeSTT]);
+  }, [stopHandsFreeSTT, memberId]);
 
   const companionForPersistence = useMemo(() => {
     const c = (companionKey || "").trim() || (companionName || "").trim();
@@ -3746,7 +3766,7 @@ const speakGreetingIfNeeded = useCallback(
             <button
               type="button"
               onClick={requestSaveSummary}
-              disabled={!ENABLE_SAVE_SUMMARY || !memberId || saveSummaryBusy}
+              disabled={!ENABLE_SAVE_SUMMARY || saveSummaryBusy}
               title={
                 !ENABLE_SAVE_SUMMARY
                   ? "Save a summary of this chat for future reference"
@@ -3761,8 +3781,8 @@ const speakGreetingIfNeeded = useCallback(
                 borderRadius: 10,
                 border: "1px solid #bbb",
                 background: "#fff",
-                cursor: (!ENABLE_SAVE_SUMMARY || !memberId || saveSummaryBusy) ? "not-allowed" : "pointer",
-                opacity: (!ENABLE_SAVE_SUMMARY || !memberId || saveSummaryBusy) ? 0.45 : 1,
+                cursor: (!ENABLE_SAVE_SUMMARY || saveSummaryBusy) ? "not-allowed" : "pointer",
+                opacity: (!ENABLE_SAVE_SUMMARY || saveSummaryBusy) ? 0.45 : 1,
                 display: "inline-flex",
                 alignItems: "center",
                 justifyContent: "center",
@@ -3903,6 +3923,120 @@ const speakGreetingIfNeeded = useCallback(
         </div>
       )}
 
+      {/* Save Summary confirmation overlay */}
+      {showSaveSummaryConfirm && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.4)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: 16,
+            zIndex: 10000,
+          }}
+        >
+          <div
+            style={{
+              background: "#fff",
+              borderRadius: 12,
+              padding: 16,
+              maxWidth: 560,
+              width: "100%",
+              boxShadow: "0 8px 30px rgba(0,0,0,0.25)",
+            }}
+          >
+            <div style={{ fontSize: 18, fontWeight: 700, marginBottom: 8 }}>
+              {saveSummaryError ? "Cannot save summary" : "Save chat summary?"}
+            </div>
+
+            <div style={{ fontSize: 14, color: "#333", lineHeight: 1.4 }}>
+              {saveSummaryError
+                ? saveSummaryError
+                : `You are authorizing Haven to save a summary of this chat (full transcript-derived) on the server for future reference. This save is scoped to your account and the selected companion (memberId + companion).`}
+            </div>
+
+            {!saveSummaryError ? (
+              <div style={{ marginTop: 10, fontSize: 12, color: "#666", lineHeight: 1.4 }}>
+                Audio and video have been stopped. You can continue the conversation after saving.
+              </div>
+            ) : null}
+
+            <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", marginTop: 14 }}>
+              {saveSummaryError ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowSaveSummaryConfirm(false);
+                    setSaveSummaryError(null);
+                    void restoreVolumesAfterClearCancel();
+                  }}
+                  style={{
+                    padding: "10px 14px",
+                    borderRadius: 10,
+                    border: "1px solid #111",
+                    background: "#111",
+                    color: "#fff",
+                    cursor: "pointer",
+                  }}
+                >
+                  OK
+                </button>
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowSaveSummaryConfirm(false);
+                      void restoreVolumesAfterClearCancel();
+                    }}
+                    style={{
+                      padding: "10px 14px",
+                      borderRadius: 10,
+                      border: "1px solid #bbb",
+                      background: "#fff",
+                      cursor: "pointer",
+                    }}
+                  >
+                    No
+                  </button>
+                  <button
+                    type="button"
+                    disabled={saveSummaryBusy}
+                    onClick={async () => {
+                      setSaveSummaryBusy(true);
+                      setSaveSummaryError(null);
+                      try {
+                        await persistConversationSummary();
+                        setShowSaveSummaryConfirm(false);
+                      } catch (e: any) {
+                        const msg = String(e?.message || e || "Save failed");
+                        setSaveSummaryError(msg);
+                      } finally {
+                        setSaveSummaryBusy(false);
+                        void restoreVolumesAfterClearCancel();
+                      }
+                    }}
+                    style={{
+                      padding: "10px 14px",
+                      borderRadius: 10,
+                      border: "1px solid #111",
+                      background: "#111",
+                      color: "#fff",
+                      cursor: saveSummaryBusy ? "not-allowed" : "pointer",
+                      opacity: saveSummaryBusy ? 0.6 : 1,
+                    }}
+                  >
+                    {saveSummaryBusy ? "Saving…" : "Yes, save"}
+                  </button>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
 {/* Consent overlay */}
       {showConsentOverlay && (
         <div
@@ -4009,7 +4143,7 @@ const speakGreetingIfNeeded = useCallback(
           }}
         >
           <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
-            <div style={{ fontWeight: 700, fontSize: 13 }}>Debug Logs ({debugLogs.length})</div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 2 }}><div style={{ fontWeight: 700, fontSize: 13 }}>Debug Logs ({debugLogs.length})</div><div style={{ fontSize: 11, color: "rgba(255,255,255,0.75)" }}>{BUILD_TAG}</div></div>
             <button
               onClick={() => {
                 try {
