@@ -30,6 +30,39 @@ const PauseIcon = ({ size = 18 }: { size?: number }) => (
   </svg>
 );
 
+
+
+const TrashIcon = ({ size = 18 }: { size?: number }) => (
+  <svg
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    aria-hidden="true"
+    focusable="false"
+    style={{ display: "block" }}
+  >
+    <path
+      d="M9 3h6l1 2h4v2H4V5h4l1-2zm1 6h2v10h-2V9zm4 0h2v10h-2V9zM6 9h2v10H6V9z"
+      fill="currentColor"
+    />
+  </svg>
+);
+
+const SaveIcon = ({ size = 18 }: { size?: number }) => (
+  <svg
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    aria-hidden="true"
+    focusable="false"
+    style={{ display: "block" }}
+  >
+    <path
+      d="M17 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7l-4-4zm2 16a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h11v5H7v2h10V4.41L19 6.41V19z"
+      fill="currentColor"
+    />
+  </svg>
+);
 type Role = "user" | "assistant";
 type Msg = { role: Role; content: string };
 
@@ -1522,6 +1555,7 @@ const speakAssistantReply = useCallback(
   });
 
   const [planName, setPlanName] = useState<PlanName>(null);
+  const [memberId, setMemberId] = useState<string>("");
   const [showModePicker, setShowModePicker] = useState(false);
   const [setModeFlash, setSetModeFlash] = useState(false);
   const [switchCompanionFlash, setSwitchCompanionFlash] = useState(false);
@@ -1700,6 +1734,15 @@ useEffect(() => {
       const incomingPlan = (data.planName ?? null) as PlanName;
       setPlanName(incomingPlan);
 
+
+      const incomingMemberId =
+        typeof (data as any).memberId === "string"
+          ? String((data as any).memberId).trim()
+          : typeof (data as any).member_id === "string"
+            ? String((data as any).member_id).trim()
+            : "";
+      setMemberId(incomingMemberId);
+
       const incomingCompanion =
         typeof (data as any).companion === "string" ? (data as any).companion.trim() : "";
       const resolvedCompanionKey = incomingCompanion || "";
@@ -1768,6 +1811,9 @@ const stateToSendWithCompanion: SessionState = {
   // Backward/forward compatibility with any backend expecting different field names
   companionName: companionForBackend,
   companion_name: companionForBackend,
+  // Member identity (from Wix)
+  memberId: (memberId || "").trim(),
+  member_id: (memberId || "").trim(),
 };
 
     const res = await fetch(`${API_BASE}/chat`, {
@@ -3470,17 +3516,45 @@ const speakGreetingIfNeeded = useCallback(
             {/** Input line with mode pills moved to the right (layout-only). */}
             <button
               type="button"
-              onClick={requestClearMessages}
-              title="Clear the conversation on screen"
+              onClick={() => {
+                // TODO: Save logic (stub for now)
+                console.log("Save conversation (stub)");
+              }}
+              title="Save conversation (coming soon)"
+              aria-label="Save"
               style={{
-                padding: "10px 12px",
+                width: 44,
+                height: 44,
                 borderRadius: 10,
                 border: "1px solid #bbb",
                 background: "#fff",
                 cursor: "pointer",
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
               }}
             >
-              Clear Messages
+              <SaveIcon size={18} />
+            </button>
+
+            <button
+              type="button"
+              onClick={requestClearMessages}
+              title="Clear the conversation on screen"
+              aria-label="Delete"
+              style={{
+                width: 44,
+                height: 44,
+                borderRadius: 10,
+                border: "1px solid #bbb",
+                background: "#fff",
+                cursor: "pointer",
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
+              }}
+            >
+              <TrashIcon size={18} />
             </button>
 
             <input
