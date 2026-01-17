@@ -1736,6 +1736,8 @@ const speakAssistantReply = useCallback(
   const [messages, setMessages] = useState<Msg[]>([]);
   const [loading, setLoading] = useState(false);
   const [showClearMessagesConfirm, setShowClearMessagesConfirm] = useState(false);
+  const [showSaveSummaryConfirm, setShowSaveSummaryConfirm] = useState(false);
+  const [savingSummary, setSavingSummary] = useState(false);
   const clearEpochRef = useRef(0);
 
   const [chatStatus, setChatStatus] = useState<ChatStatus>("safe");
@@ -2054,6 +2056,46 @@ const stateToSendWithCompanion: SessionState = {
     }
 
     return (await res.json()) as ChatApiResponse;
+  }
+
+  async function callSaveChatSummary(nextMessages: Msg[], stateToSend: SessionState): Promise<{ ok: boolean; summary?: string }> {
+    if (!API_BASE) throw new Error("NEXT_PUBLIC_API_BASE_URL is not set");
+
+    const session_id =
+      sessionIdRef.current ||
+      (crypto as any).randomUUID?.() ||
+      `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+    const companionForBackend =
+      (companionKey || "").trim() ||
+      (companionName || DEFAULT_COMPANION_NAME).trim() ||
+      DEFAULT_COMPANION_NAME;
+
+    const stateToSendWithCompanion: SessionState = {
+      ...stateToSend,
+      companion: companionForBackend,
+      companionName: companionForBackend,
+      companion_name: companionForBackend,
+      memberId: (memberId || "").trim(),
+      member_id: (memberId || "").trim(),
+    };
+
+    const res = await fetch(`${API_BASE}/chat/save-summary`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id,
+        session_state: stateToSendWithCompanion,
+        messages: nextMessages.map((m) => ({ role: m.role, content: m.content })),
+      }),
+    });
+
+    if (!res.ok) {
+      const errText = await res.text().catch(() => "");
+      throw new Error(`Backend error ${res.status}: ${errText}`);
+    }
+
+    return (await res.json()) as any;
   }
 
   // This is the mode that drives the UI highlight:
@@ -3271,6 +3313,38 @@ const speakGreetingIfNeeded = useCallback(
     setShowClearMessagesConfirm(true);
   }, [stopHandsFreeSTT, boostAllTtsVolumes, nudgeAudioSession, primeLocalTtsAudio, ensureIphoneAudioContextUnlocked]);
 
+  // Save Chat Summary (with confirmation)
+  const requestSaveChatSummary = useCallback(() => {
+    // Same safety posture as Clear Messages:
+    // Stop all audio/video + STT immediately on click, then the user manually chooses what to resume.
+    clearEpochRef.current += 1;
+    setLoading(false);
+
+    try {
+      stopHandsFreeSTT();
+    } catch {
+      // ignore
+    }
+
+    // User gesture: re-assert boosted audio routing and nudge audio session back to playback mode.
+    try {
+      boostAllTtsVolumes();
+    } catch {}
+    try {
+      void nudgeAudioSession();
+    } catch {}
+
+    // Prime the hidden VIDEO element on this user gesture so audio-only TTS remains healthy.
+    try {
+      primeLocalTtsAudio(true);
+    } catch {}
+    try {
+      void ensureIphoneAudioContextUnlocked();
+    } catch {}
+
+    setShowSaveSummaryConfirm(true);
+  }, [stopHandsFreeSTT, boostAllTtsVolumes, nudgeAudioSession, primeLocalTtsAudio, ensureIphoneAudioContextUnlocked]);
+
   // After the Clear Messages dialog is dismissed with NO, iOS can sometimes route
   // subsequent audio to the quiet receiver / low-volume path. We "nudge" the
   // audio session back to normal playback volume and ensure our media elements
@@ -3767,11 +3841,8 @@ const speakGreetingIfNeeded = useCallback(
             {/** Input line with mode pills moved to the right (layout-only). */}
             <button
               type="button"
-              onClick={() => {
-                // TODO: Save logic (stub for now)
-                console.log("Save conversation (stub)");
-              }}
-              title="Save conversation (coming soon)"
+              onClick={requestSaveChatSummary}
+              title="Save chat summary"
               aria-label="Save"
               style={{
                 width: 44,
@@ -3849,6 +3920,122 @@ const speakGreetingIfNeeded = useCallback(
 	          ) : null}
         </div>
       </section>
+
+      {/* Save Chat Summary confirmation overlay */}
+      {showSaveSummaryConfirm && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.4)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: 16,
+            zIndex: 10000,
+          }}
+        >
+          <div
+            style={{
+              background: "#fff",
+              borderRadius: 12,
+              padding: 16,
+              maxWidth: 560,
+              width: "100%",
+              boxShadow: "0 8px 30px rgba(0,0,0,0.25)",
+            }}
+          >
+            <div style={{ fontSize: 18, fontWeight: 700, marginBottom: 8 }}>
+              Save chat summary?
+            </div>
+            <div style={{ fontSize: 14, color: "#333", lineHeight: 1.4 }}>
+              Saving stores a server-side summary of this conversation for future reference across your devices.
+              By selecting <b>Yes, save</b>, you authorize AI Haven to store chat summary data associated with your
+              account for later use.
+              <div style={{ marginTop: 8 }}>
+                All audio, video, and mic listening have been stopped. You can resume manually using the controls
+                after closing this dialog.
+              </div>
+            </div>
+
+            <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", marginTop: 14 }}>
+              <button
+                type="button"
+                onClick={() => {
+                  if (savingSummary) return;
+                  setShowSaveSummaryConfirm(false);
+                  // Maintain the same post-modal audio/TTS hardening used by Clear Messages.
+                  try { boostAllTtsVolumes(); } catch {}
+                  void restoreVolumesAfterClearCancel();
+                }}
+                style={{
+                  padding: "10px 14px",
+                  borderRadius: 10,
+                  border: "1px solid #bbb",
+                  background: "#fff",
+                  cursor: savingSummary ? "not-allowed" : "pointer",
+                  opacity: savingSummary ? 0.65 : 1,
+                }}
+              >
+                No
+              </button>
+              <button
+                type="button"
+                onClick={async () => {
+                  if (savingSummary) return;
+                  setSavingSummary(true);
+                  try {
+                    const payloadMessages = messages.slice();
+                    if (payloadMessages.length === 0) {
+                      setMessages((prev) => [
+                        ...prev,
+                        { role: "assistant", content: "There is nothing to save yet." },
+                      ]);
+                      setShowSaveSummaryConfirm(false);
+                      return;
+                    }
+
+                    const resp = await callSaveChatSummary(payloadMessages, sessionState);
+                    if (resp?.ok) {
+                      setMessages((prev) => [
+                        ...prev,
+                        { role: "assistant", content: "Chat summary saved." },
+                      ]);
+                    } else {
+                      setMessages((prev) => [
+                        ...prev,
+                        { role: "assistant", content: "Unable to save chat summary right now." },
+                      ]);
+                    }
+                  } catch (e: any) {
+                    setMessages((prev) => [
+                      ...prev,
+                      { role: "assistant", content: `Save failed: ${String(e?.message || e)}` },
+                    ]);
+                  } finally {
+                    setSavingSummary(false);
+                    setShowSaveSummaryConfirm(false);
+                    // Maintain the same post-modal audio/TTS hardening used by Clear Messages.
+                    try { boostAllTtsVolumes(); } catch {}
+                    void restoreVolumesAfterClearCancel();
+                  }
+                }}
+                style={{
+                  padding: "10px 14px",
+                  borderRadius: 10,
+                  border: "1px solid #111",
+                  background: "#111",
+                  color: "#fff",
+                  cursor: savingSummary ? "not-allowed" : "pointer",
+                  opacity: savingSummary ? 0.7 : 1,
+                }}
+              >
+                {savingSummary ? "Saving…" : "Yes, save"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Clear Messages confirmation overlay */}
       {showClearMessagesConfirm && (
