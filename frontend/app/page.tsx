@@ -30,6 +30,41 @@ const PauseIcon = ({ size = 18 }: { size?: number }) => (
   </svg>
 );
 
+// International-style action icons (Save / Delete)
+const SaveIcon = ({ size = 18 }: { size?: number }) => (
+  <svg
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    aria-hidden="true"
+    focusable="false"
+    style={{ display: "block" }}
+  >
+    {/* Floppy disk icon */}
+    <path
+      d="M17 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7l-4-4zM12 19a3 3 0 1 1 0-6 3 3 0 0 1 0 6zM6 5h9v4H6V5z"
+      fill="currentColor"
+    />
+  </svg>
+);
+
+const DeleteIcon = ({ size = 18 }: { size?: number }) => (
+  <svg
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    aria-hidden="true"
+    focusable="false"
+    style={{ display: "block" }}
+  >
+    {/* Trash can icon */}
+    <path
+      d="M6 7h12l-1 14H7L6 7zm3-3h6l1 2H8l1-2z"
+      fill="currentColor"
+    />
+  </svg>
+);
+
 type Role = "user" | "assistant";
 type Msg = { role: Role; content: string };
 
@@ -78,31 +113,11 @@ const DEFAULT_AVATAR = havenHeart.src;
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
 
-/**
- * IMPORTANT SECURITY NOTE
- * We intentionally do NOT maintain a separate allowlist for postMessage origins.
- * The only origins allowed to interact with this frontend (and the backend via CORS)
- * must be those explicitly listed in CORS_ALLOWED_ORIGINS.
- *
- * For the client bundle, the backend env var isn't directly readable; therefore
- * this file expects a public mirror env var:
- *   NEXT_PUBLIC_CORS_ALLOWED_ORIGINS="https://example.com,https://app.example.com"
- *
- * If NEXT_PUBLIC_CORS_ALLOWED_ORIGINS is not set, we fall back to same-origin only.
- */
-function normalizeOrigin(o: string): string {
-  return String(o || "").trim().replace(/\/$/, "");
-}
+// Helps distinguish deployed builds when page.tsx filenames are identical.
+const BUILD_TAG = "page.tsx build 2026-01-17.1";
 
-const CORS_ALLOWED_ORIGINS_PUBLIC = normalizeOrigin(
-  process.env.NEXT_PUBLIC_CORS_ALLOWED_ORIGINS || ""
-);
-
-const ALLOWED_ORIGIN_SET: Set<string> = new Set(
-  CORS_ALLOWED_ORIGINS_PUBLIC
-    ? CORS_ALLOWED_ORIGINS_PUBLIC.split(",").map((s) => normalizeOrigin(s)).filter(Boolean)
-    : []
-);
+// Save Summary persists a per-(memberId, companion) summary for cross-device reference.
+const ENABLE_SAVE_SUMMARY = true;
 
 type Phase1AvatarMedia = {
   didAgentId: string;
@@ -300,32 +315,31 @@ function greetingFor(name: string) {
   return `Hi, ${n} here. 😊 What's on your mind?`;
 }
 
-/**
- * postMessage origin policy
- *
- * HARD REQUIREMENT: Do not allow ANY postMessage origins that are not explicitly listed
- * in the same CORS allowlist used by the backend.
- *
- * - No implicit "Wix" allowlisting.
- * - No accepting origin === "null" or "".
- * - If NEXT_PUBLIC_CORS_ALLOWED_ORIGINS is not set, fall back to SAME-ORIGIN only.
- */
-function isAllowedMessageOrigin(messageOrigin: string, pageOrigin: string) {
-  const raw = String(messageOrigin ?? "").trim();
-  if (!raw) return false;
-  if (raw === "null") return false;
+// Public mirror of backend CORS_ALLOWED_ORIGINS. Comma-separated list of absolute origins.
+// Example: "https://www.aihaven4u.com,https://yellow-hill-0a40ae30f.3.azurestaticapps.net"
+const PUBLIC_ALLOWED_ORIGINS: string[] = (() => {
+  const raw = (process.env.NEXT_PUBLIC_CORS_ALLOWED_ORIGINS || "").trim();
+  if (!raw) return [];
+  return raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+})();
 
-  const norm = normalizeOrigin(raw);
-  if (!norm) return false;
+function isAllowedOrigin(origin: string, selfOrigin?: string) {
+  // Reject null/empty origins explicitly (sandboxed iframes or opaque origins)
+  if (!origin || origin === "null") return false;
 
-  // If we have an explicit allowlist, require membership.
-  if (ALLOWED_ORIGIN_SET.size > 0) {
-    return ALLOWED_ORIGIN_SET.has(norm);
+  // If the allowlist is configured, require exact match.
+  if (PUBLIC_ALLOWED_ORIGINS.length > 0) {
+    return PUBLIC_ALLOWED_ORIGINS.includes(origin);
   }
 
-  // Otherwise, require strict same-origin.
-  return norm === normalizeOrigin(pageOrigin);
+  // Fallback: strict same-origin only.
+  if (selfOrigin) return origin === selfOrigin;
+  return false;
 }
+
 
 /**
  * Detects a mode switch request in *user text* and returns:
@@ -426,7 +440,6 @@ export default function Page() {
 
 
   const sessionIdRef = useRef<string | null>(null);
-  const wixPayloadReceivedRef = useRef(false);
 
   // -----------------------
   // Debug overlay (mobile-friendly)
@@ -525,6 +538,7 @@ export default function Page() {
 
     try {
       pushDebug("log", "Debug enabled", {
+        build: BUILD_TAG,
         href: window.location.href,
         embedded: isEmbedded,
         ua: navigator.userAgent,
@@ -574,6 +588,9 @@ export default function Page() {
 
 
   // Companion identity (drives persona + Phase 1 live avatar mapping)
+  // memberId is provided by Wix (or other host) and is used to scope saved summaries
+  // on the backend by (memberId, companion).
+  const [memberId, setMemberId] = useState<string | null>(null);
   const [companionName, setCompanionName] = useState<string>(DEFAULT_COMPANION_NAME);
   const [avatarSrc, setAvatarSrc] = useState<string>(DEFAULT_AVATAR);
   const [companionKey, setCompanionKey] = useState<string>("");
@@ -1549,6 +1566,9 @@ const speakAssistantReply = useCallback(
   const [messages, setMessages] = useState<Msg[]>([]);
   const [loading, setLoading] = useState(false);
   const [showClearMessagesConfirm, setShowClearMessagesConfirm] = useState(false);
+  const [showSaveSummaryConfirm, setShowSaveSummaryConfirm] = useState(false);
+  const [saveSummaryBusy, setSaveSummaryBusy] = useState(false);
+  const [saveSummaryError, setSaveSummaryError] = useState<string | null>(null);
   const clearEpochRef = useRef(0);
 
   const [chatStatus, setChatStatus] = useState<ChatStatus>("safe");
@@ -1732,96 +1752,123 @@ useEffect(() => {
 
   // Receive plan + companion from Wix postMessage
   useEffect(() => {
-    function safeJson(v: any) {
-      try {
-        return JSON.stringify(v);
-      } catch {
-        return "[unserializable]";
-      }
-    }
-
-    function extractPayload(raw: any): any {
-      if (!raw) return null;
-
-      // Some Wix contexts send a JSON string.
-      if (typeof raw === "string") {
+    function onMessage(event: MessageEvent) {
+      // DEBUG: capture exactly what the embedded Wix page is sending.
+      // This is intentionally verbose, but only emits when the debug overlay is enabled.
+      if (debugEnabledRef.current) {
         try {
-          raw = JSON.parse(raw);
+          const raw = (event as any)?.data;
+          console.log("[Wix postMessage] raw event", {
+            origin: (event as any)?.origin,
+            dataType: typeof raw,
+            data: raw,
+          });
         } catch {
-          return null;
+          // ignore
         }
       }
 
-      // Wrapper shapes we've seen: { data: payload } / { message: payload }
-      if (raw && typeof raw === "object" && !raw.type) {
-        const maybe = (raw as any).data || (raw as any).message || (raw as any).payload;
-        if (maybe && typeof maybe === "object") raw = maybe;
+      // Wix HTML components can postMessage from a variety of origins depending on
+      // editor/preview/live hosting. We keep a conservative allowlist, but also
+      // structured wrappers.
+      const origin = typeof event.origin === "string" ? event.origin : "";
+      const originAllowed = isAllowedOrigin(origin, typeof window !== "undefined" ? window.location.origin : undefined);
+
+      if (debugEnabledRef.current) {
+        try {
+          console.log("[Wix postMessage] origin evaluation", {
+            origin,
+            originAllowed,
+          });
+        } catch {
+          // ignore
+        }
       }
 
-      return raw;
-    }
-
-    function onMessage(event: MessageEvent) {
-      const origin = typeof (event as any)?.origin === "string" ? (event as any).origin : "";
-      // Some embedded/sandboxed iframe contexts report "null" or even an empty origin.
-      // We allow those only for the WEEKLY_PLAN handshake.
-      const originAllowed = isAllowedMessageOrigin(origin, window.location.origin);
-
-      // Always write payload diagnostics into the DEBUG overlay (not just console).
-      // This is the only way to see what the iframe is sending in some embedded Safari contexts.
-      if (debugEnabledRef.current) {
-        pushDebug("log", "[Wix postMessage] received", {
-          origin,
-          originAllowed,
-          dataType: typeof (event as any)?.data,
-          raw: (event as any)?.data,
-        });
+      // Some Wix contexts wrap the payload or send it as a JSON string.
+      let data: any = event.data;
+      if (typeof data === "string") {
+        try {
+          data = JSON.parse(data);
+          if (debugEnabledRef.current) {
+            try {
+              console.log("[Wix postMessage] parsed JSON string", data);
+            } catch {
+              // ignore
+            }
+          }
+        } catch {
+          // Ignore non-JSON string messages.
+          if (debugEnabledRef.current) {
+            try {
+              console.log("[Wix postMessage] ignored non-JSON string message", data);
+            } catch {
+              // ignore
+            }
+          }
+          return;
+        }
       }
 
-      const candidate = extractPayload((event as any)?.data);
+      // Wrapper shapes we have seen: { data: payload } or { message: payload }
+      const candidate = (data && (data.type ? data : data.data || data.message)) || null;
+
       if (debugEnabledRef.current) {
-        pushDebug("log", "[Wix postMessage] extracted", {
-          candidateType: typeof candidate,
-          candidate,
-        });
+        try {
+          console.log("[Wix postMessage] candidate extracted", {
+            candidateType: typeof candidate,
+            candidate,
+          });
+        } catch {
+          // ignore
+        }
       }
 
       if (!candidate || candidate.type !== "WEEKLY_PLAN") {
         if (debugEnabledRef.current) {
-          pushDebug("warn", "[Wix postMessage] ignored: wrong type", {
-            gotType: candidate?.type,
-            origin,
-          });
+          try {
+            console.log("[Wix postMessage] ignored: wrong type", {
+              gotType: candidate?.type,
+            });
+          } catch {
+            // ignore
+          }
         }
         return;
       }
-
       if (!originAllowed) {
         if (debugEnabledRef.current) {
-          pushDebug("warn", "[Wix postMessage] ignored: origin not allowed", { origin });
+          try {
+            console.log("[Wix postMessage] ignored: origin not allowed", { origin });
+          } catch {
+            // ignore
+          }
         }
         return;
       }
 
-      const data = candidate;
-      wixPayloadReceivedRef.current = true;
+      data = candidate;
+
       if (debugEnabledRef.current) {
-        pushDebug("log", "[Wix postMessage] accepted WEEKLY_PLAN", data);
+        try {
+          console.log("[Wix postMessage] accepted WEEKLY_PLAN payload", data);
+        } catch {
+          // ignore
+        }
       }
 
       const incomingPlan = (data.planName ?? null) as PlanName;
       setPlanName(incomingPlan);
 
       // Capture memberId from Wix so summaries can be scoped correctly server-side.
-      // Note: in some preview contexts memberId may be null/undefined.
       if (typeof (data as any).memberId === "string") {
         const mid = (data as any).memberId.trim();
         setMemberId(mid || null);
-      } else if ((data as any).memberId == null) {
-        // Do not overwrite an existing memberId with null.
-        setMemberId((prev) => prev);
       }
 
+      // Wix sends the selected companion in `companion`. It may be empty briefly
+      // while the session storage is populating; in that case we keep the existing
+      // selection rather than snapping back to Haven.
       const incomingCompanion =
         typeof (data as any).companion === "string" ? (data as any).companion.trim() : "";
       const resolvedCompanionKey = incomingCompanion || "";
@@ -1839,16 +1886,16 @@ useEffect(() => {
           companion_name: parsed.key,
         }));
       } else {
-        // IMPORTANT: Wix can transiently send an empty companion in some flows.
-        // Do NOT snap back to Haven in that case; keep the current selection.
+        // IMPORTANT: Wix can transiently send an empty companion in some
+        // preview/editor flows. Do NOT snap back to Haven in that case; keep the
+        // current selection. Only apply the default if we truly have no selection.
         setCompanionKey((prevKey) => prevKey);
         setCompanionName((prevName) => prevName || DEFAULT_COMPANION_NAME);
-
         setSessionState((prev) => {
           const existing =
-            String((prev as any)?.companion ?? "").trim() ||
-            String((prev as any)?.companionName ?? "").trim() ||
-            String((prev as any)?.companion_name ?? "").trim();
+            (prev.companion || "").trim() ||
+            (prev.companionName || "").trim() ||
+            (prev.companion_name || "").trim();
           if (existing) return prev;
           return {
             ...prev,
@@ -1859,7 +1906,9 @@ useEffect(() => {
         });
       }
 
-      const avatarCandidates = buildAvatarCandidates(resolvedCompanionKey || DEFAULT_COMPANION_NAME);
+      const avatarCandidates = buildAvatarCandidates(
+        resolvedCompanionKey || companionKey || companionName || DEFAULT_COMPANION_NAME
+      );
       pickFirstExisting(avatarCandidates).then((picked) => setAvatarSrc(picked));
 
       const nextAllowed = allowedModesForPlan(incomingPlan);
@@ -1874,20 +1923,7 @@ useEffect(() => {
 
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
-  }, [pushDebug]);
-
-  // If embedded and we never receive WEEKLY_PLAN, surface that explicitly in DEBUG.
-  useEffect(() => {
-    if (!isEmbedded) return;
-    const t = window.setTimeout(() => {
-      if (!wixPayloadReceivedRef.current && debugEnabledRef.current) {
-        pushDebug("warn", "[Wix postMessage] No WEEKLY_PLAN payload received yet", {
-          originNote: "If companion defaults to Haven, the Wix host may not be posting, or origin allowlist may be too strict.",
-        });
-      }
-    }, 2500);
-    return () => window.clearTimeout(t);
-  }, [isEmbedded, pushDebug]);
+  }, []);
 
   async function callChat(nextMessages: Msg[], stateToSend: SessionState): Promise<ChatApiResponse> {
     if (!API_BASE) throw new Error("NEXT_PUBLIC_API_BASE_URL is not set");
@@ -3130,6 +3166,129 @@ const speakGreetingIfNeeded = useCallback(
     setShowClearMessagesConfirm(true);
   }, [stopHandsFreeSTT]);
 
+  // Save Summary (with confirmation)
+  const requestSaveSummary = useCallback(() => {
+    // Match the Clear Messages behavior: stop audio/video + STT immediately on click.
+    setLoading(false);
+    try {
+      stopHandsFreeSTT();
+    } catch {
+      // ignore
+    }
+
+    // Graceful preflight errors (shown in the same dialog shell as Clear Messages).
+    if (!ENABLE_SAVE_SUMMARY) return;
+
+    if (!API_BASE) {
+      setSaveSummaryError("Save is not configured (missing NEXT_PUBLIC_API_BASE_URL). Please contact support.");
+      setShowSaveSummaryConfirm(true);
+      return;
+    }
+
+    if (!memberId) {
+      setSaveSummaryError("Save is unavailable because memberId is not present. Please sign in and reload this page.");
+      setShowSaveSummaryConfirm(true);
+      return;
+    }
+
+    setSaveSummaryError(null);
+    setShowSaveSummaryConfirm(true);
+  }, [stopHandsFreeSTT, memberId]);
+
+  const companionForPersistence = useMemo(() => {
+    const c = (companionKey || "").trim() || (companionName || "").trim();
+    return c || DEFAULT_COMPANION_NAME;
+  }, [companionKey, companionName]);
+
+  function buildFullTranscript(msgs: Msg[]): { text: string; trimmed: Msg[] } {
+    const trimmed = (msgs || []).filter((m) => (m?.content || "").trim());
+    const lines: string[] = [];
+    for (const m of trimmed) {
+      const who = m.role === "user" ? "You" : companionForPersistence;
+      const body = String(m.content || "").trim();
+      if (!body) continue;
+      lines.push(`${who}: ${body}`);
+    }
+    return { text: lines.join("\n\n"), trimmed };
+  }
+
+  function buildConversationSummaryFromFullTranscript(msgs: Msg[]): { summary: string; transcriptText: string } {
+    // Deterministic, on-device synopsis that is derived from the FULL transcript.
+    // We also persist the full transcript server-side so future summarizers can re-summarize accurately.
+    const { text: transcriptText, trimmed } = buildFullTranscript(msgs);
+    if (!trimmed.length) return { summary: "(No messages to summarize.)", transcriptText: "" };
+
+    const total = trimmed.length;
+    const userTurns = trimmed.filter((m) => m.role === "user").length;
+    const assistantTurns = total - userTurns;
+
+    const firstUser = trimmed.find((m) => m.role === "user")?.content?.trim() || "";
+    const firstAssistant = trimmed.find((m) => m.role === "assistant")?.content?.trim() || "";
+    const lastUser = [...trimmed].reverse().find((m) => m.role === "user")?.content?.trim() || "";
+    const lastAssistant = [...trimmed].reverse().find((m) => m.role === "assistant")?.content?.trim() || "";
+
+    // Keep a small “recent context” section for fast human scanning, but the summary is derived
+    // from the whole transcript via the included first + last turn anchors.
+    const recent = trimmed.slice(-12);
+    const bullets: string[] = [];
+    for (const m of recent) {
+      const who = m.role === "user" ? "You" : companionForPersistence;
+      const line = (m.content || "").trim().replace(/\s+/g, " ");
+      if (!line) continue;
+      bullets.push(`- ${who}: ${line.length > 180 ? line.slice(0, 177) + "…" : line}`);
+      if (bullets.length >= 10) break;
+    }
+
+    const header = [
+      `Companion: ${companionForPersistence}`,
+      `Turns: ${total} (You: ${userTurns}, ${companionForPersistence}: ${assistantTurns})`,
+      firstUser
+        ? `First you: ${firstUser.replace(/\s+/g, " ").slice(0, 220)}${firstUser.length > 220 ? "…" : ""}`
+        : "",
+      firstAssistant
+        ? `First ${companionForPersistence}: ${firstAssistant.replace(/\s+/g, " ").slice(0, 220)}${firstAssistant.length > 220 ? "…" : ""}`
+        : "",
+      lastUser
+        ? `Last you: ${lastUser.replace(/\s+/g, " ").slice(0, 220)}${lastUser.length > 220 ? "…" : ""}`
+        : "",
+      lastAssistant
+        ? `Last ${companionForPersistence}: ${lastAssistant.replace(/\s+/g, " ").slice(0, 220)}${lastAssistant.length > 220 ? "…" : ""}`
+        : "",
+    ].filter(Boolean);
+
+    const summary = `${header.join("\n")}\n\nRecent context:\n${bullets.join("\n")}`;
+    return { summary, transcriptText };
+  }
+
+  const persistConversationSummary = useCallback(async () => {
+    if (!API_BASE) throw new Error("NEXT_PUBLIC_API_BASE_URL is not set");
+    if (!memberId) throw new Error("Missing memberId (user not identified)");
+    if (!companionForPersistence) throw new Error("Missing companion");
+
+    const { summary, transcriptText } = buildConversationSummaryFromFullTranscript(messages);
+    const payload = {
+      memberId,
+      companion: companionForPersistence,
+      summary,
+      transcriptText,
+      transcriptMessages: messages,
+      messageCount: messages.length,
+      sessionId: sessionIdRef.current || null,
+      createdAt: new Date().toISOString(),
+    };
+
+    const res = await fetch(`${API_BASE}/chat_summary`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      throw new Error(txt || `Save failed (${res.status})`);
+    }
+    return await res.json();
+  }, [API_BASE, memberId, companionForPersistence, messages]);
+
   // After the Clear Messages dialog is dismissed with NO, iOS can sometimes route
   // subsequent audio to the quiet receiver / low-volume path. We "nudge" the
   // audio session back to normal playback volume and ensure our media elements
@@ -3614,6 +3773,35 @@ const speakGreetingIfNeeded = useCallback(
             {/** Input line with mode pills moved to the right (layout-only). */}
             <button
               type="button"
+              onClick={requestSaveSummary}
+              disabled={!ENABLE_SAVE_SUMMARY || saveSummaryBusy}
+              title={
+                !ENABLE_SAVE_SUMMARY
+                  ? "Save a summary of this chat for future reference"
+                  : !memberId
+                    ? "Sign in to save summaries across devices"
+                    : saveSummaryBusy
+                      ? "Saving summary…"
+                      : "Save a summary of this chat for future reference"
+              }
+              style={{
+                padding: "10px 12px",
+                borderRadius: 10,
+                border: "1px solid #bbb",
+                background: "#fff",
+                cursor: (!ENABLE_SAVE_SUMMARY || saveSummaryBusy) ? "not-allowed" : "pointer",
+                opacity: (!ENABLE_SAVE_SUMMARY || saveSummaryBusy) ? 0.45 : 1,
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
+                width: 44,
+              }}
+            >
+              <SaveIcon size={18} />
+            </button>
+
+            <button
+              type="button"
               onClick={requestClearMessages}
               title="Clear the conversation on screen"
               style={{
@@ -3622,9 +3810,13 @@ const speakGreetingIfNeeded = useCallback(
                 border: "1px solid #bbb",
                 background: "#fff",
                 cursor: "pointer",
+                display: "inline-flex",
+                alignItems: "center",
+                justifyContent: "center",
+                width: 44,
               }}
             >
-              Clear Messages
+              <DeleteIcon size={18} />
             </button>
 
             <input
@@ -3739,6 +3931,120 @@ const speakGreetingIfNeeded = useCallback(
         </div>
       )}
 
+      {/* Save Summary confirmation overlay */}
+      {showSaveSummaryConfirm && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.4)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: 16,
+            zIndex: 10000,
+          }}
+        >
+          <div
+            style={{
+              background: "#fff",
+              borderRadius: 12,
+              padding: 16,
+              maxWidth: 560,
+              width: "100%",
+              boxShadow: "0 8px 30px rgba(0,0,0,0.25)",
+            }}
+          >
+            <div style={{ fontSize: 18, fontWeight: 700, marginBottom: 8 }}>
+              {saveSummaryError ? "Cannot save summary" : "Save chat summary?"}
+            </div>
+
+            <div style={{ fontSize: 14, color: "#333", lineHeight: 1.4 }}>
+              {saveSummaryError
+                ? saveSummaryError
+                : `You are authorizing Haven to save a summary of this chat (full transcript-derived) on the server for future reference. This save is scoped to your account and the selected companion (memberId + companion).`}
+            </div>
+
+            {!saveSummaryError ? (
+              <div style={{ marginTop: 10, fontSize: 12, color: "#666", lineHeight: 1.4 }}>
+                Audio and video have been stopped. You can continue the conversation after saving.
+              </div>
+            ) : null}
+
+            <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", marginTop: 14 }}>
+              {saveSummaryError ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowSaveSummaryConfirm(false);
+                    setSaveSummaryError(null);
+                    void restoreVolumesAfterClearCancel();
+                  }}
+                  style={{
+                    padding: "10px 14px",
+                    borderRadius: 10,
+                    border: "1px solid #111",
+                    background: "#111",
+                    color: "#fff",
+                    cursor: "pointer",
+                  }}
+                >
+                  OK
+                </button>
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowSaveSummaryConfirm(false);
+                      void restoreVolumesAfterClearCancel();
+                    }}
+                    style={{
+                      padding: "10px 14px",
+                      borderRadius: 10,
+                      border: "1px solid #bbb",
+                      background: "#fff",
+                      cursor: "pointer",
+                    }}
+                  >
+                    No
+                  </button>
+                  <button
+                    type="button"
+                    disabled={saveSummaryBusy}
+                    onClick={async () => {
+                      setSaveSummaryBusy(true);
+                      setSaveSummaryError(null);
+                      try {
+                        await persistConversationSummary();
+                        setShowSaveSummaryConfirm(false);
+                      } catch (e: any) {
+                        const msg = String(e?.message || e || "Save failed");
+                        setSaveSummaryError(msg);
+                      } finally {
+                        setSaveSummaryBusy(false);
+                        void restoreVolumesAfterClearCancel();
+                      }
+                    }}
+                    style={{
+                      padding: "10px 14px",
+                      borderRadius: 10,
+                      border: "1px solid #111",
+                      background: "#111",
+                      color: "#fff",
+                      cursor: saveSummaryBusy ? "not-allowed" : "pointer",
+                      opacity: saveSummaryBusy ? 0.6 : 1,
+                    }}
+                  >
+                    {saveSummaryBusy ? "Saving…" : "Yes, save"}
+                  </button>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
 {/* Consent overlay */}
       {showConsentOverlay && (
         <div
@@ -3845,7 +4151,7 @@ const speakGreetingIfNeeded = useCallback(
           }}
         >
           <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
-            <div style={{ fontWeight: 700, fontSize: 13 }}>Debug Logs ({debugLogs.length})</div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 2 }}><div style={{ fontWeight: 700, fontSize: 13 }}>Debug Logs ({debugLogs.length})</div><div style={{ fontSize: 11, color: "rgba(255,255,255,0.75)" }}>{BUILD_TAG}</div></div>
             <button
               onClick={() => {
                 try {
