@@ -1800,24 +1800,60 @@ const stateToSendWithCompanion: SessionState = {
   companion_name: companionForBackend,
 };
 
-    const res = await fetch(`${API_BASE}/chat`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        session_id,
-        ...(memoryUserKeyRef.current ? { user_key: memoryUserKeyRef.current } : {}),
-        wants_explicit,
-        session_state: stateToSendWithCompanion,
-        messages: nextMessages.map((m) => ({ role: m.role, content: m.content })),
-      }),
+    const url = `${API_BASE}/chat`;
+    console.log("callChat:request", {
+      url,
+      wants_explicit,
+      msgCount: nextMessages.length,
+      companion: companionForBackend,
+      hasUserKey: Boolean(memoryUserKeyRef.current),
     });
 
-    if (!res.ok) {
-      const errText = await res.text().catch(() => "");
-      throw new Error(`Backend error ${res.status}: ${errText}`);
-    }
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id,
+          ...(memoryUserKeyRef.current ? { user_key: memoryUserKeyRef.current } : {}),
+          wants_explicit,
+          session_state: stateToSendWithCompanion,
+          messages: nextMessages.map((m) => ({ role: m.role, content: m.content })),
+        }),
+      });
 
-    return (await res.json()) as ChatApiResponse;
+      console.log("callChat:response", { url, status: res.status, ok: res.ok });
+
+      if (!res.ok) {
+        const errText = await res.text().catch(() => "");
+        throw new Error(`Backend error ${res.status}: ${errText}`);
+      }
+
+      return (await res.json()) as ChatApiResponse;
+    } catch (err) {
+      console.warn("callChat:fetch_failed", {
+        url,
+        err: String(err),
+        name: (err as any)?.name,
+        message: (err as any)?.message,
+      });
+
+      // Probe reachability without CORS, to help distinguish network vs CORS/preflight failures.
+      try {
+        const probeUrl = `${API_BASE}/health?cb=${Date.now()}`;
+        await fetch(probeUrl, { mode: "no-cors" });
+        console.warn("callChat:health_probe_no_cors_resolved", { probeUrl });
+      } catch (e2) {
+        console.warn("callChat:health_probe_no_cors_failed", {
+          probeUrl: `${API_BASE}/health`,
+          err: String(e2),
+          name: (e2 as any)?.name,
+          message: (e2 as any)?.message,
+        });
+      }
+
+      throw err;
+    }
   }
 
   // This is the mode that drives the UI highlight:
@@ -2062,6 +2098,13 @@ const stateToSendWithCompanion: SessionState = {
       }
     } catch (err: any) {
       if (epochAtStart !== clearEpochRef.current) return;
+
+      console.warn("send:failed", {
+        err: String(err),
+        name: err?.name,
+        message: err?.message,
+      });
+
       setMessages((prev) => [
         ...prev,
         { role: "assistant", content: `Error: ${err?.message ?? "Unknown error"}` },
@@ -3048,7 +3091,17 @@ const speakGreetingIfNeeded = useCallback(
     // Keep payload small-ish (last ~80 turns) to avoid prompt limits.
     const trimmed = messages.slice(Math.max(0, messages.length - 80));
 
-    const res = await fetch(`${API_BASE}/memory/save`, {
+    const saveUrl = `${API_BASE}/memory/save`;
+    console.log("memory:save.request", {
+      url: saveUrl,
+      session_id: sid,
+      companion,
+      relationship_mode: sessionState.mode,
+      msgCount: trimmed.length,
+      hasUserKey: Boolean(userKey),
+    });
+
+    const res = await fetch(saveUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -3059,6 +3112,8 @@ const speakGreetingIfNeeded = useCallback(
         messages: trimmed,
       }),
     });
+
+    console.log("memory:save.response", { url: saveUrl, status: res.status, ok: res.ok });
 
     if (!res.ok) {
       const text = await res.text().catch(() => "");
