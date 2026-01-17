@@ -1753,6 +1753,9 @@ const speakAssistantReply = useCallback(
 
   const [planName, setPlanName] = useState<PlanName>(null);
   const [memberId, setMemberId] = useState<string>("");
+  // True once we have received the Wix postMessage handoff (plan + companion).
+  // Used to ensure the *first* audio-only TTS uses the selected companion voice (not the fallback).
+  const [handoffReady, setHandoffReady] = useState<boolean>(false);
   const [showModePicker, setShowModePicker] = useState(false);
   const [setModeFlash, setSetModeFlash] = useState(false);
   const [switchCompanionFlash, setSwitchCompanionFlash] = useState(false);
@@ -2005,6 +2008,9 @@ useEffect(() => {
         if (nextAllowed.includes(prev.mode)) return prev;
         return { ...prev, mode: "friend", pending_consent: null };
       });
+
+      // Mark handoff ready so the first audio-only TTS can deterministically use the selected companion voice.
+      setHandoffReady(true);
     }
 
     window.addEventListener("message", onMessage);
@@ -3059,6 +3065,13 @@ const greetInFlightRef = useRef(false);
 
 const speakGreetingIfNeeded = useCallback(
   async (mode: "live" | "audio") => {
+    // Ensure the first audio-only TTS greeting uses the selected companion voice.
+    // If Wix hasn't provided plan/companion yet, defer until the handoff arrives.
+    if (mode === "audio" && !handoffReady) {
+      pendingGreetingModeRef.current = "audio";
+      return;
+    }
+
     const name = (companionName || "").trim() || "Companion";
     const key = `AIHAVEN_GREET_SPOKEN:${name}`;
 
@@ -3074,7 +3087,9 @@ const speakGreetingIfNeeded = useCallback(
     // IMPORTANT: do NOT prefix with "Name:"; the UI already labels the assistant bubble.
     // Keeping the spoken text free of the prefix prevents the avatar from reading its own name like a script cue.
     const greetText = `Hi, I'm ${name}. I'm here with you. How are you feeling today?`;
-    const voiceId = phase1AvatarMedia?.elevenVoiceId || "rJ9XoWu8gbUhVKZnKY8X";
+    // Local audio-only greeting must always use the companion's ElevenLabs voice.
+    // (Live avatar uses its own configured voice via the DID agent.)
+    const voiceId = getElevenVoiceIdForAvatar(companionName);
 
     // Belt & suspenders: avoid STT re-capturing the greeting audio.
     const prevIgnore = sttIgnoreUntilRef.current;
@@ -3116,7 +3131,7 @@ const speakGreetingIfNeeded = useCallback(
       } catch {}
     }
   },
-  [companionName, phase1AvatarMedia, pauseSpeechToText, resumeSpeechToText, speakAssistantReply, speakLocalTtsReply],
+  [companionName, handoffReady, pauseSpeechToText, resumeSpeechToText, speakAssistantReply, speakLocalTtsReply],
 );
 
   const maybePlayPendingGreeting = useCallback(async () => {
@@ -3133,6 +3148,14 @@ const speakGreetingIfNeeded = useCallback(
     pendingGreetingModeRef.current = null;
     await speakGreetingIfNeeded(mode);
   }, [avatarStatus, speakGreetingIfNeeded]);
+
+  // If the user started an audio-only experience before the Wix handoff arrived,
+  // play the pending greeting once plan/companion information is available.
+  useEffect(() => {
+    if (!handoffReady) return;
+    if (!pendingGreetingModeRef.current) return;
+    void maybePlayPendingGreeting();
+  }, [handoffReady, maybePlayPendingGreeting]);
 
   // Auto-play the greeting once the Live Avatar is connected, but ONLY after the user has granted mic access.
   useEffect(() => {
