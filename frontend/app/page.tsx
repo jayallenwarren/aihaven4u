@@ -3042,7 +3042,7 @@ const speakGreetingIfNeeded = useCallback(
     // does NOT introduce the /chat "Load failed" error.
     setSavingSummary(true);
     try {
-      pushDebug('saveSummary:stub');
+      pushDebug("log", "saveSummary:stub");
       showToast('Save Summary (stub): UI is wired. Backend call disabled in this step.');
     } finally {
       setSavingSummary(false);
