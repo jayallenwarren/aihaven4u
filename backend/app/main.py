@@ -7,6 +7,7 @@ import uuid
 import json
 import hashlib
 import base64
+import asyncio
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -298,6 +299,25 @@ def _call_gpt4o(messages: List[Dict[str, str]]) -> str:
     return (resp.choices[0].message.content or "").strip()
 
 
+
+def _call_gpt4o_summary(messages: List[Dict[str, str]]) -> str:
+    """Summarization call with conservative limits for reliability."""
+    from openai import OpenAI
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set")
+
+    timeout_s = float(os.getenv("SAVE_SUMMARY_OPENAI_TIMEOUT_S", "25") or "25")
+    client = OpenAI(api_key=api_key, timeout=timeout_s)
+    resp = client.chat.completions.create(
+        model=os.getenv("OPENAI_MODEL", "gpt-4o"),
+        messages=messages,
+        temperature=float(os.getenv("SAVE_SUMMARY_TEMPERATURE", "0.2") or "0.2"),
+        max_tokens=int(os.getenv("SAVE_SUMMARY_MAX_TOKENS", "350") or "350"),
+    )
+    return (resp.choices[0].message.content or "").strip()
+
 def _normalize_payload(raw: Dict[str, Any]) -> Tuple[str, List[Dict[str, str]], Dict[str, Any], bool]:
     sid = raw.get("session_id") or raw.get("sid")
     msgs = raw.get("messages") or []
@@ -460,19 +480,29 @@ async def chat(request: Request):
 
     raw = await request.json()
     session_id, messages, session_state, wants_explicit = _normalize_payload(raw)
-    voice_id = _extract_voice_id(raw)
-
-    # Best-effort retrieval of a previously saved chat summary.
-    # This enables cross-device continuity when the user has explicitly saved a summary.
+    voice_id = _extract_voice_id(raw)    # Best-effort retrieval of a previously saved chat summary.
+    # IMPORTANT: Companion-isolated memory. We do NOT use wildcard fallbacks.
     saved_summary: str | None = None
+    memory_key: str | None = None
     try:
-        key = _summary_store_key(session_state, session_id)
-        rec = _CHAT_SUMMARY_STORE.get(key) or {}
-        s = rec.get("summary")
-        if isinstance(s, str) and s.strip():
-            saved_summary = s.strip()
+        member_id, companion_key = _extract_member_and_companion(session_state)
+        if member_id:
+            # If companion is missing, do not inject memory (prevents cross-companion leakage).
+            if companion_key:
+                memory_key = f"{member_id}::{companion_key}"
+            else:
+                memory_key = None
+        else:
+            memory_key = f"session::{session_id}"
+
+        if memory_key:
+            rec = _CHAT_SUMMARY_STORE.get(memory_key) or {}
+            s = rec.get("summary")
+            if isinstance(s, str) and s.strip():
+                saved_summary = s.strip()
     except Exception:
         saved_summary = None
+        memory_key = None
 
     # Helper to build responses consistently and optionally include audio_url.
     async def _respond(reply: str, status_mode: str, state_out: Dict[str, Any]) -> Dict[str, Any]:
@@ -599,11 +629,22 @@ async def chat(request: Request):
             debug=debug,
         )
 
-        # Inject the saved summary (if present) as a second system message.
-        # This keeps the persona/system prompt stable while providing durable context.
+        # Memory policy: do not guess about prior conversations.
+        # - If a saved summary is injected, you may use ONLY that as cross-session context.
+        # - If no saved summary is injected, explicitly say no saved summary is available if asked.
+        # Platform capability policy:
+        # - This app can speak your replies via TTS / Live Avatar. Do not claim you "don't have TTS".
+        memory_policy = (
+            "Memory rule: Only reference cross-session history if a 'Saved conversation summary' is provided. "
+            "If no saved summary is provided and the user asks about past conversations, say you do not have a saved summary for this companion.\n"
+            "Capability rule: Your replies may be spoken aloud in this app (audio TTS and/or a live avatar). "
+            "Do not say you lack text-to-speech; instead explain that you generate text and the platform voices it."
+        )
+        openai_messages.insert(1, {"role": "system", "content": memory_policy})
+
         if saved_summary:
             openai_messages.insert(
-                1,
+                2,
                 {
                     "role": "system",
                     "content": "Saved conversation summary (user-authorized, for reference across devices):\n" + saved_summary,
@@ -667,26 +708,48 @@ def _load_summary_store() -> None:
         return
 
 
-def _summary_store_key(session_state: Dict[str, Any], session_id: str) -> str:
-    """Best-effort stable key using memberId + companion when present; falls back to session_id."""
+def _normalize_companion_key(raw: Any) -> str:
+    """Normalize a companion identifier for stable keying.
+
+    Used ONLY for storage keys; display names remain unchanged.
+    """
+    s = "" if raw is None else str(raw)
+    s = re.sub(r"\s+", " ", s.strip())
+    return s.lower()
+
+
+def _extract_member_id(session_state: Dict[str, Any]) -> str:
     member_id = (
         session_state.get("memberId")
         or session_state.get("member_id")
         or session_state.get("member")
         or ""
     )
-    member_id = str(member_id).strip() if member_id is not None else ""
+    return str(member_id).strip() if member_id is not None else ""
 
+
+def _extract_companion_raw(session_state: Dict[str, Any]) -> str:
     companion = (
         session_state.get("companion")
         or session_state.get("companionName")
         or session_state.get("companion_name")
         or ""
     )
-    companion = str(companion).strip() if companion is not None else ""
+    return str(companion).strip() if companion is not None else ""
+
+
+def _summary_store_key(session_state: Dict[str, Any], session_id: str) -> str:
+    """Stable key using memberId + normalized companion; falls back to session_id.
+
+    IMPORTANT: Companion isolation is enforced by including the normalized companion key.
+    If memberId is present but companion is missing/empty, we deliberately use 'unknown'
+    and retrieval must treat that as 'no saved memory'.
+    """
+    member_id = _extract_member_id(session_state)
+    companion_key = _normalize_companion_key(_extract_companion_raw(session_state))
 
     if member_id:
-        return f"{member_id}::{companion or 'unknown'}"
+        return f"{member_id}::{companion_key or 'unknown'}"
     return f"session::{session_id}"
 
 
@@ -708,22 +771,62 @@ _load_summary_store()
 
 @app.post("/chat/save-summary", response_model=None)
 async def save_chat_summary(request: Request):
-    """
-    Saves a server-side summary of the full chat history.
+    """Saves a server-side summary of the chat history.
+
+    Reliability goals:
+      - Never leave the browser with an ambiguous network failure when possible.
+      - Cap inputs to avoid oversized payloads/timeouts.
+      - Return a structured JSON response even when summarization fails.
 
     Request JSON:
       { session_id, messages, session_state }
 
     Response JSON:
-      { ok: true, summary: "...", saved_at: "...", key: "..." }
+      { ok: true|false, summary?: "...", error_code?: "...", error?: "...", saved_at?: <ts>, key?: "..." }
     """
     debug = bool(getattr(settings, "DEBUG", False))
 
-    raw = await request.json()
+    try:
+        raw = await request.json()
+    except Exception as e:
+        return {"ok": False, "error_code": "invalid_json", "error": f"{type(e).__name__}: {e}"}
+
     session_id, messages, session_state, _wants_explicit = _normalize_payload(raw)
 
-    # Build summarization prompt.
-    # Keep it stable, short, and future-conversation oriented.
+    # Normalize + cap the conversation for summarization to reduce cost and avoid request failures.
+    max_msgs = int(os.getenv("SAVE_SUMMARY_MAX_MESSAGES", "80") or "80")
+    max_chars = int(os.getenv("SAVE_SUMMARY_MAX_CHARS", "12000") or "12000")
+    per_msg_chars = int(os.getenv("SAVE_SUMMARY_MAX_CHARS_PER_MESSAGE", "2000") or "2000")
+
+    convo_items: List[Dict[str, str]] = []
+    for m in messages:
+        role = m.get("role")
+        if role in ("user", "assistant"):
+            content = str(m.get("content") or "")
+            if per_msg_chars > 0 and len(content) > per_msg_chars:
+                content = content[:per_msg_chars] + " …"
+            convo_items.append({"role": role, "content": content})
+
+    if max_msgs > 0 and len(convo_items) > max_msgs:
+        convo_items = convo_items[-max_msgs:]
+
+    # Enforce a total character budget from the end (most recent is most useful).
+    total = 0
+    capped: List[Dict[str, str]] = []
+    for m in reversed(convo_items):
+        c = m["content"]
+        if total >= max_chars:
+            break
+        # keep at least some of this message
+        remaining = max_chars - total
+        if remaining <= 0:
+            break
+        if len(c) > remaining:
+            c = c[-remaining:]
+        capped.append({"role": m["role"], "content": c})
+        total += len(c)
+    convo_items = list(reversed(capped))
+
     sys = (
         "You are a concise assistant that creates a server-side chat summary for future context. "
         "Write a compact summary that captures: relationship tone, key facts, user preferences/boundaries, "
@@ -731,17 +834,17 @@ async def save_chat_summary(request: Request):
         "Output plain text only."
     )
 
-    convo: List[Dict[str, str]] = [{"role": "system", "content": sys}]
-    for m in messages:
-        role = m.get("role")
-        if role in ("user", "assistant"):
-            convo.append({"role": role, "content": str(m.get("content") or "")})
+    convo: List[Dict[str, str]] = [{"role": "system", "content": sys}] + convo_items
 
+    # Time-bound the summarization request to prevent upstream timeouts.
+    timeout_s = float(os.getenv("SAVE_SUMMARY_TIMEOUT_S", "30") or "30")
     try:
-        summary = _call_gpt4o(convo)
+        summary = await asyncio.wait_for(run_in_threadpool(_call_gpt4o_summary, convo), timeout=timeout_s)
+    except asyncio.TimeoutError:
+        return {"ok": False, "error_code": "timeout", "error": f"Save summary timed out after {timeout_s:.0f}s"}
     except Exception as e:
         _dbg(debug, "Summary generation failed:", repr(e))
-        raise HTTPException(status_code=500, detail=f"Summary generation failed: {type(e).__name__}: {e}")
+        return {"ok": False, "error_code": "summary_failed", "error": f"{type(e).__name__}: {e}"}
 
     key = _summary_store_key(session_state, session_id)
     record = {
