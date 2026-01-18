@@ -106,9 +106,18 @@ type CompanionMeta = {
 
 const DEFAULT_COMPANION_NAME = "Haven";
 const HEADSHOT_DIR = "/companion/headshot";
+
+// Resolve companion key/name for backend requests and TTS voice selection.
+// This must be browser-safe and never rely on DOM parsing.
+function resolveCompanionForBackend(opts: { companionKey?: string; companionName?: string }): string {
+  const ck = (opts.companionKey || '').trim();
+  if (ck) return ck;
+  const cn = (opts.companionName || '').trim();
+  if (cn) return cn;
+  return DEFAULT_COMPANION_NAME;
+}
+
 const GREET_ONCE_KEY = "AIHAVEN_GREETED";
-const LS_COMPANION_KEY = "AIHAVEN_COMPANION";
-const LS_MEMBERID_KEY = "AIHAVEN_MEMBERID";
 const DEFAULT_AVATAR = havenHeart.src;
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
@@ -1994,10 +2003,6 @@ useEffect(() => {
             : "";
       setMemberId(incomingMemberId);
 
-      try {
-        if (incomingMemberId) localStorage.setItem(LS_MEMBERID_KEY, incomingMemberId);
-      } catch {}
-
       const incomingCompanion =
         typeof (data as any).companion === "string" ? (data as any).companion.trim() : "";
       const resolvedCompanionKey = incomingCompanion || "";
@@ -2006,11 +2011,6 @@ useEffect(() => {
         const parsed = parseCompanionMeta(resolvedCompanionKey);
         setCompanionKey(parsed.key);
         setCompanionName(parsed.first || DEFAULT_COMPANION_NAME);
-
-
-        try {
-          if (parsed.key) localStorage.setItem(LS_COMPANION_KEY, parsed.key);
-        } catch {}
 
         // Keep session_state aligned with the selected companion so the backend can apply the correct persona.
         setSessionState((prev) => ({
@@ -2022,10 +2022,6 @@ useEffect(() => {
       } else {
         setCompanionKey("");
         setCompanionName(DEFAULT_COMPANION_NAME);
-
-        try {
-          localStorage.setItem(LS_COMPANION_KEY, DEFAULT_COMPANION_NAME);
-        } catch {}
 
         setSessionState((prev) => ({
           ...prev,
@@ -2070,9 +2066,6 @@ const wants_explicit = stateToSend.mode === "intimate";
 const companionForBackend =
   (companionKey || "").trim() ||
   (companionName || DEFAULT_COMPANION_NAME).trim() ||
-  (() => {
-    try { return (localStorage.getItem(LS_COMPANION_KEY) || "").trim(); } catch { return ""; }
-  })() ||
   DEFAULT_COMPANION_NAME;
 
 const stateToSendWithCompanion: SessionState = {
@@ -2082,8 +2075,8 @@ const stateToSendWithCompanion: SessionState = {
   companionName: companionForBackend,
   companion_name: companionForBackend,
   // Member identity (from Wix)
-  memberId: ((memberId || "").trim() || (() => { try { return (localStorage.getItem(LS_MEMBERID_KEY) || "").trim(); } catch { return ""; } })()),
-  member_id: ((memberId || "").trim() || (() => { try { return (localStorage.getItem(LS_MEMBERID_KEY) || "").trim(); } catch { return ""; } })()),
+  memberId: (memberId || "").trim(),
+  member_id: (memberId || "").trim(),
 };
 
     const res = await fetch(`${API_BASE}/chat`, {
@@ -2105,7 +2098,7 @@ const stateToSendWithCompanion: SessionState = {
     return (await res.json()) as ChatApiResponse;
   }
 
-  async function callSaveChatSummary(nextMessages: Msg[], stateToSend: SessionState): Promise<{ ok: boolean; summary?: string }> {
+  async function callSaveChatSummary(nextMessages: Msg[], stateToSend: SessionState): Promise<{ ok: boolean; summary?: string; error_code?: string; error?: string; key?: string; saved_at?: string }> {
     if (!API_BASE) throw new Error("NEXT_PUBLIC_API_BASE_URL is not set");
 
     const session_id =
@@ -2123,8 +2116,8 @@ const stateToSendWithCompanion: SessionState = {
       companion: companionForBackend,
       companionName: companionForBackend,
       companion_name: companionForBackend,
-      memberId: ((memberId || "").trim() || (() => { try { return (localStorage.getItem(LS_MEMBERID_KEY) || "").trim(); } catch { return ""; } })()),
-      member_id: ((memberId || "").trim() || (() => { try { return (localStorage.getItem(LS_MEMBERID_KEY) || "").trim(); } catch { return ""; } })()),
+      memberId: (memberId || "").trim(),
+      member_id: (memberId || "").trim(),
     };
 
     const res = await fetch(`${API_BASE}/chat/save-summary`, {
@@ -2357,6 +2350,8 @@ const stateToSendWithCompanion: SessionState = {
           }
         },
       };
+
+      const safeCompanionKey = resolveCompanionForBackend({ companionKey, companionName });
 
       const voiceId = getElevenVoiceIdForAvatar(safeCompanionKey);
 
@@ -3113,15 +3108,7 @@ const speakGreetingIfNeeded = useCallback(
       return;
     }
 
-    const safeCompanionKey =
-      (companionKey || "").trim() ||
-      (companionName || "").trim() ||
-      (() => {
-        try { return (localStorage.getItem(LS_COMPANION_KEY) || "").trim(); } catch { return ""; }
-      })() ||
-      DEFAULT_COMPANION_NAME;
-
-    const name = safeCompanionKey || "Companion";
+    const name = (companionName || "").trim() || "Companion";
     const key = `AIHAVEN_GREET_SPOKEN:${name}`;
 
     // Already spoken this session?
@@ -3138,7 +3125,9 @@ const speakGreetingIfNeeded = useCallback(
     const greetText = `Hi, I'm ${name}. I'm here with you. How are you feeling today?`;
     // Local audio-only greeting must always use the companion's ElevenLabs voice.
     // (Live avatar uses its own configured voice via the DID agent.)
-    const voiceId = getElevenVoiceIdForAvatar(safeCompanionKey);
+    const safeCompanionKey = resolveCompanionForBackend({ companionKey, companionName });
+
+      const voiceId = getElevenVoiceIdForAvatar(safeCompanionKey);
 
     // Belt & suspenders: avoid STT re-capturing the greeting audio.
     const prevIgnore = sttIgnoreUntilRef.current;
@@ -3357,24 +3346,6 @@ const speakGreetingIfNeeded = useCallback(
     }
   }, [liveAvatarActive, stopLiveAvatar, stopLocalTtsPlayback, stopSpeechToText]);
 
-  // Stop button: halt all comms AND immediately re-prime audio routing so that
-  // re-engaging Live Avatar or Audio TTS does not come back at low volume.
-  const stopAllCommunications = useCallback(() => {
-    try {
-      stopHandsFreeSTT();
-    } catch {}
-
-    // User gesture: re-assert boosted routing and nudge the audio session back to playback mode.
-    try { boostAllTtsVolumes(); } catch {}
-    try { void nudgeAudioSession(); } catch {}
-
-    // Prime the hidden VIDEO element (audio-only TTS path) so the next manual resume is loud/audible.
-    try { primeLocalTtsAudio(true); } catch {}
-
-    // If Live Avatar is used on iPhone, ensure its audio context is unlocked as well.
-    try { void ensureIphoneAudioContextUnlocked(); } catch {}
-  }, [stopHandsFreeSTT, boostAllTtsVolumes, nudgeAudioSession, primeLocalTtsAudio, ensureIphoneAudioContextUnlocked]);
-
   // Clear Messages (with confirmation)
   const requestClearMessages = useCallback(() => {
     // Stop all audio/video + STT immediately on click (even before the user confirms).
@@ -3552,7 +3523,7 @@ const speakGreetingIfNeeded = useCallback(
 
       <button
         type="button"
-        onClick={stopAllCommunications}
+        onClick={stopHandsFreeSTT}
         disabled={!sttEnabled}
         title="Stop listening"
         style={{
@@ -4079,6 +4050,7 @@ const speakGreetingIfNeeded = useCallback(
                 onClick={async () => {
                   if (savingSummary) return;
                   setSavingSummary(true);
+                  const companionForDisplay = ((companionKey || "").trim() || (companionName || DEFAULT_COMPANION_NAME).trim() || DEFAULT_COMPANION_NAME);
                   try {
                     const payloadMessages = messages.slice();
                     if (payloadMessages.length === 0) {
@@ -4094,18 +4066,18 @@ const speakGreetingIfNeeded = useCallback(
                     if (resp?.ok) {
                       setMessages((prev) => [
                         ...prev,
-                        { role: "assistant", content: "Chat summary saved." },
+                        { role: "assistant", content: `Chat saved for ${companionForDisplay}.` },
                       ]);
                     } else {
                       setMessages((prev) => [
                         ...prev,
-                        { role: "assistant", content: "Unable to save chat summary right now." },
+                        { role: "assistant", content: `Chat NOT saved for ${companionForDisplay}${resp?.error_code ? ` (reason: ${resp.error_code})` : ""}.` },
                       ]);
                     }
                   } catch (e: any) {
                     setMessages((prev) => [
                       ...prev,
-                      { role: "assistant", content: `Save failed: ${String(e?.message || e)}` },
+                      { role: "assistant", content: `Save failed for ${companionForDisplay}: ${String(e?.message || e)}` },
                     ]);
                   } finally {
                     setSavingSummary(false);
