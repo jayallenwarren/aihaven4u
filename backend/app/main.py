@@ -477,6 +477,7 @@ async def chat(request: Request):
       { voice_id: "<elevenlabs_voice_id>" }   or  { voiceId: "<...>" }
     """
     debug = bool(getattr(settings, "DEBUG", False))
+    debug_memory = debug or (str(os.getenv("MEMORY_DEBUG", "")).strip().lower() in ("1", "true", "yes"))
 
     raw = await request.json()
     session_id, messages, session_state, wants_explicit = _normalize_payload(raw)
@@ -516,13 +517,19 @@ async def chat(request: Request):
                 state_out = dict(state_out)
                 state_out["tts_error"] = f"{type(e).__name__}: {e}"
 
-        return {
+        out = {
             "session_id": session_id,
             "mode": status_mode,          # safe/explicit_blocked/explicit_allowed
             "reply": reply,
             "session_state": state_out,
             "audio_url": audio_url,       # NEW (optional)
         }
+        if debug_memory:
+            out["debug"] = {
+                "memory_key": memory_key,
+                "summary_injected": bool(saved_summary),
+            }
+        return out
 
     # last user message
     last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
