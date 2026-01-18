@@ -3534,15 +3534,7 @@ const speakGreetingIfNeeded = useCallback(
         type="button"
         onClick={toggleSpeechToText}
         disabled={(!sttEnabled && loading) || (liveAvatarActive && sttEnabled)}
-        title={
-          liveAvatarActive
-            ? sttEnabled
-              ? "Mic is required in Live Avatar (use Stop to end)"
-              : "Enable microphone (required for Live Avatar)"
-            : sttEnabled
-              ? "Stop speech-to-text"
-              : "Start speech-to-text"
-        }
+        title="Audio"
         style={{
           width: 44,
           minWidth: 44,
@@ -3561,7 +3553,7 @@ const speakGreetingIfNeeded = useCallback(
         type="button"
         onClick={handleStopClick}
         disabled={!sttEnabled}
-        title="Stop listening"
+        title="Stop"
         style={{
           width: 44,
           minWidth: 44,
@@ -3792,13 +3784,7 @@ const speakGreetingIfNeeded = useCallback(
             ? "Stop Live Avatar"
             : "Start Live Avatar"
         }
-        title={
-          avatarStatus === "connected" ||
-          avatarStatus === "connecting" ||
-          avatarStatus === "reconnecting"
-            ? "Stop Live Avatar"
-            : "Start Live Avatar"
-        }
+        title="Video"
       >
         {avatarStatus === "connected" ||
         avatarStatus === "connecting" ||
@@ -3944,7 +3930,7 @@ const speakGreetingIfNeeded = useCallback(
             <button
               type="button"
               onClick={requestSaveChatSummary}
-              title="Save chat summary"
+              title="Save"
               aria-label="Save"
               style={{
                 width: 44,
@@ -3964,7 +3950,7 @@ const speakGreetingIfNeeded = useCallback(
             <button
               type="button"
               onClick={requestClearMessages}
-              title="Clear the conversation on screen"
+              title="Clear"
               aria-label="Delete"
               style={{
                 width: 44,
@@ -4087,9 +4073,8 @@ const speakGreetingIfNeeded = useCallback(
                   if (savingSummary) return;
                   setSavingSummary(true);
                   const rawCompanionLabel = (
-                    (companionName || "").trim() ||
+                     (companionName || "").trim() ||
                     (companionKey || "").trim() ||
-                    ((companion as any)?.name || "").trim() ||
                     DEFAULT_COMPANION_NAME
                   ).trim() || DEFAULT_COMPANION_NAME;
 
