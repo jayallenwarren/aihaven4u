@@ -175,8 +175,22 @@ const ELEVEN_VOICE_ID_BY_AVATAR: Record<string, string> = {
 };
 
 function getElevenVoiceIdForAvatar(avatarName: string | null | undefined): string {
-  const key = (avatarName || "").trim();
-  if (key && ELEVEN_VOICE_ID_BY_AVATAR[key]) return ELEVEN_VOICE_ID_BY_AVATAR[key];
+  const raw = (avatarName || "").trim();
+  if (raw && ELEVEN_VOICE_ID_BY_AVATAR[raw]) return ELEVEN_VOICE_ID_BY_AVATAR[raw];
+
+  // Many companions arrive from Wix as a descriptive key like:
+  //   "Ashley-Female-Caucasian-Millennials"
+  // while our ElevenLabs map is keyed by the first name ("Ashley").
+  // Normalize to reduce accidental fallback to Haven for the greeting.
+  const firstToken = raw.split("-")[0]?.trim() || "";
+  if (firstToken && ELEVEN_VOICE_ID_BY_AVATAR[firstToken]) return ELEVEN_VOICE_ID_BY_AVATAR[firstToken];
+
+  // Case-insensitive match as a final attempt.
+  const ciKey = Object.keys(ELEVEN_VOICE_ID_BY_AVATAR).find(
+    (k) => k.toLowerCase() === raw.toLowerCase() || (firstToken && k.toLowerCase() === firstToken.toLowerCase())
+  );
+  if (ciKey) return ELEVEN_VOICE_ID_BY_AVATAR[ciKey];
+
   // Fallback to Haven so audio-only TTS always has a voice.
   return ELEVEN_VOICE_ID_BY_AVATAR["Haven"] || "";
 }
@@ -3237,7 +3251,12 @@ const speakGreetingIfNeeded = useCallback(
 
   const startSpeechToText = useCallback(async (opts?: { forceBrowser?: boolean; suppressGreeting?: boolean }) => {
     const forceBrowser = !!opts?.forceBrowser;
-    primeLocalTtsAudio();
+    // iOS Safari can enter a low-volume route after stop/start transitions.
+    // Apply the same "loud path" recovery we use for Clear/Save before kicking off STT.
+    // IMPORTANT: do not await here; iOS SpeechRecognition must start directly from the user gesture.
+    try { boostAllTtsVolumes(); } catch {}
+    void nudgeAudioSession();
+    primeLocalTtsAudio(true);
     void ensureIphoneAudioContextUnlocked();
 
     sttEnabledRef.current = true;
@@ -3298,10 +3317,12 @@ const speakGreetingIfNeeded = useCallback(
       void maybePlayPendingGreeting();
     }
   }, [
+    boostAllTtsVolumes,
     ensureSpeechRecognition,
     kickBackendStt,
     liveAvatarActive,
     maybePlayPendingGreeting,
+    nudgeAudioSession,
     primeLocalTtsAudio,
     ensureIphoneAudioContextUnlocked,
     requestMicPermission,
