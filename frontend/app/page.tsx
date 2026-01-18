@@ -30,39 +30,6 @@ const PauseIcon = ({ size = 18 }: { size?: number }) => (
   </svg>
 );
 
-
-
-const TrashIcon = ({ size = 18 }: { size?: number }) => (
-  <svg
-    width={size}
-    height={size}
-    viewBox="0 0 24 24"
-    aria-hidden="true"
-    focusable="false"
-    style={{ display: "block" }}
-  >
-    <path
-      d="M9 3h6l1 2h4v2H4V5h4l1-2zm1 6h2v10h-2V9zm4 0h2v10h-2V9zM6 9h2v10H6V9z"
-      fill="currentColor"
-    />
-  </svg>
-);
-
-const SaveIcon = ({ size = 18 }: { size?: number }) => (
-  <svg
-    width={size}
-    height={size}
-    viewBox="0 0 24 24"
-    aria-hidden="true"
-    focusable="false"
-    style={{ display: "block" }}
-  >
-    <path
-      d="M17 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7l-4-4zm2 16a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h11v5H7v2h10V4.41L19 6.41V19z"
-      fill="currentColor"
-    />
-  </svg>
-);
 type Role = "user" | "assistant";
 type Msg = { role: Role; content: string };
 
@@ -221,11 +188,6 @@ const MODE_LABELS: Record<Mode, string> = {
   intimate: "Intimate (18+)",
 };
 
-// Plan → mode availability mapping (UI pills)
-// Requirements:
-// - Friend or Test - Friend Plan: Friend only
-// - Romantic or Test - Romantic Plan: Friend + Romantic
-// - Intimate (18+) or Test - Intimate (18+) Plan: Friend + Romantic + Intimate (18+)
 const ROMANTIC_ALLOWED_PLANS: PlanName[] = [
   "Trial",
   "Romantic",
@@ -569,181 +531,6 @@ export default function Page() {
   const localTtsUnlockedRef = useRef(false);
   const localTtsStopFnRef = useRef<(() => void) | null>(null);
 
-  // Live Avatar element ref is declared early so it can be used by the global TTS volume booster.
-  const avatarVideoRef = useRef<HTMLVideoElement | null>(null);
-
-  // ----------------------------
-  // Global TTS volume boost
-  // ----------------------------
-  // HTMLMediaElement.volume tops out at 1.0. To reliably boost perceived loudness—especially
-  // on iOS after an audio-capture session—we route TTS playback through WebAudio GainNodes.
-  // This applies to:
-  // - Local TTS <audio>/<video> playback (hands-free STT mode)
-  // - Live Avatar <video> element playback (non-iPhone)
-  // iPhone Live Avatar already routes MediaStream audio through WebAudio (see applyIphoneLiveAvatarAudioBoost).
-  // Volume boost for audio-only TTS and non-iPhone Live Avatar.
-  // Note: We intentionally use WebAudio gain to exceed HTMLMediaElement.volume (max 1.0).
-  const TTS_GAIN = 12.0;
-  const ttsAudioCtxRef = useRef<AudioContext | null>(null);
-  const ttsAudioMediaSrcRef = useRef<MediaElementAudioSourceNode | null>(null);
-  const ttsAudioGainRef = useRef<GainNode | null>(null);
-  const ttsAudioBoundElRef = useRef<HTMLMediaElement | null>(null);
-  const ttsVideoMediaSrcRef = useRef<MediaElementAudioSourceNode | null>(null);
-  const ttsVideoGainRef = useRef<GainNode | null>(null);
-  const ttsVideoBoundElRef = useRef<HTMLMediaElement | null>(null);
-  const avatarVideoMediaSrcRef = useRef<MediaElementAudioSourceNode | null>(null);
-  const avatarVideoGainRef = useRef<GainNode | null>(null);
-  const avatarVideoBoundElRef = useRef<HTMLMediaElement | null>(null);
-
-  const ensureTtsAudioContext = useCallback((): AudioContext | null => {
-    if (typeof window === "undefined") return null;
-    try {
-      const AudioCtx = (window as any).AudioContext || (window as any).webkitAudioContext;
-      if (!AudioCtx) return null;
-      if (!ttsAudioCtxRef.current) ttsAudioCtxRef.current = new AudioCtx();
-      const ctx = ttsAudioCtxRef.current;
-      if (ctx?.state === "suspended" && ctx.resume) {
-        ctx.resume().catch(() => {});
-      }
-      return ctx;
-    } catch {
-      return null;
-    }
-  }, []);
-
-  // "Audio session nudge" (runs on a user gesture):
-  // iOS Safari can remain in a low/communications-volume route after mic capture or modal dialogs.
-  // A short, low-frequency, low-amplitude burst through WebAudio helps re-establish the normal
-  // playback route so subsequent audio-only TTS (hidden VIDEO path) is not silent/feeble.
-  //
-  // NOTE: This is intentionally slightly stronger than "inaudible" because the user's report
-  // indicates iOS can otherwise remain stuck after the Clear Messages modal.
-  const nudgeAudioSession = useCallback(async () => {
-    const ctx = ensureTtsAudioContext();
-    if (!ctx) return;
-    try {
-      if (ctx.state === "suspended") {
-        await ctx.resume();
-      }
-
-      const osc = ctx.createOscillator();
-      const g = ctx.createGain();
-      g.gain.value = 0.02;
-      osc.frequency.value = 40;
-      osc.connect(g);
-      g.connect(ctx.destination);
-      const stopAt = ctx.currentTime + 0.12;
-      osc.start();
-      osc.stop(stopAt);
-
-      window.setTimeout(() => {
-        try { osc.disconnect(); } catch {}
-        try { g.disconnect(); } catch {}
-      }, 180);
-    } catch {
-      // ignore
-    }
-  }, [ensureTtsAudioContext]);
-
-  // Track whether we have already connected each gain routing chain.
-  const ttsAudioChainConnectedRef = useRef<boolean>(false);
-  const ttsVideoChainConnectedRef = useRef<boolean>(false);
-  const avatarVideoChainConnectedRef = useRef<boolean>(false);
-
-
-  const applyTtsGainRouting = useCallback(
-    (media: HTMLMediaElement | null, kind: "audio" | "video" | "avatar") => {
-      if (!media) return;
-      const ctx = ensureTtsAudioContext();
-      if (!ctx) return;
-
-      // iPhone Live Avatar uses MediaStream routing; do not double-route the <video> element.
-      if (kind === "avatar" && isIphone) return;
-
-      // IMPORTANT: Audio-only TTS must remain on the hidden <video> path, but routing
-      // cross-origin media through WebAudio can result in silence on some browsers (notably iOS Safari)
-      // if the media response is not CORS-enabled. To guarantee audibility, we do NOT route
-      // local (audio-only) TTS through WebAudio GainNodes. (We still keep the hidden VIDEO element.)
-      if (kind === "audio" || kind === "video") {
-        try { media.muted = false; media.volume = 1; } catch {}
-        return;
-      }
-
-      try {
-        // From here on, we only handle the non-iPhone Live Avatar <video> element.
-        // (Audio-only TTS elements return early above to avoid WebAudio routing issues.)
-
-        // If the underlying media element instance changed (common when Live Avatar is stopped/started),
-        // we must recreate the MediaElementSourceNode. Source nodes are permanently bound to a single element.
-        if (avatarVideoBoundElRef.current !== media) {
-          try { avatarVideoMediaSrcRef.current?.disconnect(); } catch {}
-          avatarVideoMediaSrcRef.current = null;
-          avatarVideoBoundElRef.current = media;
-          avatarVideoChainConnectedRef.current = false;
-        }
-
-        // If we already created a MediaElementSourceNode for this media element, reuse it.
-        // (Browsers throw if you call createMediaElementSource() more than once per element.)
-        let src: MediaElementAudioSourceNode | null = null;
-        let gain: GainNode | null = null;
-
-        // Avatar routing
-        {
-          src = avatarVideoMediaSrcRef.current;
-          gain = avatarVideoGainRef.current;
-          if (!src) {
-            src = ctx.createMediaElementSource(media);
-            avatarVideoMediaSrcRef.current = src;
-          }
-          if (!gain) {
-            gain = ctx.createGain();
-            avatarVideoGainRef.current = gain;
-          }
-        }
-
-        // Connect once and then only update gain. Repeated disconnect/reconnect can leave
-        // iOS Safari in a bad route after modal dialogs.
-        const connectOnce = (connectedRef: React.MutableRefObject<boolean>) => {
-          if (connectedRef.current) return;
-          try {
-            src!.connect(gain!);
-          } catch {}
-          try {
-            gain!.connect(ctx.destination);
-          } catch {}
-          connectedRef.current = true;
-        };
-        // kind is narrowed to "avatar" here (audio/video returned early above).
-        connectOnce(avatarVideoChainConnectedRef);
-
-        gain.gain.value = TTS_GAIN;
-
-        // Keep element volume at max so the gain node is the only limiter.
-        try {
-          media.muted = false;
-          media.volume = 1;
-        } catch {}
-      } catch (e) {
-        // If this fails (e.g., cross-origin media restrictions), we still keep media.volume at 1.
-        try {
-          media.muted = false;
-          media.volume = 1;
-        } catch {}
-      }
-    },
-    [ensureTtsAudioContext, isIphone]
-  );
-
-  const boostAllTtsVolumes = useCallback(() => {
-    try {
-      // Local (audio-only) TTS elements intentionally NOT routed through WebAudio.
-      // Live avatar video element (non-iPhone)
-      applyTtsGainRouting(avatarVideoRef.current, "avatar");
-    } catch {
-      // ignore
-    }
-  }, [applyTtsGainRouting]);
-
 
   // Companion identity (drives persona + Phase 1 live avatar mapping)
   const [companionName, setCompanionName] = useState<string>(DEFAULT_COMPANION_NAME);
@@ -754,6 +541,7 @@ export default function Page() {
 // ----------------------------
 // Phase 1: Live Avatar (D-ID) + TTS (ElevenLabs -> Azure Blob)
 // ----------------------------
+const avatarVideoRef = useRef<HTMLVideoElement | null>(null);
 const didSrcObjectRef = useRef<any | null>(null);
 const didAgentMgrRef = useRef<any | null>(null);
 const didReconnectInFlightRef = useRef<boolean>(false);
@@ -868,8 +656,7 @@ const applyIphoneLiveAvatarAudioBoost = useCallback(
       const gain = ctx.createGain();
 
       // Boost amount tuned for iPhone; iPad/Desktop already fine.
-      // Use a higher gain because iPhone often routes WebRTC audio at a receiver-like level.
-      gain.gain.value = 10.0;
+      gain.gain.value = 2.6;
 
       source.connect(gain);
       gain.connect(ctx.destination);
@@ -1056,11 +843,6 @@ const startLiveAvatar = useCallback(async () => {
             vid.play().catch(() => {});
             // iPhone: route WebRTC audio through WebAudio gain so volume is audible
             applyIphoneLiveAvatarAudioBoost(value);
-
-            // Non-iPhone: also route the <video> element through a gain node to ensure robust volume.
-            try {
-              applyTtsGainRouting(vid, "avatar");
-            } catch {}
           }
           return value;
         },
@@ -1240,11 +1022,6 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string): Promis
     prime(localTtsVideoRef.current, "video");
     prime(localTtsAudioRef.current, "audio");
 
-    // Ensure boosted routing is in place after priming.
-    try {
-      boostAllTtsVolumes();
-    } catch {}
-
     // If neither succeeds, localTtsUnlockedRef remains false and we'll retry on the next user gesture.
   }, []);
 
@@ -1323,10 +1100,6 @@ const playLocalTtsUrl = useCallback(
           m.muted = false;
           m.volume = 1;
         } catch {}
-
-        // Local (audio-only) TTS stays on the hidden VIDEO element, but we do not
-        // route it through WebAudio (can cause silence with non-CORS media).
-        try { m.muted = false; m.volume = 1; } catch {}
 
         try {
           (m as any).preload = "auto";
@@ -1505,7 +1278,7 @@ const playLocalTtsUrl = useCallback(
         hooks?.onDidNotSpeak?.();
       } catch {}
     },
-    [isIOS, applyTtsGainRouting],
+    [isIOS],
   );
 
   // Stop any in-progress local (audio-only) TTS playback immediately.
@@ -1732,7 +1505,6 @@ const speakAssistantReply = useCallback(
   }, []);
 
   const [input, setInput] = useState("");
-  const inputElRef = useRef<HTMLInputElement | null>(null);
   const [messages, setMessages] = useState<Msg[]>([]);
   const [loading, setLoading] = useState(false);
   const [showClearMessagesConfirm, setShowClearMessagesConfirm] = useState(false);
@@ -1750,7 +1522,6 @@ const speakAssistantReply = useCallback(
   });
 
   const [planName, setPlanName] = useState<PlanName>(null);
-  const [memberId, setMemberId] = useState<string>("");
   const [showModePicker, setShowModePicker] = useState(false);
   const [setModeFlash, setSetModeFlash] = useState(false);
   const [switchCompanionFlash, setSwitchCompanionFlash] = useState(false);
@@ -1758,32 +1529,6 @@ const speakAssistantReply = useCallback(
 
   const goToMyHaven = useCallback(() => {
     const url = "https://www.aihaven4u.com/myhaven";
-
-    // If running inside an iframe, attempt to navigate the *top* browsing context
-    // so we leave the embed and avoid “stacked headers”.
-    try {
-      if (window.top && window.top !== window.self) {
-        window.top.location.href = url;
-        return;
-      }
-    } catch {
-      // Cross-origin access to window.top can throw.
-    }
-
-    // Alternate attempt that may still target the top browsing context.
-    try {
-      window.open(url, "_top");
-      return;
-    } catch {
-      // ignore
-    }
-
-    // Fallback: navigate the current frame.
-    window.location.href = url;
-  }, []);
-
-  const goToUpgrade = useCallback(() => {
-    const url = UPGRADE_URL;
 
     // If running inside an iframe, attempt to navigate the *top* browsing context
     // so we leave the embed and avoid “stacked headers”.
@@ -1955,15 +1700,6 @@ useEffect(() => {
       const incomingPlan = (data.planName ?? null) as PlanName;
       setPlanName(incomingPlan);
 
-
-      const incomingMemberId =
-        typeof (data as any).memberId === "string"
-          ? String((data as any).memberId).trim()
-          : typeof (data as any).member_id === "string"
-            ? String((data as any).member_id).trim()
-            : "";
-      setMemberId(incomingMemberId);
-
       const incomingCompanion =
         typeof (data as any).companion === "string" ? (data as any).companion.trim() : "";
       const resolvedCompanionKey = incomingCompanion || "";
@@ -2032,9 +1768,6 @@ const stateToSendWithCompanion: SessionState = {
   // Backward/forward compatibility with any backend expecting different field names
   companionName: companionForBackend,
   companion_name: companionForBackend,
-  // Member identity (from Wix)
-  memberId: (memberId || "").trim(),
-  member_id: (memberId || "").trim(),
 };
 
     const res = await fetch(`${API_BASE}/chat`, {
@@ -3250,76 +2983,74 @@ const speakGreetingIfNeeded = useCallback(
       // ignore
     }
 
-    // User gesture: re-assert boosted audio routing and nudge audio session back to playback mode.
-    try {
-      boostAllTtsVolumes();
-    } catch {}
-    try {
-      void nudgeAudioSession();
-    } catch {}
-
-    // Strong iOS recovery: prime the hidden VIDEO element on this user gesture so audio-only TTS
-    // is not left in a silent/receiver route after the confirmation modal.
-    try {
-      primeLocalTtsAudio(true);
-    } catch {}
-    try {
-      void ensureIphoneAudioContextUnlocked();
-    } catch {}
-
-
     setShowClearMessagesConfirm(true);
-  }, [stopHandsFreeSTT, boostAllTtsVolumes, nudgeAudioSession, primeLocalTtsAudio, ensureIphoneAudioContextUnlocked]);
+  }, [stopHandsFreeSTT]);
 
   // After the Clear Messages dialog is dismissed with NO, iOS can sometimes route
   // subsequent audio to the quiet receiver / low-volume path. We "nudge" the
   // audio session back to normal playback volume and ensure our media elements
   // are not left muted/low.
   const restoreVolumesAfterClearCancel = useCallback(async () => {
-    // This function runs on a user gesture (Yes/No click). Its job is purely to ensure
-    // that *future* manual resumption of TTS is not routed to a silent/receiver path.
-
-    // Re-assert boosted routing first.
-    try { boostAllTtsVolumes(); } catch {}
-
-    // iOS route recovery: nudge the audio session back to normal playback.
-    try { await nudgeAudioSession(); } catch {}
-
-    // Prime the hidden VIDEO element (required by your constraint) so the next audio-only
-    // TTS playback is unlocked and uses the correct output route.
+    // Re-prime audio routing on cancel (silent). Helps iOS recover speaker route/volume.
     try { primeLocalTtsAudio(true); } catch {}
-
-    // If Live Avatar is used on iPhone, ensure its audio context is also unlocked.
     try { void ensureIphoneAudioContextUnlocked(); } catch {}
 
-    // Ensure element mute/volume flags are sane (gain routing provides the loudness).
+    // Always ensure elements are at normal volume/mute state.
     try {
-      const v = localTtsVideoRef.current;
-      if (v) {
-        v.muted = false;
-        v.volume = 1;
-        v.setAttribute?.("playsinline", "");
+      if (avatarVideoRef.current) {
+        avatarVideoRef.current.muted = false;
+        avatarVideoRef.current.volume = 1;
+      }
+    } catch {}
+
+    try {
+      if (localTtsAudioRef.current) {
+        localTtsAudioRef.current.muted = false;
+        localTtsAudioRef.current.volume = 1;
+      }
+    } catch {}
+
+    try {
+      if (localTtsVideoRef.current) {
+        localTtsVideoRef.current.muted = false;
+        localTtsVideoRef.current.volume = 1;
+        localTtsVideoRef.current.setAttribute?.("playsinline", "");
         // @ts-ignore
-        v.playsInline = true;
+        localTtsVideoRef.current.playsInline = true;
       }
     } catch {}
 
-    try {
-      const a = localTtsAudioRef.current;
-      if (a) {
-        a.muted = false;
-        a.volume = 1;
-      }
-    } catch {}
+    if (!isIOS) return;
 
+    // iOS Safari: kick audio session back to normal playback (speaker) mode.
+    // This is a silent, ultra-short WebAudio buffer that runs only on user gesture.
     try {
-      const av = avatarVideoRef.current;
-      if (av) {
-        av.muted = false;
-        av.volume = 1;
+      const AnyWin = window as any;
+      const Ctx = AnyWin.AudioContext || AnyWin.webkitAudioContext;
+      if (!Ctx) return;
+
+      let ctx = didIphoneAudioCtxRef.current as any;
+      if (!ctx || typeof ctx.createBuffer !== "function") {
+        ctx = new Ctx();
+        didIphoneAudioCtxRef.current = ctx;
       }
+
+      if (ctx.state === "suspended") {
+        await ctx.resume();
+      }
+
+      const dur = 0.06;
+      const frames = Math.max(1, Math.floor(ctx.sampleRate * dur));
+      const buf = ctx.createBuffer(1, frames, ctx.sampleRate);
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.connect(ctx.destination);
+      src.start();
+      try {
+        src.stop(ctx.currentTime + dur);
+      } catch {}
     } catch {}
-  }, [isIOS, primeLocalTtsAudio, ensureIphoneAudioContextUnlocked, boostAllTtsVolumes, nudgeAudioSession]);
+  }, [isIOS, primeLocalTtsAudio, ensureIphoneAudioContextUnlocked]);
 
 
   // Cleanup
@@ -3404,18 +3135,6 @@ const speakGreetingIfNeeded = useCallback(
   );
 
   
-  const visibleModePills = useMemo(() => {
-    // Keep stable ordering regardless of allowedModes ordering.
-    const ordered: Mode[] = ["friend", "romantic", "intimate"];
-    return ordered.filter((m) => allowedModes.includes(m));
-  }, [allowedModes]);
-
-  const showUpgradePill = useMemo(() => {
-    // Requirement: show Upgrade whenever Friend and/or Romantic pills are available,
-    // except when Intimate (18+) is available (no further upgrade path).
-    return !allowedModes.includes("intimate") && (allowedModes.includes("friend") || allowedModes.includes("romantic"));
-  }, [allowedModes]);
-
   const modePillControls = (
     <div style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "flex-end" }}>
       {!showModePicker ? (
@@ -3472,52 +3191,36 @@ const speakGreetingIfNeeded = useCallback(
           </button>
         </div>
       ) : (
-        <>
-          {visibleModePills.map((m) => {
-            const active = effectiveActiveMode === m;
-            return (
-              <button
-                key={m}
-                onClick={() => {
-                  setModeFromPill(m);
-                  setShowModePicker(false);
-                }}
-                style={{
-                  padding: "8px 12px",
-                  borderRadius: 999,
-                  border: "1px solid #ddd",
-                  background: active ? "#111" : "#fff",
-                  color: active ? "#fff" : "#111",
-                  cursor: "pointer",
-                  whiteSpace: "nowrap",
-                }}
-              >
-                {MODE_LABELS[m]}
-              </button>
-            );
-          })}
-
-          {showUpgradePill ? (
+        modePills.map((m) => {
+          const active = effectiveActiveMode === m;
+          const disabled = !allowedModes.includes(m);
+          return (
             <button
-              key="upgrade"
+              key={m}
+              disabled={disabled}
               onClick={() => {
+                if (disabled) {
+                  showUpgradeMessage(m);
+                } else {
+                  setModeFromPill(m);
+                }
                 setShowModePicker(false);
-                goToUpgrade();
               }}
               style={{
                 padding: "8px 12px",
                 borderRadius: 999,
                 border: "1px solid #ddd",
-                background: "#fff",
-                color: "#111",
-                cursor: "pointer",
+                background: active ? "#111" : "#fff",
+                color: active ? "#fff" : "#111",
+                opacity: disabled ? 0.45 : 1,
+                cursor: disabled ? "not-allowed" : "pointer",
                 whiteSpace: "nowrap",
               }}
             >
-              Upgrade
+              {MODE_LABELS[m]}
             </button>
-          ) : null}
-        </>
+          );
+        })
       )}
     </div>
   );
@@ -3767,49 +3470,20 @@ const speakGreetingIfNeeded = useCallback(
             {/** Input line with mode pills moved to the right (layout-only). */}
             <button
               type="button"
-              onClick={() => {
-                // TODO: Save logic (stub for now)
-                console.log("Save conversation (stub)");
-              }}
-              title="Save conversation (coming soon)"
-              aria-label="Save"
-              style={{
-                width: 44,
-                height: 44,
-                borderRadius: 10,
-                border: "1px solid #bbb",
-                background: "#fff",
-                cursor: "pointer",
-                display: "inline-flex",
-                alignItems: "center",
-                justifyContent: "center",
-              }}
-            >
-              <SaveIcon size={18} />
-            </button>
-
-            <button
-              type="button"
               onClick={requestClearMessages}
               title="Clear the conversation on screen"
-              aria-label="Delete"
               style={{
-                width: 44,
-                height: 44,
+                padding: "10px 12px",
                 borderRadius: 10,
                 border: "1px solid #bbb",
                 background: "#fff",
                 cursor: "pointer",
-                display: "inline-flex",
-                alignItems: "center",
-                justifyContent: "center",
               }}
             >
-              <TrashIcon size={18} />
+              Clear Messages
             </button>
 
             <input
-              ref={inputElRef}
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => {
@@ -3876,7 +3550,7 @@ const speakGreetingIfNeeded = useCallback(
           >
             <div style={{ fontSize: 18, fontWeight: 700, marginBottom: 8 }}>Clear messages?</div>
             <div style={{ fontSize: 14, color: "#333", lineHeight: 1.4 }}>
-              This will clear the conversation on your screen. All audio, video, and mic listening have been stopped. You can resume manually using the controls after closing this dialog.
+              This will clear the conversation on your screen. Audio and video have been stopped.
             </div>
 
             <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", marginTop: 14 }}>
@@ -3884,9 +3558,6 @@ const speakGreetingIfNeeded = useCallback(
                 type="button"
                 onClick={() => {
                     setShowClearMessagesConfirm(false);
-                    // User gesture: restore boosted routing so subsequent TTS isn't quiet.
-                    try { boostAllTtsVolumes(); } catch {}
-                    // Restore audio routing/volume immediately.
                     void restoreVolumesAfterClearCancel();
                   }}
                 style={{
@@ -3904,10 +3575,7 @@ const speakGreetingIfNeeded = useCallback(
                 onClick={() => {
                   setMessages([]);
                   setInput("");
-                  try { if (inputElRef.current) inputElRef.current.value = ""; } catch {}
                   setShowClearMessagesConfirm(false);
-                  // User gesture: restore boosted routing so subsequent TTS isn't quiet.
-                  try { boostAllTtsVolumes(); } catch {}
                   // Re-prime audio outputs after a hard stop so Audio TTS doesn't come back quiet (iOS/Safari).
                   void restoreVolumesAfterClearCancel();
                 }}
