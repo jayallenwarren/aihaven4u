@@ -4086,7 +4086,20 @@ const speakGreetingIfNeeded = useCallback(
                 onClick={async () => {
                   if (savingSummary) return;
                   setSavingSummary(true);
-                  const companionForDisplay = ((companionKey || "").trim() || (companionName || DEFAULT_COMPANION_NAME).trim() || DEFAULT_COMPANION_NAME);
+                  const rawCompanionLabel = (
+                    (companionName || "").trim() ||
+                    (companionKey || "").trim() ||
+                    ((companion as any)?.name || "").trim() ||
+                    DEFAULT_COMPANION_NAME
+                  ).trim() || DEFAULT_COMPANION_NAME;
+
+                  // For user-facing messages, show only the companion's first name (no demographics).
+                  const companionForDisplay = (() => {
+                    const s = rawCompanionLabel;
+                    const afterNs = s.includes("::") ? (s.split("::").pop() || s) : s;
+                    const base = (afterNs.split("-")[0] || "").trim();
+                    return base || afterNs || DEFAULT_COMPANION_NAME;
+                  })();
                   try {
                     const payloadMessages = messages.slice();
                     if (payloadMessages.length === 0) {
