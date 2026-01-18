@@ -109,6 +109,11 @@ const HEADSHOT_DIR = "/companion/headshot";
 const GREET_ONCE_KEY = "AIHAVEN_GREETED";
 const DEFAULT_AVATAR = havenHeart.src;
 
+// Persisted identifiers used to ensure companion isolation is never lost across modalities.
+// This is a device-local fallback only (no server-side wildcard fallback).
+const LS_COMPANION_KEY = "AIHAVEN_COMPANION";
+const LS_MEMBERID_KEY = "AIHAVEN_MEMBERID";
+
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL;
 
 type Phase1AvatarMedia = {
@@ -168,6 +173,40 @@ function getElevenVoiceIdForAvatar(avatarName: string | null | undefined): strin
   if (key && ELEVEN_VOICE_ID_BY_AVATAR[key]) return ELEVEN_VOICE_ID_BY_AVATAR[key];
   // Fallback to Haven so audio-only TTS always has a voice.
   return ELEVEN_VOICE_ID_BY_AVATAR["Haven"] || "";
+}
+
+function safeLocalStorageGet(key: string): string {
+  try {
+    if (typeof window === "undefined") return "";
+    return window.localStorage.getItem(key) || "";
+  } catch {
+    return "";
+  }
+}
+
+function safeLocalStorageSet(key: string, value: string) {
+  try {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(key, value);
+  } catch {
+    // ignore
+  }
+}
+
+function getSafeCompanionForBackend(
+  companionKey: string,
+  companionName: string,
+  defaultName: string
+): string {
+  const fromState = (companionKey || "").trim() || (companionName || "").trim();
+  const fromStorage = safeLocalStorageGet(LS_COMPANION_KEY).trim();
+  return (fromState || fromStorage || defaultName).trim() || defaultName;
+}
+
+function getSafeMemberIdForBackend(memberId: string): string {
+  const fromState = (memberId || "").trim();
+  const fromStorage = safeLocalStorageGet(LS_MEMBERID_KEY).trim();
+  return (fromState || fromStorage || "").trim();
 }
 function getPhase1AvatarMedia(avatarName: string | null | undefined): Phase1AvatarMedia | null {
   if (!avatarName) return null;
@@ -568,9 +607,6 @@ export default function Page() {
   const localTtsVideoRef = useRef<HTMLVideoElement | null>(null);
   const localTtsUnlockedRef = useRef(false);
   const localTtsStopFnRef = useRef<(() => void) | null>(null);
-  // Guards to cancel/ignore in-flight local TTS work when user stops communications mid-stream.
-  const localTtsEpochRef = useRef(0);
-  const localTtsAbortRef = useRef<AbortController | null>(null);
 
   // Live Avatar element ref is declared early so it can be used by the global TTS volume booster.
   const avatarVideoRef = useRef<HTMLVideoElement | null>(null);
@@ -1140,12 +1176,11 @@ useEffect(() => {
   void stopLiveAvatar();
 }, [companionKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
-const getTtsAudioUrl = useCallback(async (text: string, voiceId: string, signal?: AbortSignal): Promise<string | null> => {
+const getTtsAudioUrl = useCallback(async (text: string, voiceId: string): Promise<string | null> => {
   try {
     const res = await fetch(`${API_BASE}/tts/audio-url`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      signal,
       body: JSON.stringify({
         session_id: sessionIdRef.current || "anon",
         voice_id: voiceId,
@@ -1555,27 +1590,8 @@ const playLocalTtsUrl = useCallback(
         return;
       }
 
-      // Guard against mid-stream Stop/Save/Clear: cancel any in-flight request and ignore late results.
-      const epoch = localTtsEpochRef.current;
-      try {
-        localTtsAbortRef.current?.abort();
-      } catch {}
-      const controller = new AbortController();
-      localTtsAbortRef.current = controller;
-
-      const audioUrl = await getTtsAudioUrl(clean, voiceId, controller.signal);
-      if (controller.signal.aborted || localTtsEpochRef.current != epoch) {
-        // Stop/Save/Clear happened while we were generating the audio URL.
-        hooks?.onDidNotSpeak?.();
-        return;
-      }
+      const audioUrl = await getTtsAudioUrl(clean, voiceId);
       if (!audioUrl) {
-        hooks?.onDidNotSpeak?.();
-        return;
-      }
-
-      // If a stop happens during playback start, playLocalTtsUrl will be interrupted by stopLocalTtsPlayback().
-      if (localTtsEpochRef.current != epoch) {
         hooks?.onDidNotSpeak?.();
         return;
       }
@@ -1776,9 +1792,6 @@ const speakAssistantReply = useCallback(
 
   const [planName, setPlanName] = useState<PlanName>(null);
   const [memberId, setMemberId] = useState<string>("");
-  // True once we have received the Wix postMessage handoff (plan + companion).
-  // Used to ensure the *first* audio-only TTS uses the selected companion voice (not the fallback).
-  const [handoffReady, setHandoffReady] = useState<boolean>(false);
   const [showModePicker, setShowModePicker] = useState(false);
   const [setModeFlash, setSetModeFlash] = useState(false);
   const [switchCompanionFlash, setSwitchCompanionFlash] = useState(false);
@@ -1991,6 +2004,7 @@ useEffect(() => {
             ? String((data as any).member_id).trim()
             : "";
       setMemberId(incomingMemberId);
+      if (incomingMemberId) safeLocalStorageSet(LS_MEMBERID_KEY, incomingMemberId);
 
       const incomingCompanion =
         typeof (data as any).companion === "string" ? (data as any).companion.trim() : "";
@@ -2000,6 +2014,7 @@ useEffect(() => {
         const parsed = parseCompanionMeta(resolvedCompanionKey);
         setCompanionKey(parsed.key);
         setCompanionName(parsed.first || DEFAULT_COMPANION_NAME);
+        if (parsed.key) safeLocalStorageSet(LS_COMPANION_KEY, parsed.key);
 
         // Keep session_state aligned with the selected companion so the backend can apply the correct persona.
         setSessionState((prev) => ({
@@ -2011,6 +2026,8 @@ useEffect(() => {
       } else {
         setCompanionKey("");
         setCompanionName(DEFAULT_COMPANION_NAME);
+
+        safeLocalStorageSet(LS_COMPANION_KEY, DEFAULT_COMPANION_NAME);
 
         setSessionState((prev) => ({
           ...prev,
@@ -2031,9 +2048,6 @@ useEffect(() => {
         if (nextAllowed.includes(prev.mode)) return prev;
         return { ...prev, mode: "friend", pending_consent: null };
       });
-
-      // Mark handoff ready so the first audio-only TTS can deterministically use the selected companion voice.
-      setHandoffReady(true);
     }
 
     window.addEventListener("message", onMessage);
@@ -2052,10 +2066,11 @@ const wants_explicit = stateToSend.mode === "intimate";
 
 // Ensure backend receives the selected companion so it can apply the correct persona.
 // Without this, the backend may fall back to the default companion ("Haven") even when the UI shows another.
-const companionForBackend =
-  (companionKey || "").trim() ||
-  (companionName || DEFAULT_COMPANION_NAME).trim() ||
-  DEFAULT_COMPANION_NAME;
+const companionForBackend = getSafeCompanionForBackend(
+  companionKey || "",
+  companionName || "",
+  DEFAULT_COMPANION_NAME
+);
 
 const stateToSendWithCompanion: SessionState = {
   ...stateToSend,
@@ -2064,8 +2079,8 @@ const stateToSendWithCompanion: SessionState = {
   companionName: companionForBackend,
   companion_name: companionForBackend,
   // Member identity (from Wix)
-  memberId: (memberId || "").trim(),
-  member_id: (memberId || "").trim(),
+  memberId: getSafeMemberIdForBackend(memberId || ""),
+  member_id: getSafeMemberIdForBackend(memberId || ""),
 };
 
     const res = await fetch(`${API_BASE}/chat`, {
@@ -2095,18 +2110,19 @@ const stateToSendWithCompanion: SessionState = {
       (crypto as any).randomUUID?.() ||
       `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
-    const companionForBackend =
-      (companionKey || "").trim() ||
-      (companionName || DEFAULT_COMPANION_NAME).trim() ||
-      DEFAULT_COMPANION_NAME;
+    const companionForBackend = getSafeCompanionForBackend(
+      companionKey || "",
+      companionName || "",
+      DEFAULT_COMPANION_NAME
+    );
 
     const stateToSendWithCompanion: SessionState = {
       ...stateToSend,
       companion: companionForBackend,
       companionName: companionForBackend,
       companion_name: companionForBackend,
-      memberId: (memberId || "").trim(),
-      member_id: (memberId || "").trim(),
+      memberId: getSafeMemberIdForBackend(memberId || ""),
+      member_id: getSafeMemberIdForBackend(memberId || ""),
     };
 
     const res = await fetch(`${API_BASE}/chat/save-summary`, {
@@ -3088,13 +3104,6 @@ const greetInFlightRef = useRef(false);
 
 const speakGreetingIfNeeded = useCallback(
   async (mode: "live" | "audio") => {
-    // Ensure the first audio-only TTS greeting uses the selected companion voice.
-    // If Wix hasn't provided plan/companion yet, defer until the handoff arrives.
-    if (mode === "audio" && !handoffReady) {
-      pendingGreetingModeRef.current = "audio";
-      return;
-    }
-
     const name = (companionName || "").trim() || "Companion";
     const key = `AIHAVEN_GREET_SPOKEN:${name}`;
 
@@ -3110,9 +3119,7 @@ const speakGreetingIfNeeded = useCallback(
     // IMPORTANT: do NOT prefix with "Name:"; the UI already labels the assistant bubble.
     // Keeping the spoken text free of the prefix prevents the avatar from reading its own name like a script cue.
     const greetText = `Hi, I'm ${name}. I'm here with you. How are you feeling today?`;
-    // Local audio-only greeting must always use the companion's ElevenLabs voice.
-    // (Live avatar uses its own configured voice via the DID agent.)
-    const voiceId = getElevenVoiceIdForAvatar(companionName);
+    const voiceId = phase1AvatarMedia?.elevenVoiceId || "rJ9XoWu8gbUhVKZnKY8X";
 
     // Belt & suspenders: avoid STT re-capturing the greeting audio.
     const prevIgnore = sttIgnoreUntilRef.current;
@@ -3154,7 +3161,7 @@ const speakGreetingIfNeeded = useCallback(
       } catch {}
     }
   },
-  [companionName, handoffReady, pauseSpeechToText, resumeSpeechToText, speakAssistantReply, speakLocalTtsReply],
+  [companionName, phase1AvatarMedia, pauseSpeechToText, resumeSpeechToText, speakAssistantReply, speakLocalTtsReply],
 );
 
   const maybePlayPendingGreeting = useCallback(async () => {
@@ -3171,14 +3178,6 @@ const speakGreetingIfNeeded = useCallback(
     pendingGreetingModeRef.current = null;
     await speakGreetingIfNeeded(mode);
   }, [avatarStatus, speakGreetingIfNeeded]);
-
-  // If the user started an audio-only experience before the Wix handoff arrived,
-  // play the pending greeting once plan/companion information is available.
-  useEffect(() => {
-    if (!handoffReady) return;
-    if (!pendingGreetingModeRef.current) return;
-    void maybePlayPendingGreeting();
-  }, [handoffReady, maybePlayPendingGreeting]);
 
   // Auto-play the greeting once the Live Avatar is connected, but ONLY after the user has granted mic access.
   useEffect(() => {
@@ -3311,12 +3310,6 @@ const speakGreetingIfNeeded = useCallback(
   }, [liveAvatarActive, startSpeechToText, stopSpeechToText]);
 
   const stopHandsFreeSTT = useCallback(() => {
-    // Cancel any in-flight local TTS work and advance epoch so late callbacks are ignored.
-    localTtsEpochRef.current += 1;
-    try {
-      localTtsAbortRef.current?.abort();
-    } catch {}
-    localTtsAbortRef.current = null;
     // Stop listening immediately
     stopSpeechToText();
 
@@ -3367,15 +3360,16 @@ const speakGreetingIfNeeded = useCallback(
 
   // Save Chat Summary (with confirmation)
   const requestSaveChatSummary = useCallback(() => {
-    // REQUIREMENT: behave like Clear Messages with respect to media stability.
-    // We halt all communication immediately using the Stop button logic.
-    // The user will manually choose what to resume after selecting Yes/No.
-    // IMPORTANT: Unlike Clear, do NOT bump clearEpochRef or change loading state here;
-    // doing so can interfere with subsequent reply speaking.
+    // Same safety posture as Clear Messages:
+    // Stop all audio/video + STT immediately on click, then the user manually chooses what to resume.
+    clearEpochRef.current += 1;
+    setLoading(false);
 
     try {
       stopHandsFreeSTT();
-    } catch {}
+    } catch {
+      // ignore
+    }
 
     // User gesture: re-assert boosted audio routing and nudge audio session back to playback mode.
     try {
