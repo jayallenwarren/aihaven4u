@@ -485,20 +485,23 @@ async def chat(request: Request):
     saved_summary: str | None = None
     memory_key: str | None = None
     try:
-        member_id, companion_key = _extract_member_and_companion(session_state)
-        if member_id:
-            # If companion is missing, do not inject memory (prevents cross-companion leakage).
-            if companion_key:
-                memory_key = f"{member_id}::{companion_key}"
-            else:
-                memory_key = None
+        # Use the exact same keying logic as /chat/save-summary, otherwise retrieval will miss.
+        # If memberId is present but companion is missing/empty, _summary_store_key() returns 'unknown'
+        # and we deliberately do NOT inject memory (prevents cross-companion leakage).
+        key = _summary_store_key(session_state, session_id)
+        if key.startswith('session::'):
+            memory_key = key
         else:
-            memory_key = f"session::{session_id}"
+            # memberId-based key: require a real companion key
+            if key.endswith('::unknown'):
+                memory_key = None
+            else:
+                memory_key = key
 
         if memory_key:
             _refresh_summary_store_if_needed()
             rec = _CHAT_SUMMARY_STORE.get(memory_key) or {}
-            s = rec.get("summary")
+            s = rec.get('summary')
             if isinstance(s, str) and s.strip():
                 saved_summary = s.strip()
     except Exception:
