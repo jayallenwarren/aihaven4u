@@ -2707,13 +2707,25 @@ const stateToSendWithCompanion: SessionState = {
         if (ev.data && ev.data.size > 0) chunks.push(ev.data);
       };
 
+      // MediaRecorder stop can fail to fire on some Safari paths; guard with a hard timeout.
       const blobPromise = new Promise<Blob>((resolve, reject) => {
+        const t = window.setTimeout(() => reject(new Error("Recorder timeout")), 30000);
+
         recorder.onstop = () => {
+          try {
+            window.clearTimeout(t);
+          } catch {}
           const type = recorder.mimeType || mimeType || "audio/webm";
           resolve(new Blob(chunks, { type }));
         };
-        (recorder as any).onerror = (ev: any) => reject(ev?.error || new Error("Recorder error"));
-      }, 30000);
+
+        (recorder as any).onerror = (ev: any) => {
+          try {
+            window.clearTimeout(t);
+          } catch {}
+          reject(ev?.error || new Error("Recorder error"));
+        };
+      });
 
       // Simple VAD (silence detection) using AnalyserNode
       try {
