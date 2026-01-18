@@ -398,6 +398,18 @@ function normalizeMode(raw: any): Mode | null {
 
 
 export default function Page() {
+  // Feature-flag (safe): enable companion voice for the FIRST audio-only greeting via ?cvfix=1
+  const companionVoiceFixEnabledRef = useRef<boolean>(false);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      const sp = new URLSearchParams(window.location.search);
+      companionVoiceFixEnabledRef.current = sp.get("cvfix") === "1";
+    } catch {
+      companionVoiceFixEnabledRef.current = false;
+    }
+  }, []);
+
   // iOS detection (includes iPadOS 13+ which reports itself as "Macintosh")
   const isIOS = useMemo(() => {
     if (typeof navigator === "undefined") return false;
@@ -1840,10 +1852,6 @@ const speakAssistantReply = useCallback(
   const [sttEnabled, setSttEnabled] = useState(false);
   const [sttRunning, setSttRunning] = useState(false);
   const [sttError, setSttError] = useState<string | null>(null);
-
-  // Wix handoff readiness (WEEKLY_PLAN postMessage). We avoid auto-spoken audio greetings
-  // until this is true, so the *first* audio-only TTS uses the selected companion voice.
-  const [handoffReady, setHandoffReady] = useState(false);
   // Track whether the user has already granted microphone access in this session.
   // On iOS Web Speech, this becomes true on SpeechRecognition.onstart (after the permission prompt).
   const [micGranted, setMicGranted] = useState(false);
@@ -1957,10 +1965,6 @@ useEffect(() => {
 
       const data = event.data;
       if (!data || data.type !== "WEEKLY_PLAN") return;
-
-      // Mark the Wix plan/companion handoff as ready. This gates the auto-spoken audio greeting
-      // so the first audio-only TTS always uses the selected companion voice.
-      setHandoffReady(true);
 
       const incomingPlan = (data.planName ?? null) as PlanName;
       setPlanName(incomingPlan);
@@ -3082,9 +3086,9 @@ const speakGreetingIfNeeded = useCallback(
     // IMPORTANT: do NOT prefix with "Name:"; the UI already labels the assistant bubble.
     // Keeping the spoken text free of the prefix prevents the avatar from reading its own name like a script cue.
     const greetText = `Hi, I'm ${name}. I'm here with you. How are you feeling today?`;
-    // IMPORTANT: For audio-only mode, always use the selected companion's ElevenLabs voice ID.
-    // Phase1 (D-ID) avatars have a separate voice mapping and do not cover most companions (e.g., Kevin).
-    const voiceId = getElevenVoiceIdForAvatar(companionName);
+    const voiceId = companionVoiceFixEnabledRef.current
+      ? getElevenVoiceIdForAvatar(companionName)
+      : (phase1AvatarMedia?.elevenVoiceId || "rJ9XoWu8gbUhVKZnKY8X");
 
     // Belt & suspenders: avoid STT re-capturing the greeting audio.
     const prevIgnore = sttIgnoreUntilRef.current;
@@ -3134,10 +3138,6 @@ const speakGreetingIfNeeded = useCallback(
     if (!mode) return;
     if (!micGrantedRef.current) return;
 
-	  // Audio-only greeting must wait until Wix has provided the selected companion, otherwise
-	  // the first spoken greeting can use the default companion voice.
-	  if (mode === "audio" && !handoffReady) return;
-
     // Live Avatar greeting must wait until the agent is fully connected.
     if (mode === "live") {
       if (avatarStatus !== "connected" || !didAgentMgrRef.current) return;
@@ -3146,7 +3146,7 @@ const speakGreetingIfNeeded = useCallback(
     // Clear first so we don't re-enter if something throws.
     pendingGreetingModeRef.current = null;
     await speakGreetingIfNeeded(mode);
-	}, [avatarStatus, handoffReady, speakGreetingIfNeeded]);
+  }, [avatarStatus, speakGreetingIfNeeded]);
 
   // Auto-play the greeting once the Live Avatar is connected, but ONLY after the user has granted mic access.
   useEffect(() => {
@@ -3162,13 +3162,6 @@ const speakGreetingIfNeeded = useCallback(
     if (!micGranted) return;
     void maybePlayPendingGreeting();
   }, [micGranted, maybePlayPendingGreeting]);
-
-	// If the user already granted mic access and started audio STT before the Wix handoff arrives,
-	// defer the audio greeting until we know the selected companion (voice) from WEEKLY_PLAN.
-	useEffect(() => {
-	  if (!handoffReady) return;
-	  void maybePlayPendingGreeting();
-	}, [handoffReady, maybePlayPendingGreeting]);
 
 
 
