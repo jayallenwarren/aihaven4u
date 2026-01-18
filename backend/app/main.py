@@ -4,6 +4,7 @@ import os
 import time
 import re
 import uuid
+import json
 import hashlib
 import base64
 from datetime import datetime, timedelta
@@ -461,6 +462,18 @@ async def chat(request: Request):
     session_id, messages, session_state, wants_explicit = _normalize_payload(raw)
     voice_id = _extract_voice_id(raw)
 
+    # Best-effort retrieval of a previously saved chat summary.
+    # This enables cross-device continuity when the user has explicitly saved a summary.
+    saved_summary: str | None = None
+    try:
+        key = _summary_store_key(session_state, session_id)
+        rec = _CHAT_SUMMARY_STORE.get(key) or {}
+        s = rec.get("summary")
+        if isinstance(s, str) and s.strip():
+            saved_summary = s.strip()
+    except Exception:
+        saved_summary = None
+
     # Helper to build responses consistently and optionally include audio_url.
     async def _respond(reply: str, status_mode: str, state_out: Dict[str, Any]) -> Dict[str, Any]:
         audio_url: Optional[str] = None
@@ -578,15 +591,26 @@ async def chat(request: Request):
 
     # call model
     try:
-        assistant_reply = _call_gpt4o(
-            _to_openai_messages(
-                messages,
-                session_state,
-                mode=effective_mode,
-                intimate_allowed=intimate_allowed,
-                debug=debug,
-            )
+        openai_messages = _to_openai_messages(
+            messages,
+            session_state,
+            mode=effective_mode,
+            intimate_allowed=intimate_allowed,
+            debug=debug,
         )
+
+        # Inject the saved summary (if present) as a second system message.
+        # This keeps the persona/system prompt stable while providing durable context.
+        if saved_summary:
+            openai_messages.insert(
+                1,
+                {
+                    "role": "system",
+                    "content": "Saved conversation summary (user-authorized, for reference across devices):\n" + saved_summary,
+                },
+            )
+
+        assistant_reply = _call_gpt4o(openai_messages)
     except Exception as e:
         _dbg(debug, "OpenAI call failed:", repr(e))
         raise HTTPException(status_code=500, detail=f"OpenAI call failed: {type(e).__name__}: {e}")
@@ -606,6 +630,131 @@ async def chat(request: Request):
         STATUS_ALLOWED if intimate_allowed else STATUS_SAFE,
         session_state_out,
     )
+
+
+# ----------------------------
+# SAVE CHAT SUMMARY
+# ----------------------------
+# NOTE: This stores summaries server-side (in memory, with optional file persistence).
+# This is intentionally simple; durable storage / retrieval strategy can be evolved
+# incrementally without changing the frontend contract.
+_CHAT_SUMMARY_STORE: Dict[str, Dict[str, Any]] = {}
+_CHAT_SUMMARY_FILE = os.getenv("CHAT_SUMMARY_FILE", "")
+
+
+def _load_summary_store() -> None:
+    """Best-effort load of persisted summary store (single-instance deployments).
+
+    Notes:
+      - This is intentionally simple and fail-open.
+      - If CHAT_SUMMARY_FILE is not configured, this is a no-op.
+      - If the file is invalid or unreadable, the in-memory store remains empty.
+    """
+    if not _CHAT_SUMMARY_FILE:
+        return
+    try:
+        if not os.path.isfile(_CHAT_SUMMARY_FILE):
+            return
+        with open(_CHAT_SUMMARY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            # Only accept dict-of-dicts; ignore anything else.
+            for k, v in data.items():
+                if isinstance(k, str) and isinstance(v, dict):
+                    _CHAT_SUMMARY_STORE[k] = v
+    except Exception:
+        # Fail-open
+        return
+
+
+def _summary_store_key(session_state: Dict[str, Any], session_id: str) -> str:
+    """Best-effort stable key using memberId + companion when present; falls back to session_id."""
+    member_id = (
+        session_state.get("memberId")
+        or session_state.get("member_id")
+        or session_state.get("member")
+        or ""
+    )
+    member_id = str(member_id).strip() if member_id is not None else ""
+
+    companion = (
+        session_state.get("companion")
+        or session_state.get("companionName")
+        or session_state.get("companion_name")
+        or ""
+    )
+    companion = str(companion).strip() if companion is not None else ""
+
+    if member_id:
+        return f"{member_id}::{companion or 'unknown'}"
+    return f"session::{session_id}"
+
+
+def _persist_summary_store() -> None:
+    if not _CHAT_SUMMARY_FILE:
+        return
+    try:
+        # Best-effort persistence for dev/single-instance deployments.
+        with open(_CHAT_SUMMARY_FILE, "w", encoding="utf-8") as f:
+            json.dump(_CHAT_SUMMARY_STORE, f, ensure_ascii=False, indent=2)
+    except Exception:
+        # Fail-open
+        return
+
+
+# Load persisted summaries once at startup (best-effort).
+_load_summary_store()
+
+
+@app.post("/chat/save-summary", response_model=None)
+async def save_chat_summary(request: Request):
+    """
+    Saves a server-side summary of the full chat history.
+
+    Request JSON:
+      { session_id, messages, session_state }
+
+    Response JSON:
+      { ok: true, summary: "...", saved_at: "...", key: "..." }
+    """
+    debug = bool(getattr(settings, "DEBUG", False))
+
+    raw = await request.json()
+    session_id, messages, session_state, _wants_explicit = _normalize_payload(raw)
+
+    # Build summarization prompt.
+    # Keep it stable, short, and future-conversation oriented.
+    sys = (
+        "You are a concise assistant that creates a server-side chat summary for future context. "
+        "Write a compact summary that captures: relationship tone, key facts, user preferences/boundaries, "
+        "names/roles, and any commitments or plans. Avoid quoting long passages. "
+        "Output plain text only."
+    )
+
+    convo: List[Dict[str, str]] = [{"role": "system", "content": sys}]
+    for m in messages:
+        role = m.get("role")
+        if role in ("user", "assistant"):
+            convo.append({"role": role, "content": str(m.get("content") or "")})
+
+    try:
+        summary = _call_gpt4o(convo)
+    except Exception as e:
+        _dbg(debug, "Summary generation failed:", repr(e))
+        raise HTTPException(status_code=500, detail=f"Summary generation failed: {type(e).__name__}: {e}")
+
+    key = _summary_store_key(session_state, session_id)
+    record = {
+        "saved_at": _now_ts(),
+        "session_id": session_id,
+        "member_id": session_state.get("memberId") or session_state.get("member_id"),
+        "companion": session_state.get("companion") or session_state.get("companionName") or session_state.get("companion_name"),
+        "summary": summary,
+    }
+    _CHAT_SUMMARY_STORE[key] = record
+    _persist_summary_store()
+
+    return {"ok": True, "summary": summary, "saved_at": record["saved_at"], "key": key}
 
 
 # ----------------------------
