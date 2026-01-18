@@ -477,7 +477,6 @@ async def chat(request: Request):
       { voice_id: "<elevenlabs_voice_id>" }   or  { voiceId: "<...>" }
     """
     debug = bool(getattr(settings, "DEBUG", False))
-    debug_memory = debug or (str(os.getenv("MEMORY_DEBUG", "")).strip().lower() in ("1", "true", "yes"))
 
     raw = await request.json()
     session_id, messages, session_state, wants_explicit = _normalize_payload(raw)
@@ -497,6 +496,7 @@ async def chat(request: Request):
             memory_key = f"session::{session_id}"
 
         if memory_key:
+            _refresh_summary_store_if_needed()
             rec = _CHAT_SUMMARY_STORE.get(memory_key) or {}
             s = rec.get("summary")
             if isinstance(s, str) and s.strip():
@@ -517,19 +517,13 @@ async def chat(request: Request):
                 state_out = dict(state_out)
                 state_out["tts_error"] = f"{type(e).__name__}: {e}"
 
-        out = {
+        return {
             "session_id": session_id,
             "mode": status_mode,          # safe/explicit_blocked/explicit_allowed
             "reply": reply,
             "session_state": state_out,
             "audio_url": audio_url,       # NEW (optional)
         }
-        if debug_memory:
-            out["debug"] = {
-                "memory_key": memory_key,
-                "summary_injected": bool(saved_summary),
-            }
-        return out
 
     # last user message
     last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
@@ -688,16 +682,24 @@ async def chat(request: Request):
 # incrementally without changing the frontend contract.
 _CHAT_SUMMARY_STORE: Dict[str, Dict[str, Any]] = {}
 _CHAT_SUMMARY_FILE = os.getenv("CHAT_SUMMARY_FILE", "")
+_CHAT_SUMMARY_FILE_MTIME: float = 0.0
+
+# Lock for cross-worker file refresh/write coordination (best-effort).
+# This only synchronizes within a single worker process; cross-worker sync is via atomic file replace + mtime.
+_CHAT_SUMMARY_LOCK = __import__("threading").RLock()
 
 
 def _load_summary_store() -> None:
-    """Best-effort load of persisted summary store (single-instance deployments).
+    """Best-effort load of persisted summary store.
 
-    Notes:
-      - This is intentionally simple and fail-open.
-      - If CHAT_SUMMARY_FILE is not configured, this is a no-op.
-      - If the file is invalid or unreadable, the in-memory store remains empty.
+    Worker-safe behavior for single-instance App Service:
+      - Load from CHAT_SUMMARY_FILE if present.
+      - Clear and replace the in-memory store to match disk.
+      - Track file mtime to enable refresh-on-change across gunicorn workers.
+
+    Fail-open: never crashes the API.
     """
+    global _CHAT_SUMMARY_FILE_MTIME
     if not _CHAT_SUMMARY_FILE:
         return
     try:
@@ -706,13 +708,47 @@ def _load_summary_store() -> None:
         with open(_CHAT_SUMMARY_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict):
-            # Only accept dict-of-dicts; ignore anything else.
+            _CHAT_SUMMARY_STORE.clear()
             for k, v in data.items():
                 if isinstance(k, str) and isinstance(v, dict):
                     _CHAT_SUMMARY_STORE[k] = v
+        try:
+            _CHAT_SUMMARY_FILE_MTIME = os.stat(_CHAT_SUMMARY_FILE).st_mtime
+        except Exception:
+            pass
     except Exception:
         # Fail-open
         return
+
+
+def _refresh_summary_store_if_needed() -> None:
+    """Refresh the in-memory store if the backing file changed.
+
+    This enables cross-worker consistency on a single instance because each gunicorn
+    worker sees the shared filesystem and can reload when another worker writes.
+    """
+    global _CHAT_SUMMARY_FILE_MTIME
+    if not _CHAT_SUMMARY_FILE:
+        return
+    try:
+        st = os.stat(_CHAT_SUMMARY_FILE)
+    except FileNotFoundError:
+        return
+    except Exception:
+        return
+
+    if st.st_mtime <= _CHAT_SUMMARY_FILE_MTIME:
+        return
+
+    with _CHAT_SUMMARY_LOCK:
+        # Re-check inside lock to avoid redundant reloads within this worker
+        try:
+            st2 = os.stat(_CHAT_SUMMARY_FILE)
+        except Exception:
+            return
+        if st2.st_mtime <= _CHAT_SUMMARY_FILE_MTIME:
+            return
+        _load_summary_store()
 
 
 def _normalize_companion_key(raw: Any) -> str:
@@ -761,12 +797,22 @@ def _summary_store_key(session_state: Dict[str, Any], session_id: str) -> str:
 
 
 def _persist_summary_store() -> None:
+    """Best-effort atomic persistence to a shared file.
+
+    Uses write-to-temp + os.replace to avoid other workers reading partial files.
+    """
+    global _CHAT_SUMMARY_FILE_MTIME
     if not _CHAT_SUMMARY_FILE:
         return
     try:
-        # Best-effort persistence for dev/single-instance deployments.
-        with open(_CHAT_SUMMARY_FILE, "w", encoding="utf-8") as f:
+        tmp_path = _CHAT_SUMMARY_FILE + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(_CHAT_SUMMARY_STORE, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, _CHAT_SUMMARY_FILE)
+        try:
+            _CHAT_SUMMARY_FILE_MTIME = os.stat(_CHAT_SUMMARY_FILE).st_mtime
+        except Exception:
+            pass
     except Exception:
         # Fail-open
         return
@@ -852,6 +898,9 @@ async def save_chat_summary(request: Request):
     except Exception as e:
         _dbg(debug, "Summary generation failed:", repr(e))
         return {"ok": False, "error_code": "summary_failed", "error": f"{type(e).__name__}: {e}"}
+
+    # Refresh from disk before write to avoid clobbering another worker's recent update.
+    _refresh_summary_store_if_needed()
 
     key = _summary_store_key(session_state, session_id)
     record = {
