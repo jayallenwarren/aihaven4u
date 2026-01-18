@@ -398,18 +398,6 @@ function normalizeMode(raw: any): Mode | null {
 
 
 export default function Page() {
-  // Feature-flag (safe): enable companion voice for the FIRST audio-only greeting via ?cvfix=1
-  const companionVoiceFixEnabledRef = useRef<boolean>(false);
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    try {
-      const sp = new URLSearchParams(window.location.search);
-      companionVoiceFixEnabledRef.current = sp.get("cvfix") === "1";
-    } catch {
-      companionVoiceFixEnabledRef.current = false;
-    }
-  }, []);
-
   // iOS detection (includes iPadOS 13+ which reports itself as "Macintosh")
   const isIOS = useMemo(() => {
     if (typeof navigator === "undefined") return false;
@@ -3086,9 +3074,7 @@ const speakGreetingIfNeeded = useCallback(
     // IMPORTANT: do NOT prefix with "Name:"; the UI already labels the assistant bubble.
     // Keeping the spoken text free of the prefix prevents the avatar from reading its own name like a script cue.
     const greetText = `Hi, I'm ${name}. I'm here with you. How are you feeling today?`;
-    const voiceId = companionVoiceFixEnabledRef.current
-      ? getElevenVoiceIdForAvatar(companionName)
-      : (phase1AvatarMedia?.elevenVoiceId || "rJ9XoWu8gbUhVKZnKY8X");
+    const voiceId = phase1AvatarMedia?.elevenVoiceId || "rJ9XoWu8gbUhVKZnKY8X";
 
     // Belt & suspenders: avoid STT re-capturing the greeting audio.
     const prevIgnore = sttIgnoreUntilRef.current;
