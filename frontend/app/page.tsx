@@ -3346,6 +3346,21 @@ const speakGreetingIfNeeded = useCallback(
     }
   }, [liveAvatarActive, stopLiveAvatar, stopLocalTtsPlayback, stopSpeechToText]);
 
+  // Stop button handler (explicit user gesture): stop all comms AND immediately
+  // re-prime the iOS/Safari audio route so that when the user manually resumes
+  // (Live Avatar or Audio-only), volume does not drop to the quiet receiver path.
+  const handleStopClick = useCallback(() => {
+    try {
+      stopHandsFreeSTT();
+    } catch {}
+
+    // Re-assert boosted audio routing and nudge audio session on the same user gesture.
+    try { boostAllTtsVolumes(); } catch {}
+    try { void nudgeAudioSession(); } catch {}
+    try { primeLocalTtsAudio(true); } catch {}
+    try { void ensureIphoneAudioContextUnlocked(); } catch {}
+  }, [stopHandsFreeSTT, boostAllTtsVolumes, nudgeAudioSession, primeLocalTtsAudio, ensureIphoneAudioContextUnlocked]);
+
   // Clear Messages (with confirmation)
   const requestClearMessages = useCallback(() => {
     // Stop all audio/video + STT immediately on click (even before the user confirms).
@@ -3523,7 +3538,7 @@ const speakGreetingIfNeeded = useCallback(
 
       <button
         type="button"
-        onClick={stopHandsFreeSTT}
+        onClick={handleStopClick}
         disabled={!sttEnabled}
         title="Stop listening"
         style={{
@@ -4064,9 +4079,13 @@ const speakGreetingIfNeeded = useCallback(
 
                     const resp = await callSaveChatSummary(payloadMessages, sessionState);
                     if (resp?.ok) {
+                      const keyHint = typeof resp?.key === "string" ? resp.key : "";
+                      const persistHint = keyHint.startsWith("session::")
+                        ? " (note: no memberId detected; memory will not persist across new sessions)"
+                        : "";
                       setMessages((prev) => [
                         ...prev,
-                        { role: "assistant", content: `Chat saved for ${companionForDisplay}.` },
+                        { role: "assistant", content: `Chat saved for ${companionForDisplay}.${persistHint}` },
                       ]);
                     } else {
                       setMessages((prev) => [
