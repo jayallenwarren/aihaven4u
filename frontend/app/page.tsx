@@ -319,11 +319,56 @@ function buildAvatarCandidates(companionKeyOrName: string) {
   return candidates;
 }
 
-async function pickFirstExisting(urls: string[]) {
-  for (const url of urls) {
-    if (url === DEFAULT_AVATAR) return url;
+
+// --- Latency helpers (v0.2.30) -------------------------------------------------
+// Use explicit timeouts for network calls to reduce tail-latency and avoid Safari hangs.
+function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}, timeoutMs = 15000): Promise<Response> {
+  const controller = new AbortController();
+  const priorSignal = init.signal;
+
+  // If caller provided a signal, abort when either aborts.
+  if (priorSignal) {
+    if (priorSignal.aborted) controller.abort();
+    else priorSignal.addEventListener('abort', () => controller.abort(), { once: true });
+  }
+
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+  return fetch(input, { ...init, signal: controller.signal }).finally(() => clearTimeout(id));
+}
+
+// Cache avatar URL picks per normalized companion key to avoid repeated HEAD waterfalls.
+const avatarPickCache = new Map<string, string>();
+
+// For existence checks, race candidates in parallel and take the first that responds OK.
+async function pickFirstExistingParallel(urls: string[], timeoutMs = 2500): Promise<string> {
+  for (const u of urls) {
+    if (u === DEFAULT_AVATAR) return u;
+  }
+
+  const candidates = urls.filter((u) => u !== DEFAULT_AVATAR);
+  if (candidates.length === 0) return DEFAULT_AVATAR;
+
+  const checks = candidates.map((url) =>
+    fetchWithTimeout(url, { method: "HEAD" }, timeoutMs).then((res) => {
+      if (res.ok) return url;
+      throw new Error(`HEAD ${res.status}`);
+    })
+  );
+
+  // Promise.any is supported in modern browsers; fall back to sequential on older runtimes.
+  const anyFn = (Promise as any).any as (ps: Promise<string>[]) => Promise<string>;
+  if (typeof anyFn === "function") {
     try {
-      const res = await fetch(url, { method: "HEAD", cache: "no-store" });
+      return await anyFn(checks);
+    } catch {
+      return DEFAULT_AVATAR;
+    }
+  }
+
+  // Fallback: sequential.
+  for (const url of candidates) {
+    try {
+      const res = await fetchWithTimeout(url, { method: "HEAD" }, timeoutMs);
       if (res.ok) return url;
     } catch {
       // ignore
@@ -331,6 +376,25 @@ async function pickFirstExisting(urls: string[]) {
   }
   return DEFAULT_AVATAR;
 }
+// -------------------------------------------------------------------------------
+
+async function pickFirstExisting(urls: string[]) {
+  // Key by the first real candidate (normalized) so repeated mode switches do not re-check the network.
+  const first = (urls || []).find((u) => u && u !== DEFAULT_AVATAR) || DEFAULT_AVATAR;
+  const cacheKey = first
+    .split("?")[0]
+    .replace(/\.(jpeg|jpg|png)$/i, "")
+    .trim()
+    .toLowerCase();
+
+  const cached = avatarPickCache.get(cacheKey);
+  if (cached) return cached;
+
+  const picked = await pickFirstExistingParallel(urls, 2500);
+  avatarPickCache.set(cacheKey, picked);
+  return picked;
+}
+
 
 function greetingFor(name: string) {
   const n = (name || DEFAULT_COMPANION_NAME).trim() || DEFAULT_COMPANION_NAME;
@@ -1167,7 +1231,7 @@ useEffect(() => {
 
 const getTtsAudioUrl = useCallback(async (text: string, voiceId: string, signal?: AbortSignal): Promise<string | null> => {
   try {
-    const res = await fetch(`${API_BASE}/tts/audio-url`, {
+    const res = await fetchWithTimeout(`${API_BASE}/tts/audio-url`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       signal,
@@ -1176,7 +1240,7 @@ const getTtsAudioUrl = useCallback(async (text: string, voiceId: string, signal?
         voice_id: voiceId,
         text,
       }),
-    });
+    }, 30000);
 
     if (!res.ok) {
       const msg = await res.text().catch(() => "");
@@ -2093,7 +2157,7 @@ const stateToSendWithCompanion: SessionState = {
   member_id: (memberId || "").trim(),
 };
 
-    const res = await fetch(`${API_BASE}/chat`, {
+    const res = await fetchWithTimeout(`${API_BASE}/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -2102,7 +2166,7 @@ const stateToSendWithCompanion: SessionState = {
         session_state: stateToSendWithCompanion,
         messages: nextMessages.map((m) => ({ role: m.role, content: m.content })),
       }),
-    });
+    }, 45000);
 
     if (!res.ok) {
       const errText = await res.text().catch(() => "");
@@ -2134,7 +2198,7 @@ const stateToSendWithCompanion: SessionState = {
       member_id: (memberId || "").trim(),
     };
 
-    const res = await fetch(`${API_BASE}/chat/save-summary`, {
+    const res = await fetchWithTimeout(`${API_BASE}/chat/save-summary`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -2142,7 +2206,7 @@ const stateToSendWithCompanion: SessionState = {
         session_state: stateToSendWithCompanion,
         messages: nextMessages.map((m) => ({ role: m.role, content: m.content })),
       }),
-    });
+    }, 30000);
 
     if (!res.ok) {
       const errText = await res.text().catch(() => "");
@@ -2542,12 +2606,12 @@ const stateToSendWithCompanion: SessionState = {
       const apiBase = API_BASE.replace(/\/+$/, "");
       const contentType = blob.type || (isIOS ? "audio/mp4" : "audio/webm");
 
-      const resp = await fetch(`${apiBase}/stt/transcribe`, {
+      const resp = await fetchWithTimeout(`${apiBase}/stt/transcribe`, {
         method: "POST",
         headers: { "Content-Type": contentType, Accept: "application/json" },
         body: blob,
         signal: controller.signal,
-      });
+      }, 30000);
 
       if (!resp.ok) {
         let detail = "";
@@ -2649,7 +2713,7 @@ const stateToSendWithCompanion: SessionState = {
           resolve(new Blob(chunks, { type }));
         };
         (recorder as any).onerror = (ev: any) => reject(ev?.error || new Error("Recorder error"));
-      });
+      }, 30000);
 
       // Simple VAD (silence detection) using AnalyserNode
       try {
