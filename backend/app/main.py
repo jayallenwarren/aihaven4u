@@ -350,6 +350,39 @@ _TTS_CONTAINER = os.getenv("AZURE_TTS_CONTAINER", os.getenv("AZURE_STORAGE_CONTA
 _TTS_BLOB_PREFIX = os.getenv("TTS_BLOB_PREFIX", "audio") or "audio"
 _TTS_SAS_MINUTES = int(os.getenv("TTS_SAS_MINUTES", os.getenv("AZURE_BLOB_SAS_EXPIRY_MINUTES", "30")) or "30")
 
+# TTS cache (Azure Blob) — deterministic blob names to avoid regenerating identical audio.
+# Enabled by default. Disable by setting TTS_CACHE_ENABLED=0.
+_TTS_CACHE_ENABLED = (os.getenv("TTS_CACHE_ENABLED", "1") or "1").strip().lower() not in {"0", "false", "no", "off"}
+# Cache blobs live under this prefix within the same container.
+_TTS_CACHE_PREFIX = (os.getenv("TTS_CACHE_PREFIX", "tts_cache") or "tts_cache").strip().strip("/")
+# Whether to normalize whitespace in TTS text before hashing.
+_TTS_CACHE_NORMALIZE_WS = (os.getenv("TTS_CACHE_NORMALIZE_WS", "1") or "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _normalize_tts_text_for_cache(text: str) -> str:
+    t = (text or "").strip()
+    if _TTS_CACHE_NORMALIZE_WS:
+        t = re.sub(r"\s+", " ", t)
+    return t
+
+
+def _tts_cache_blob_name(voice_id: str, text: str) -> str:
+    """Deterministic blob name for caching across sessions and workers."""
+    safe_voice = re.sub(r"[^A-Za-z0-9_-]", "_", (voice_id or "voice"))[:48]
+
+    model_id = (os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2") or "eleven_multilingual_v2").strip()
+    output_format = (os.getenv("ELEVENLABS_OUTPUT_FORMAT", "mp3_44100_128") or "mp3_44100_128").strip()
+    silence = str(_TTS_LEADING_SILENCE_COPIES)
+
+    norm_text = _normalize_tts_text_for_cache(text)
+    h = hashlib.sha256(
+        (safe_voice + "|" + model_id + "|" + output_format + "|" + silence + "|" + norm_text).encode("utf-8")
+    ).hexdigest()[:40]
+
+    # Keep under a predictable prefix; safe_voice helps partition blobs for listing/debug.
+    return f"{_TTS_CACHE_PREFIX}/{safe_voice}/{h}.mp3"
+
+
 
 
 # 235ms silent MP3 prefix used to prevent some clients (notably iOS/Safari in embedded contexts)
@@ -398,6 +431,42 @@ def _elevenlabs_tts_mp3_bytes(voice_id: str, text: str) -> bytes:
     return audio_bytes
 
 
+
+
+def _azure_blob_sas_url(blob_name: str) -> str:
+    """Create a read-only SAS URL for an existing blob name in the TTS container."""
+    from azure.storage.blob import BlobServiceClient  # type: ignore
+    from azure.storage.blob import BlobSasPermissions, generate_blob_sas  # type: ignore
+
+    storage_conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "").strip()
+    if not storage_conn_str:
+        raise RuntimeError("AZURE_STORAGE_CONNECTION_STRING is not configured")
+
+    blob_service = BlobServiceClient.from_connection_string(storage_conn_str)
+    container_client = blob_service.get_container_client(_TTS_CONTAINER)
+    blob_client = container_client.get_blob_client(blob_name)
+
+    # Parse AccountName/AccountKey from connection string for SAS
+    parts: Dict[str, str] = {}
+    for seg in storage_conn_str.split(";"):
+        if "=" in seg:
+            k, v = seg.split("=", 1)
+            parts[k] = v
+    account_name = parts.get("AccountName") or getattr(blob_service, "account_name", None)
+    account_key = parts.get("AccountKey")
+    if not account_name or not account_key:
+        raise RuntimeError("Could not parse AccountName/AccountKey from AZURE_STORAGE_CONNECTION_STRING")
+
+    expiry = datetime.utcnow() + timedelta(minutes=max(5, min(_TTS_SAS_MINUTES, 24 * 60)))
+    sas = generate_blob_sas(
+        account_name=account_name,
+        container_name=_TTS_CONTAINER,
+        blob_name=blob_name,
+        account_key=account_key,
+        permission=BlobSasPermissions(read=True),
+        expiry=expiry,
+    )
+    return f"{blob_client.url}?{sas}"
 def _azure_upload_mp3_and_get_sas_url(blob_name: str, mp3_bytes: bytes) -> str:
     from azure.storage.blob import BlobServiceClient, ContentSettings  # type: ignore
     from azure.storage.blob import BlobSasPermissions, generate_blob_sas  # type: ignore
@@ -452,6 +521,56 @@ def _tts_audio_url_sync(session_id: str, voice_id: str, text: str) -> str:
     text = (text or "").strip()
     if not text:
         raise RuntimeError("TTS text is empty")
+
+    # Cache path: deterministic blob name, cross-session.
+    if _TTS_CACHE_ENABLED:
+        cache_blob = _tts_cache_blob_name(voice_id=voice_id, text=text)
+        try:
+            from azure.storage.blob import BlobServiceClient  # type: ignore
+
+            storage_conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "").strip()
+            if not storage_conn_str:
+                raise RuntimeError("AZURE_STORAGE_CONNECTION_STRING is not configured")
+
+            blob_service = BlobServiceClient.from_connection_string(storage_conn_str)
+            container_client = blob_service.get_container_client(_TTS_CONTAINER)
+            blob_client = container_client.get_blob_client(cache_blob)
+
+            # Fast existence check (SDK-level). If present, return SAS immediately.
+            exists = False
+            try:
+                exists = bool(blob_client.exists())
+            except Exception:
+                try:
+                    blob_client.get_blob_properties()
+                    exists = True
+                except Exception:
+                    exists = False
+
+            if exists:
+                return _azure_blob_sas_url(blob_name=cache_blob)
+
+            # Cache miss: generate and upload.
+            mp3_bytes = _elevenlabs_tts_mp3_bytes(voice_id=voice_id, text=text)
+
+            # Upload without overwrite to avoid clobbering a concurrent writer.
+            try:
+                from azure.storage.blob import ContentSettings  # type: ignore
+                blob_client.upload_blob(
+                    mp3_bytes,
+                    overwrite=False,
+                    content_settings=ContentSettings(content_type="audio/mpeg"),
+                )
+            except Exception:
+                # If another worker won the race and uploaded first, just return SAS.
+                pass
+
+            return _azure_blob_sas_url(blob_name=cache_blob)
+        except Exception:
+            # Fail-open: if cache path fails for any reason, fall back to the legacy per-session upload.
+            pass
+
+    # Legacy path: per-session unique blob (no caching).
     blob_name = _tts_blob_name(session_id=session_id, voice_id=voice_id, text=text)
     mp3_bytes = _elevenlabs_tts_mp3_bytes(voice_id=voice_id, text=text)
     return _azure_upload_mp3_and_get_sas_url(blob_name=blob_name, mp3_bytes=mp3_bytes)
