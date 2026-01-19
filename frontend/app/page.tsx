@@ -341,18 +341,33 @@ const avatarPickCache = new Map<string, string>();
 
 // For existence checks, race candidates in parallel and take the first that responds OK.
 async function pickFirstExistingParallel(urls: string[], timeoutMs = 2500): Promise<string> {
-  for (const u of urls) {
-    if (u === DEFAULT_AVATAR) return u;
-  }
-
-  const candidates = urls.filter((u) => u !== DEFAULT_AVATAR);
+  // IMPORTANT: Do not short-circuit just because DEFAULT_AVATAR is present in the list.
+  // DEFAULT_AVATAR is always appended as the last fallback; we must only use it
+  // after failing to resolve any real headshot candidates.
+  const candidates = urls.filter((u) => u && u !== DEFAULT_AVATAR);
   if (candidates.length === 0) return DEFAULT_AVATAR;
 
   const checks = candidates.map((url) =>
-    fetchWithTimeout(url, { method: "HEAD" }, timeoutMs).then((res) => {
-      if (res.ok) return url;
-      throw new Error(`HEAD ${res.status}`);
-    })
+    fetchWithTimeout(url, { method: "HEAD" }, timeoutMs)
+      .then(async (res) => {
+        if (res.ok) return url;
+
+        // Some static hosts/CDNs may not support HEAD. If so, try a tiny GET.
+        if (res.status === 405 || res.status === 403) {
+          try {
+            const g = await fetchWithTimeout(
+              url,
+              { method: "GET", headers: { Range: "bytes=0-0" } },
+              timeoutMs
+            );
+            if (g.ok || g.status === 206) return url;
+          } catch {
+            // ignore
+          }
+        }
+
+        throw new Error(`HEAD ${res.status}`);
+      })
   );
 
   // Promise.any is supported in modern browsers; fall back to sequential on older runtimes.
