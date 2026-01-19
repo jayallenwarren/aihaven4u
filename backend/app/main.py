@@ -548,9 +548,14 @@ def _tts_audio_url_sync(session_id: str, voice_id: str, text: str) -> str:
                     exists = False
 
             if exists:
+                _clear_inflight_marker(cache_blob)
+
                 return _azure_blob_sas_url(blob_name=cache_blob)
 
             # Cache miss: generate and upload.
+
+
+            _touch_inflight_marker(cache_blob)
             mp3_bytes = _elevenlabs_tts_mp3_bytes(voice_id=voice_id, text=text)
 
             # Upload without overwrite to avoid clobbering a concurrent writer.
@@ -652,6 +657,87 @@ async def _startup_tts_prewarm() -> None:
     except Exception:
         pass
 
+# ----------------------------
+# STEP B (Latency): Cache-first TTS for audio/video (rule-preserving)
+# ----------------------------
+# Rule: For audio and live-avatar flows, do NOT return assistant text before audio/video is ready.
+# This step therefore keeps /chat synchronous when voice_id is present, but adds a cache-first fast path
+# to avoid an ElevenLabs call on repeats. It also adds a lightweight "inflight" marker so /tts/audio-url
+# can wait briefly for another request/worker that is already generating the same cached blob.
+#
+# No default voice is introduced; this engages only when the frontend supplies voice_id (as today).
+#
+# Controls:
+#   TTS_CHAT_CACHE_FIRST=1|0     (default: 1)
+#   TTS_INFLIGHT_WAIT_MS=1500    (default: 1500ms)
+#   TTS_INFLIGHT_STALE_S=90      (default: 90s)
+#   TTS_INFLIGHT_DIR=/home/tts_inflight
+
+_TTS_CHAT_CACHE_FIRST = (os.getenv("TTS_CHAT_CACHE_FIRST", "1") or "1").strip().lower() not in {"0","false","no","off"}
+_TTS_INFLIGHT_WAIT_MS = max(0, int(os.getenv("TTS_INFLIGHT_WAIT_MS", "1500") or "1500"))
+_TTS_INFLIGHT_STALE_S = max(10, int(os.getenv("TTS_INFLIGHT_STALE_S", "90") or "90"))
+_TTS_INFLIGHT_DIR = (os.getenv("TTS_INFLIGHT_DIR", "/home/tts_inflight") or "/home/tts_inflight").strip()
+
+def _inflight_marker_path(cache_blob_name: str) -> str:
+    h = hashlib.sha256((cache_blob_name or "").encode("utf-8")).hexdigest()[:40]
+    return os.path.join(_TTS_INFLIGHT_DIR, f"{h}.lock")
+
+def _touch_inflight_marker(cache_blob_name: str) -> None:
+    try:
+        os.makedirs(_TTS_INFLIGHT_DIR, exist_ok=True)
+        with open(_inflight_marker_path(cache_blob_name), "w", encoding="utf-8") as f:
+            f.write(str(int(time.time())))
+    except Exception:
+        pass
+
+def _clear_inflight_marker(cache_blob_name: str) -> None:
+    try:
+        p = _inflight_marker_path(cache_blob_name)
+        if os.path.exists(p):
+            os.remove(p)
+    except Exception:
+        pass
+
+def _inflight_marker_is_fresh(cache_blob_name: str) -> bool:
+    try:
+        p = _inflight_marker_path(cache_blob_name)
+        if not os.path.exists(p):
+            return False
+        age = time.time() - os.path.getmtime(p)
+        return age >= 0 and age <= _TTS_INFLIGHT_STALE_S
+    except Exception:
+        return False
+
+def _tts_cache_peek_sync(voice_id: str, text: str) -> Optional[str]:
+    """Cache-only lookup: returns SAS URL if deterministic cache blob exists, else None."""
+    if not _TTS_CACHE_ENABLED:
+        return None
+    t = (text or "").strip()
+    if not t:
+        return None
+    cache_blob = _tts_cache_blob_name(voice_id=voice_id, text=t)
+    try:
+        from azure.storage.blob import BlobServiceClient  # type: ignore
+        storage_conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "").strip()
+        if not storage_conn_str:
+            return None
+        blob_service = BlobServiceClient.from_connection_string(storage_conn_str)
+        container_client = blob_service.get_container_client(_TTS_CONTAINER)
+        blob_client = container_client.get_blob_client(cache_blob)
+        try:
+            if blob_client.exists():
+                return _azure_blob_sas_url(blob_name=cache_blob)
+        except Exception:
+            try:
+                blob_client.get_blob_properties()
+                return _azure_blob_sas_url(blob_name=cache_blob)
+            except Exception:
+                return None
+    except Exception:
+        return None
+    return None
+
+
 
 
 # ----------------------------
@@ -710,7 +796,10 @@ async def chat(request: Request):
         audio_url: Optional[str] = None
         if voice_id and (reply or "").strip():
             try:
-                audio_url = await run_in_threadpool(_tts_audio_url_sync, session_id, voice_id, reply)
+                if _TTS_CHAT_CACHE_FIRST and _TTS_CACHE_ENABLED:
+                    audio_url = await run_in_threadpool(_tts_cache_peek_sync, voice_id, reply)
+                if audio_url is None:
+                    audio_url = await run_in_threadpool(_tts_audio_url_sync, session_id, voice_id, reply)
             except Exception as e:
                 # Fail-open: never break chat because TTS failed
                 _dbg(debug, "TTS generation failed:", repr(e))
@@ -1150,7 +1239,24 @@ async def tts_audio_url(request: Request) -> Dict[str, Any]:
         raise HTTPException(status_code=422, detail="voice_id and text are required")
 
     try:
-        audio_url = await run_in_threadpool(_tts_audio_url_sync, session_id, voice_id, text)
+        # STEP B: if another worker/request is already generating the same cached blob, wait briefly.
+        audio_url: Optional[str] = None
+        if _TTS_CACHE_ENABLED and voice_id and text:
+            try:
+                cache_blob = _tts_cache_blob_name(voice_id=voice_id, text=text)
+                if _inflight_marker_is_fresh(cache_blob):
+                    waited = 0
+                    while waited < _TTS_INFLIGHT_WAIT_MS:
+                        peek = await run_in_threadpool(_tts_cache_peek_sync, voice_id, text)
+                        if peek:
+                            audio_url = peek
+                            break
+                        await asyncio.sleep(0.15)
+                        waited += 150
+            except Exception:
+                pass
+        if audio_url is None:
+            audio_url = await run_in_threadpool(_tts_audio_url_sync, session_id, voice_id, text)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"TTS failed: {type(e).__name__}: {e}")
 
