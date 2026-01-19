@@ -355,12 +355,9 @@ const avatarPickCache = new Map<string, string>();
 
 // For existence checks, race candidates in parallel and take the first that responds OK.
 async function pickFirstExistingParallel(urls: string[], timeoutMs = 2500): Promise<string> {
-  for (const u of urls) {
-    if (u === DEFAULT_AVATAR) return u;
-  }
-
-  const candidates = urls.filter((u) => u !== DEFAULT_AVATAR);
+  const candidates = (urls || []).filter((u) => !!u && u !== DEFAULT_AVATAR);
   if (candidates.length === 0) return DEFAULT_AVATAR;
+
 
   const checks = candidates.map((url) =>
     fetchWithTimeout(url, { method: "HEAD" }, timeoutMs)
