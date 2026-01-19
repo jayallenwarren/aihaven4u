@@ -272,8 +272,7 @@ function stripExt(s: string) {
 }
 
 function normalizeKeyForFile(raw: string) {
-  // Lowercase to avoid case-sensitive asset path mismatches on static hosts (e.g., Jamal vs jamal).
-  return (raw || "").trim().toLowerCase().replace(/\s+/g, "-");
+  return (raw || "").trim().replace(/\s+/g, "-");
 }
 
 function parseCompanionMeta(raw: string): CompanionMeta {
@@ -307,28 +306,15 @@ function parseCompanionMeta(raw: string): CompanionMeta {
 
 function buildAvatarCandidates(companionKeyOrName: string) {
   const raw = (companionKeyOrName || "").trim();
-  const stripped = stripExt(raw);
-  const normalizedLower = normalizeKeyForFile(stripped);
-  // Defensive: also try a non-lowercased normalization in case files were uploaded with caps.
-  const normalizedAsIs = (stripped || "").trim().replace(/\s+/g, "-");
-
-  const bases: string[] = [];
-  if (normalizedLower) bases.push(`${HEADSHOT_DIR}/${encodeURIComponent(normalizedLower)}`);
-  if (normalizedAsIs && normalizedAsIs.toLowerCase() !== normalizedLower) {
-    bases.push(`${HEADSHOT_DIR}/${encodeURIComponent(normalizedAsIs)}`);
-  }
+  const normalized = normalizeKeyForFile(stripExt(raw));
+  const base = normalized ? `${HEADSHOT_DIR}/${encodeURIComponent(normalized)}` : "";
 
   const candidates: string[] = [];
-  for (const base of bases) {
+  if (base) {
     candidates.push(`${base}.jpeg`);
     candidates.push(`${base}.jpg`);
     candidates.push(`${base}.png`);
-    // Some uploads may use uppercase extensions on case-sensitive hosts; try those too.
-    candidates.push(`${base}.JPEG`);
-    candidates.push(`${base}.JPG`);
-    candidates.push(`${base}.PNG`);
   }
-
   candidates.push(DEFAULT_AVATAR);
   return candidates;
 }
@@ -355,22 +341,18 @@ const avatarPickCache = new Map<string, string>();
 
 // For existence checks, race candidates in parallel and take the first that responds OK.
 async function pickFirstExistingParallel(urls: string[], timeoutMs = 2500): Promise<string> {
-  const candidates = (urls || []).filter((u) => !!u && u !== DEFAULT_AVATAR);
+  for (const u of urls) {
+    if (u === DEFAULT_AVATAR) return u;
+  }
+
+  const candidates = urls.filter((u) => u !== DEFAULT_AVATAR);
   if (candidates.length === 0) return DEFAULT_AVATAR;
 
-
   const checks = candidates.map((url) =>
-    fetchWithTimeout(url, { method: "HEAD" }, timeoutMs)
-      .then((res) => {
-        if (res.ok) return url;
-        // Some static hosts may not support HEAD reliably; fall back to a small GET check.
-        throw new Error(`HEAD ${res.status}`);
-      })
-      .catch(async () => {
-        const res = await fetchWithTimeout(url, { method: "GET", headers: { Range: "bytes=0-0" } }, timeoutMs);
-        if (res.ok) return url;
-        throw new Error(`GET ${res.status}`);
-      })
+    fetchWithTimeout(url, { method: "HEAD" }, timeoutMs).then((res) => {
+      if (res.ok) return url;
+      throw new Error(`HEAD ${res.status}`);
+    })
   );
 
   // Promise.any is supported in modern browsers; fall back to sequential on older runtimes.
@@ -386,10 +368,7 @@ async function pickFirstExistingParallel(urls: string[], timeoutMs = 2500): Prom
   // Fallback: sequential.
   for (const url of candidates) {
     try {
-      let res = await fetchWithTimeout(url, { method: "HEAD" }, timeoutMs);
-      if (!res.ok) {
-        res = await fetchWithTimeout(url, { method: "GET" }, timeoutMs);
-      }
+      const res = await fetchWithTimeout(url, { method: "HEAD" }, timeoutMs);
       if (res.ok) return url;
     } catch {
       // ignore
