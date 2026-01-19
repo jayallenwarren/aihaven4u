@@ -575,6 +575,84 @@ def _tts_audio_url_sync(session_id: str, voice_id: str, text: str) -> str:
     mp3_bytes = _elevenlabs_tts_mp3_bytes(voice_id=voice_id, text=text)
     return _azure_upload_mp3_and_get_sas_url(blob_name=blob_name, mp3_bytes=mp3_bytes)
 
+# ----------------------------
+# STEP A (Latency): TTS Cache Prewarm (Azure Blob)
+# ----------------------------
+# Objective:
+#   Pre-generate a small set of common system phrases into the deterministic Azure Blob cache so that
+#   first-use latency for these phrases is near-zero after a cold start/restart.
+#
+# Safety properties:
+#   - Backend-only change; no frontend impact.
+#   - Fire-and-forget: does not block application startup.
+#   - Fail-open: any error during prewarm is ignored; normal runtime behavior is unchanged.
+#   - Uses the same TTS/cache path as production (/chat and /tts/audio-url), so behavior is consistent.
+#
+# Controls:
+#   TTS_PREWARM_ENABLED=1|0   (default: 1)
+#   TTS_PREWARM_VOICE_ID=<elevenlabs_voice_id>  (optional; if missing, prewarm is skipped)
+#   TTS_PREWARM_PHRASES_JSON='["Hello!", "..."]' (optional override)
+
+_TTS_PREWARM_ENABLED = (os.getenv("TTS_PREWARM_ENABLED", "1") or "1").strip().lower() not in {"0", "false", "no", "off"}
+
+# We deliberately do NOT guess a voice_id from companion here because this is backend-only and we want
+# to avoid unintended cross-companion behavior. If you want prewarm for a specific voice, set it explicitly.
+_TTS_PREWARM_VOICE_ID = (os.getenv("TTS_PREWARM_VOICE_ID", "") or "").strip()
+
+_DEFAULT_PREWARM_PHRASES: list[str] = [
+    "Hello!",
+    "Hi there!",
+    "How can I help you today?",
+    "Sure.",
+    "Okay.",
+    "Got it.",
+    "All set.",
+]
+
+def _load_prewarm_phrases() -> list[str]:
+    raw = (os.getenv("TTS_PREWARM_PHRASES_JSON", "") or "").strip()
+    if not raw:
+        return list(_DEFAULT_PREWARM_PHRASES)
+    try:
+        v = json.loads(raw)
+        if isinstance(v, list):
+            out: list[str] = []
+            for item in v:
+                s = str(item or "").strip()
+                if s:
+                    out.append(s)
+            return out or list(_DEFAULT_PREWARM_PHRASES)
+    except Exception:
+        pass
+    return list(_DEFAULT_PREWARM_PHRASES)
+
+async def _tts_prewarm_task() -> None:
+    if not _TTS_PREWARM_ENABLED:
+        return
+    if not _TTS_PREWARM_VOICE_ID:
+        # No explicit voice configured; skip prewarm to avoid generating for the wrong companion.
+        return
+
+    phrases = _load_prewarm_phrases()
+    # Use a fixed session id; caching ignores session id when _TTS_CACHE_ENABLED is on.
+    sid = "prewarm"
+    for phrase in phrases:
+        try:
+            # run the synchronous generator in a thread to avoid blocking the event loop
+            await run_in_threadpool(_tts_audio_url_sync, sid, _TTS_PREWARM_VOICE_ID, phrase)
+        except Exception:
+            # fail-open: ignore
+            continue
+
+@app.on_event("startup")
+async def _startup_tts_prewarm() -> None:
+    # Fire-and-forget. Do not await; do not block startup.
+    try:
+        asyncio.create_task(_tts_prewarm_task())
+    except Exception:
+        pass
+
+
 
 # ----------------------------
 # CHAT (Optimized: optional audio_url in same response)
