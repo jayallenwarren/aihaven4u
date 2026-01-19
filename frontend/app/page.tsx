@@ -105,6 +105,24 @@ type CompanionMeta = {
 };
 
 const DEFAULT_COMPANION_NAME = "Haven";
+
+// Step C (Latency): limit how much chat history we send to /chat.
+// 20 turns ~= 40 messages (user+assistant). System prompt (if present) is always preserved.
+const MAX_MESSAGES_TO_SEND = 40;
+
+function trimMessagesForChat<T extends { role: string; content: any }>(messages: T[]): T[] {
+  if (!Array.isArray(messages) || messages.length <= MAX_MESSAGES_TO_SEND) return messages;
+
+  const first = messages[0];
+  const hasSystem = first && first.role === "system";
+
+  const body = hasSystem ? messages.slice(1) : messages.slice();
+
+  const trimmedBody = body.slice(Math.max(0, body.length - MAX_MESSAGES_TO_SEND));
+
+  return hasSystem ? ([first, ...trimmedBody] as T[]) : (trimmedBody as T[]);
+}
+
 const HEADSHOT_DIR = "/companion/headshot";
 
 // Resolve companion key/name for backend requests and TTS voice selection.
@@ -2100,7 +2118,7 @@ const stateToSendWithCompanion: SessionState = {
         session_id,
         wants_explicit,
         session_state: stateToSendWithCompanion,
-        messages: nextMessages.map((m) => ({ role: m.role, content: m.content })),
+        messages: trimMessagesForChat(nextMessages).map((m) => ({ role: m.role, content: m.content })),
       }),
     });
 
