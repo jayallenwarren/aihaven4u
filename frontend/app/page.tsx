@@ -341,33 +341,18 @@ const avatarPickCache = new Map<string, string>();
 
 // For existence checks, race candidates in parallel and take the first that responds OK.
 async function pickFirstExistingParallel(urls: string[], timeoutMs = 2500): Promise<string> {
-  // IMPORTANT: Do not short-circuit just because DEFAULT_AVATAR is present in the list.
-  // DEFAULT_AVATAR is always appended as the last fallback; we must only use it
-  // after failing to resolve any real headshot candidates.
-  const candidates = urls.filter((u) => u && u !== DEFAULT_AVATAR);
+  for (const u of urls) {
+    if (u === DEFAULT_AVATAR) return u;
+  }
+
+  const candidates = urls.filter((u) => u !== DEFAULT_AVATAR);
   if (candidates.length === 0) return DEFAULT_AVATAR;
 
   const checks = candidates.map((url) =>
-    fetchWithTimeout(url, { method: "HEAD" }, timeoutMs)
-      .then(async (res) => {
-        if (res.ok) return url;
-
-        // Some static hosts/CDNs may not support HEAD. If so, try a tiny GET.
-        if (res.status === 405 || res.status === 403) {
-          try {
-            const g = await fetchWithTimeout(
-              url,
-              { method: "GET", headers: { Range: "bytes=0-0" } },
-              timeoutMs
-            );
-            if (g.ok || g.status === 206) return url;
-          } catch {
-            // ignore
-          }
-        }
-
-        throw new Error(`HEAD ${res.status}`);
-      })
+    fetchWithTimeout(url, { method: "HEAD" }, timeoutMs).then((res) => {
+      if (res.ok) return url;
+      throw new Error(`HEAD ${res.status}`);
+    })
   );
 
   // Promise.any is supported in modern browsers; fall back to sequential on older runtimes.
@@ -2722,25 +2707,13 @@ const stateToSendWithCompanion: SessionState = {
         if (ev.data && ev.data.size > 0) chunks.push(ev.data);
       };
 
-      // MediaRecorder stop can fail to fire on some Safari paths; guard with a hard timeout.
       const blobPromise = new Promise<Blob>((resolve, reject) => {
-        const t = window.setTimeout(() => reject(new Error("Recorder timeout")), 30000);
-
         recorder.onstop = () => {
-          try {
-            window.clearTimeout(t);
-          } catch {}
           const type = recorder.mimeType || mimeType || "audio/webm";
           resolve(new Blob(chunks, { type }));
         };
-
-        (recorder as any).onerror = (ev: any) => {
-          try {
-            window.clearTimeout(t);
-          } catch {}
-          reject(ev?.error || new Error("Recorder error"));
-        };
-      });
+        (recorder as any).onerror = (ev: any) => reject(ev?.error || new Error("Recorder error"));
+      }, 30000);
 
       // Simple VAD (silence detection) using AnalyserNode
       try {
