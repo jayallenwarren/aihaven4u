@@ -125,11 +125,39 @@ if consent_router is not None:
     app.include_router(consent_router)
 
 
+@app.get("/")
+def root():
+    """
+    Minimal root endpoint.
+
+    Azure App Service (Linux) health probes and some monitoring tools will call "/"
+    by default. Returning 200 here prevents false "container failed to start" / 502
+    notifications when the API itself is healthy but has no root route.
+    """
+    return {"ok": True, "service": "AIHaven4U API"}
+
+
 @app.get("/health")
+@app.get("/healthz")
 def health():
+    """
+    Liveness probe.
+
+    Keep this fast and dependency-free (no downstream calls) so platform health checks
+    remain reliable during partial outages.
+    """
     return {"ok": True}
 
 
+@app.get("/ready")
+def ready():
+    """
+    Readiness probe.
+
+    If you want a stricter readiness check (e.g., verify required env vars),
+    add lightweight checks here. For now it mirrors liveness.
+    """
+    return {"ok": True}
 # ----------------------------
 # Helpers
 # ----------------------------
